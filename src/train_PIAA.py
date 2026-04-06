@@ -678,7 +678,9 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
                 for genre, metrics in genre_metrics.items():
                     wandb.log({
                         f"{genre}/Test SROCC user_{uid}": metrics['srocc'],
+                        f"{genre}/Test MAE user_{uid}": metrics['mae'],
                         f"{genre}/Test NDCG@10 user_{uid}": metrics['ndcg@10'],
+                        f"{genre}/Test CCC user_{uid}": metrics['ccc'],
                     }, commit=False)
                 wandb.log({}, commit=True)
             results[uid] = (genre_metrics, total_mae)
@@ -723,6 +725,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
             log_dict[f"{genre}/Avg. Test SROCC"] = metrics['srocc']
             log_dict[f"{genre}/Avg. Test MAE"] = metrics['mae']
             log_dict[f"{genre}/Avg. Test NDCG@10"] = metrics['ndcg@10']
+            log_dict[f"{genre}/Avg. Test CCC"] = metrics['ccc']
         wandb.log(log_dict, commit=True)
 
     cross_domain_results = {}
@@ -755,7 +758,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
     for uid, (genre_metrics_user, total_mae) in results.items():
         if isinstance(genre_metrics_user, dict):
             per_user_results[str(uid)] = {
-                genre: {'srocc': float(metrics['srocc']), 'ndcg@10': float(metrics['ndcg@10'])}
+                genre: {'srocc': float(metrics['srocc']), 'mae': float(metrics['mae']), 'ndcg@10': float(metrics['ndcg@10']), 'ccc': float(metrics['ccc'])}
                 for genre, metrics in genre_metrics_user.items()
             }
 
@@ -765,7 +768,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
         'mode': 'PIAA_finetune',
         'genres': genres,
         'average_metrics': {
-            genre: {'srocc': float(metrics['srocc']), 'ndcg@10': float(metrics['ndcg@10'])}
+            genre: {'srocc': float(metrics['srocc']), 'mae': float(metrics['mae']), 'ndcg@10': float(metrics['ndcg@10']), 'ccc': float(metrics['ccc'])}
             for genre, metrics in genre_avg_metrics.items()
         },
         'per_user_metrics': per_user_results
