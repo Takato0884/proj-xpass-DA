@@ -545,7 +545,7 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
         avg_preds = np.mean([per_head_preds[sg] for sg in source_genres], axis=0)
 
         # Per-user metrics for averaged predictions
-        avg_sroccs, avg_ndcgs = [], []
+        avg_sroccs, avg_ndcgs, avg_maes, avg_cccs = [], [], [], []
         per_user_results = {}
         for uid in unique_user_ids:
             uid_mask = (user_ids == uid)
@@ -555,20 +555,31 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
                     f"User {uid} in target genre '{target_genre}' has only {n_samples} sample(s). "
                     f"At least 2 samples are required for SROCC computation."
                 )
-            uid_srocc, _ = spearmanr(avg_preds[uid_mask], true_scores[uid_mask])
-            uid_ndcg = ndcg_score([true_scores[uid_mask]], [avg_preds[uid_mask]], k=10)
+            uid_pred = avg_preds[uid_mask]
+            uid_true = true_scores[uid_mask]
+            uid_srocc, _ = spearmanr(uid_pred, uid_true)
+            uid_ndcg = ndcg_score([uid_true], [uid_pred], k=10)
+            uid_mae = float(np.mean(np.abs(uid_pred - uid_true)))
+            mu_p, mu_t = uid_pred.mean(), uid_true.mean()
+            var_p, var_t = uid_pred.var(), uid_true.var()
+            cov = ((uid_pred - mu_p) * (uid_true - mu_t)).mean()
+            uid_ccc = float(2 * cov / (var_p + var_t + (mu_p - mu_t) ** 2 + 1e-8))
             avg_sroccs.append(uid_srocc)
             avg_ndcgs.append(uid_ndcg)
+            avg_maes.append(uid_mae)
+            avg_cccs.append(uid_ccc)
             per_user_results[str(int(uid))] = {
                 'srocc': float(uid_srocc),
-                'ndcg@10': float(uid_ndcg)
+                'ndcg@10': float(uid_ndcg),
+                'mae': uid_mae,
+                'ccc': uid_ccc,
             }
 
         # Per-head per-user metrics
         per_head_metrics = {}
         per_user_per_head = {}
         for sg in source_genres:
-            sg_sroccs, sg_ndcgs = [], []
+            sg_sroccs, sg_ndcgs, sg_maes, sg_cccs = [], [], [], []
             for uid in unique_user_ids:
                 uid_mask = (user_ids == uid)
                 n_samples = np.sum(uid_mask)
@@ -577,20 +588,33 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
                         f"User {uid} in target genre '{target_genre}' has only {n_samples} sample(s). "
                         f"At least 2 samples are required for SROCC computation."
                     )
-                uid_srocc, _ = spearmanr(per_head_preds[sg][uid_mask], true_scores[uid_mask])
-                uid_ndcg = ndcg_score([true_scores[uid_mask]], [per_head_preds[sg][uid_mask]], k=10)
+                uid_pred = per_head_preds[sg][uid_mask]
+                uid_true = true_scores[uid_mask]
+                uid_srocc, _ = spearmanr(uid_pred, uid_true)
+                uid_ndcg = ndcg_score([uid_true], [uid_pred], k=10)
+                uid_mae = float(np.mean(np.abs(uid_pred - uid_true)))
+                mu_p, mu_t = uid_pred.mean(), uid_true.mean()
+                var_p, var_t = uid_pred.var(), uid_true.var()
+                cov = ((uid_pred - mu_p) * (uid_true - mu_t)).mean()
+                uid_ccc = float(2 * cov / (var_p + var_t + (mu_p - mu_t) ** 2 + 1e-8))
                 sg_sroccs.append(uid_srocc)
                 sg_ndcgs.append(uid_ndcg)
+                sg_maes.append(uid_mae)
+                sg_cccs.append(uid_ccc)
                 uid_str = str(int(uid))
                 if uid_str not in per_user_per_head:
                     per_user_per_head[uid_str] = {}
                 per_user_per_head[uid_str][sg] = {
                     'srocc': float(uid_srocc),
-                    'ndcg@10': float(uid_ndcg)
+                    'ndcg@10': float(uid_ndcg),
+                    'mae': uid_mae,
+                    'ccc': uid_ccc,
                 }
             per_head_metrics[sg] = {
                 'srocc': float(np.mean(sg_sroccs)) if sg_sroccs else 0.0,
                 'ndcg@10': float(np.mean(sg_ndcgs)) if sg_ndcgs else 0.0,
+                'mae': float(np.mean(sg_maes)) if sg_maes else 0.0,
+                'ccc': float(np.mean(sg_cccs)) if sg_cccs else 0.0,
             }
 
         cross_domain_results[target_genre] = {
@@ -599,6 +623,8 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
             'average': {
                 'srocc': float(np.mean(avg_sroccs)) if avg_sroccs else 0.0,
                 'ndcg@10': float(np.mean(avg_ndcgs)) if avg_ndcgs else 0.0,
+                'mae': float(np.mean(avg_maes)) if avg_maes else 0.0,
+                'ccc': float(np.mean(avg_cccs)) if avg_cccs else 0.0,
             },
             'per_head': per_head_metrics,
             'per_user': per_user_results,
@@ -606,9 +632,11 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
         }
 
         print(f"[Cross-Domain] {target_genre}: avg SROCC={cross_domain_results[target_genre]['average']['srocc']:.4f}, "
-              f"avg NDCG@10={cross_domain_results[target_genre]['average']['ndcg@10']:.4f}")
+              f"avg NDCG@10={cross_domain_results[target_genre]['average']['ndcg@10']:.4f}, "
+              f"avg MAE={cross_domain_results[target_genre]['average']['mae']:.4f}, "
+              f"avg CCC={cross_domain_results[target_genre]['average']['ccc']:.4f}")
         for sg, m in per_head_metrics.items():
-            print(f"  head [{sg}]: SROCC={m['srocc']:.4f}, NDCG@10={m['ndcg@10']:.4f}")
+            print(f"  head [{sg}]: SROCC={m['srocc']:.4f}, NDCG@10={m['ndcg@10']:.4f}, MAE={m['mae']:.4f}, CCC={m['ccc']:.4f}")
 
     return cross_domain_results
 
