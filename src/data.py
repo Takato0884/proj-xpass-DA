@@ -692,7 +692,7 @@ def collate_fn(batch):
         'image': torch.stack([item['image'] for item in batch]),
         'Aesthetic': torch.stack([item['Aesthetic'] for item in batch]),
         'traits': torch.stack([item['traits'] for item in batch]),
-        'attributes': torch.stack([item['QIP'] for item in batch]),
+        'QIP': torch.stack([item['QIP'] for item in batch]),
     }
     # include optional fields if present in samples
     optional_keys = ['user_id']

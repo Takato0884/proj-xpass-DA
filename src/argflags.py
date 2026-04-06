@@ -39,6 +39,9 @@ def parse_arguments(parse=True):
     parser.add_argument('--user_grouped_batch', action='store_true', default=False,
                         help='Pretrain: group each batch by user (n_users=batch_size//32, 32 samples/user). Default: standard random batching.')
 
+    parser.add_argument('--no_save_model', action='store_true', default=False,
+                        help='If set, keep best model in memory instead of saving to disk')
+
     # Loss function
     parser.add_argument('--loss_type', type=str, default='rmse',
                         choices=['rmse', 'ccc', 'ccc+rmse'],

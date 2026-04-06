@@ -632,6 +632,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
     genre_srocc_list = defaultdict(list)
     genre_mae_list = defaultdict(list)
     genre_ndcg_list = defaultdict(list)
+    genre_ccc_list = defaultdict(list)
     for genre in genres:
         all_user_ids.update(datasets_dict[genre]['test'].data['user_id'].values)
 
@@ -672,6 +673,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
                 genre_srocc_list[genre].append(metrics['srocc'])
                 genre_mae_list[genre].append(metrics['mae'])
                 genre_ndcg_list[genre].append(metrics['ndcg@10'])
+                genre_ccc_list[genre].append(metrics['ccc'])
             if args.is_log:
                 for genre, metrics in genre_metrics.items():
                     wandb.log({
@@ -712,6 +714,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
                 'srocc': np.mean(genre_srocc_list[genre]),
                 'mae': np.mean(genre_mae_list[genre]),
                 'ndcg@10': np.mean(genre_ndcg_list[genre]),
+                'ccc': np.mean(genre_ccc_list[genre]),
             }
 
     if args.is_log:
@@ -744,7 +747,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
             }
 
     # Save test performance to JSON
-    save_dir = os.path.join('/home/hayashi0884/proj-xpass-DA/reports/exp', args.dataset_ver, genre_str)
+    save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, genre_str)
     os.makedirs(save_dir, exist_ok=True)
 
     # Prepare per-user results
@@ -922,13 +925,11 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
     except Exception as e:
         raise RuntimeError(f"Error: Failed to load NIMA weights for {genre} from {pretrained_path}: {e}")
 
-    # Freeze entire backbone if requested
-    if args.freeze_backbone:
-        model.freeze_backbone()
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        frozen_params = total_params - trainable_params
-        print(f"[Freeze] Backbone frozen: {frozen_params:,} frozen / {trainable_params:,} trainable / {total_params:,} total")
+    model.freeze_backbone()
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    print(f"[Freeze] Backbone frozen: {frozen_params:,} frozen / {trainable_params:,} trainable / {total_params:,} total")
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
@@ -1027,6 +1028,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
     genre_srocc_list = defaultdict(list)
     genre_mae_list = defaultdict(list)
     genre_ndcg_list = defaultdict(list)
+    genre_ccc_list = defaultdict(list)
     per_user_results = {}
 
     for uid in unique_user_ids:
@@ -1040,6 +1042,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
                 genre_srocc_list[g].append(metrics['srocc'])
                 genre_mae_list[g].append(metrics['mae'])
                 genre_ndcg_list[g].append(metrics['ndcg@10'])
+                genre_ccc_list[g].append(metrics['ccc'])
             if args.is_log:
                 log_dict = {}
                 for g, metrics in genre_metrics.items():
@@ -1047,7 +1050,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
                     log_dict[f"{g}/Test NDCG@10 user_{uid}"] = metrics['ndcg@10']
                 wandb.log(log_dict, commit=True)
             per_user_results[str(uid)] = {
-                g: {'srocc': float(metrics['srocc']), 'ndcg@10': float(metrics['ndcg@10'])}
+                g: {'srocc': float(metrics['srocc']), 'ndcg@10': float(metrics['ndcg@10']), 'mae': float(metrics['mae']), 'ccc': float(metrics['ccc'])}
                 for g, metrics in genre_metrics.items()
             }
 
@@ -1058,6 +1061,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
                 'srocc': np.mean(genre_srocc_list[g]),
                 'mae': np.mean(genre_mae_list[g]),
                 'ndcg@10': np.mean(genre_ndcg_list[g]),
+                'ccc': np.mean(genre_ccc_list[g]),
             }
 
     if args.is_log:
@@ -1079,7 +1083,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         cross_domain_results = evaluate_cross_domain(model, eval_loaders_dict, device, genres)
 
     # Save test performance to JSON
-    save_dir = os.path.join('/home/hayashi0884/proj-xpass/reports/exp', args.dataset_ver, genre_str)
+    save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, genre_str)
     os.makedirs(save_dir, exist_ok=True)
 
     model_basename = os.path.splitext(os.path.basename(best_model_path))[0]
@@ -1089,7 +1093,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         'mode': 'PIAA_pretrain',
         'genres': genres,
         'average_metrics': {
-            g: {'srocc': float(metrics['srocc']), 'ndcg@10': float(metrics['ndcg@10'])}
+            g: {'srocc': float(metrics['srocc']), 'ndcg@10': float(metrics['ndcg@10']), 'mae': float(metrics['mae']), 'ccc': float(metrics['ccc'])}
             for g, metrics in genre_avg_metrics.items()
         },
         'per_user_metrics': per_user_results
@@ -1158,13 +1162,13 @@ def run_main(args):
     print(f"Auto-discovered pretrained models: {pretrained_model_dict}")
 
     if args.is_log:
-        tags = ['ICI']
+        tags = [args.piaa_mode]
         tags += wandb_tags(args)
         if args.use_video:
             tags.append("use_video")
         wandb.init(
-                   project=f"XPASS-Baseline",
-                   notes=f"ICI-{genre}({backbone_dict[genre]})",
+                   project=f"XPASS",
+                   notes=f"ICI",
                    tags=tags)
         wandb.config = {
             "learning_rate": args.lr,
@@ -1257,4 +1261,24 @@ if __name__ == '__main__':
             args_fold.dataset_ver = fold
             run_main(args_fold)
     else:
-        run_main(args)
+        # Search for fold structure in models_pth
+        models_base = 'models_pth'
+        fold_dirs = sorted([
+            d for d in os.listdir(models_base)
+            if d.startswith(f'{args.dataset_ver}_fold') and os.path.isdir(os.path.join(models_base, d))
+        ]) if os.path.exists(models_base) else []
+
+        if fold_dirs:
+            print(f"models_pth/{args.dataset_ver}/ not found. Running fold structure: {fold_dirs}")
+            for i, fold in enumerate(fold_dirs):
+                if i + 1 < args.start_fold:
+                    print(f"Skipping fold {i+1}/{len(fold_dirs)}: {fold} (start_fold={args.start_fold})")
+                    continue
+                print(f"\n{'='*60}")
+                print(f"  Fold {i+1}/{len(fold_dirs)}: {fold}")
+                print(f"{'='*60}\n")
+                args_fold = copy.deepcopy(args)
+                args_fold.dataset_ver = fold
+                run_main(args_fold)
+        else:
+            run_main(args)
