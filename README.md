@@ -1,0 +1,507 @@
+<p align="center">
+  <img src="logo.png" alt="proj-xpass-logo" width="650">
+</p>
+
+## 概要
+
+XPASSは、クロスドメイン個人化画像美的評価（PIAA）のための初の大規模データセットです。アート作品、ファッション画像、風景動画の3ドメインから6,528サンプルを収集し、150名のアノテーターによる98,000件以上のユーザー-アイテムインタラクションを含みます。本リポジトリでは、各ドメインにおける一般画像美的評価（GIAA）モデルと個人化美的評価（PIAA）モデルの開発、およびクロスドメインPIAAの新手法を提案しています。
+---
+
+## 目次
+
+1. [環境構築](#環境構築)
+2. [データ前処理](#データ前処理)
+3. [データ分割](#データ分割)
+4. [学習（GIAA）](#giaa一般画像美的評価)
+5. [学習（PIAA）](#piaa事前学習--ファインチューニングici)
+6. [分析ツール](#分析ツール)
+7. [特徴量の次元構成](#特徴量の次元構成)
+8. [コミットメッセージ規則](#コミットメッセージ規則)
+
+---
+
+## 環境構築
+
+### 仮想環境の作成と有効化
+
+```bash
+# Linux/macOS
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirement.txt
+```
+
+```powershell
+# Windows (PowerShell)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirement.txt
+```
+
+> **注意:** 以下のコマンドはすべてリポジトリのルートディレクトリ（`src/` を含むフォルダ）から実行してください。別のディレクトリから実行すると `ModuleNotFoundError: No module named 'src'` が発生する場合があります。代替手段として、`PYTHONPATH` をリポジトリルートに設定できます：`export PYTHONPATH=$PWD`
+
+---
+
+## データ前処理
+
+### 必要な生データ
+
+以下のCSVファイルを事前に配置してください：
+
+- `data/raw/user-annotation-data_rows.csv`
+- `data/raw/annotation-tasks_rows.csv`
+- `data/raw/user-data_rows.csv`
+- `data/raw/url_filename_rows.csv`
+
+### users.csv と ratings.csv の作成
+
+ユーザープロファイルテーブル（`users.csv`）とサンプルごとの評価テーブル（`ratings.csv`）を一括で作成します。
+
+- `ratings.user_id` を `users.csv` の `uuid` 経由で整合
+- アノテーター品質基準（p_mode・再評価信頼性・反応時間）による自動除外
+
+#### 基本的な使い方
+
+```bash
+# デフォルト（引数なし）— すべての除外設定・品質基準にデフォルト値を使用
+python src/preprocessing.py make_users_and_ratings
+
+# フォルダや設定を上書きする場合
+python src/preprocessing.py make_users_and_ratings \
+  --raw-dir data/raw \
+  --output-dir data/maked \
+  --score-col Aesthetic \
+  --min-rs-art-fashion 10 \
+  --min-rs-video 30 \
+  --fast-user-thresh 0.2 \
+  --exclude-videos E5zeYBrVd5o_0034350_0036150.mp4 \
+  --exclude-fashion 0940.jpg 1034.jpg \
+  --retest-method mae \
+  --mad-multiplier 2.5 \
+  --outlier-method std
+```
+
+`--raw-dir` に指定したフォルダから以下の4つのCSVが自動的に読み込まれます：
+
+- `user-annotation-data_rows.csv`
+- `annotation-tasks_rows.csv`
+- `user-data_rows.csv`
+- `url_filename_rows.csv`
+
+デフォルト設定では、art/fashion で10秒未満、scenery で30秒未満の回答が20%以上のアノテーターが除外されます。
+
+#### アノテーター除外基準
+
+以下の3基準のいずれか1つのドメインでフラグが立った場合に除外されます：
+
+| 基準 | 内容 |
+|------|------|
+| `p_mode` | モード評価値の割合が集団から外れている（high = bad） |
+| `retest` | 同一サンプルの再評価一貫性が低い（MAE: high = bad / ICC・Spearman: low = bad） |
+| `rt_prop` | 高速回答（`--min-rs-*` 未満）の割合が `--fast-user-thresh` を超えている |
+
+#### オプション引数一覧
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|------|------|------|
+| `--raw-dir` | str | `/home/hayashi0884/proj-xpass/data/raw` | 生CSVが格納されたフォルダ |
+| `--output-dir` | str | `data/maked` | 出力先フォルダ（`users.csv` と `ratings.csv` を書き出す） |
+| `--score-col` | str | `Aesthetic` | p_mode検出・再評価信頼性に使用するスコア列 |
+| `--exclude-videos` | list | `E5zeYBrVd5o_0034350_0036150.mp4` | 除外する動画ファイル名のリスト |
+| `--exclude-fashion` | list | `0940.jpg 1034.jpg` | 除外するファッション画像ファイル名のリスト |
+| `--min-rs-art-fashion` | float | `10` | art/fashionジャンルの最低反応時間（秒） |
+| `--min-rs-video` | float | `30` | sceneryジャンルの最低反応時間（秒） |
+| `--fast-user-thresh` | float | `0.2` | 最低反応時間を下回る割合の閾値（これ以上なら除外） |
+| `--retest-method` | str | `mae` | 再評価信頼性の指標: `spearman` / `icc` / `mae` |
+| `--mad-multiplier` | float | `2.5` | 外れ値閾値の乗数 k |
+| `--outlier-method` | str | `std` | 外れ値検出手法: `mad`（median ± k×MAD）または `std`（mean ± k×SD） |
+
+#### 出力
+
+- `data/maked/users.csv`
+- `data/maked/ratings.csv`
+
+---
+
+## データ分割
+
+### GIAA分割（make_data_split_giaa）
+
+`ratings.csv` を作成した後、GIAA用の train/val/test 画像リストを生成します。`--version` でバージョン管理を行います。
+
+```bash
+# 全ジャンル（art, fashion, scenery）の分割を生成
+python src/preprocessing.py make_data_split_giaa \
+  data/maked/ratings.csv \
+  --genre all \
+  --version v_giaa \
+  --val-frac 0.15 \
+  --test-frac 0.15 \
+  --out-dir data/split
+```
+
+#### オプション引数一覧
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|------|------|------|
+| `ratings_csv` | str | (必須) | ratings CSVのパス（例: `data/maked/ratings.csv`） |
+| `--genre` | str | なし | 分割対象のジャンル（`art` / `fashion` / `scenery` / `all`） |
+| `--version` | str | (必須) | 出力ディレクトリ下のバージョン名（例: `v_giaa`） |
+| `--val-frac` | float | `0.15` | 検証データの割合（0〜1） |
+| `--test-frac` | float | `0.15` | テストデータの割合（0〜1） |
+| `--seed` | int | `42` | 乱数シード |
+| `--out-dir` | str | `./data/split` | 出力ディレクトリ |
+
+#### 出力（`--genre all --version v_giaa` の場合）
+
+- `data/split/v_giaa/art/{train|val|test}_images_GIAA.txt`
+- `data/split/v_giaa/fashion/{train|val|test}_images_GIAA.txt`
+- `data/split/v_giaa/scenery/{train|val|test}_images_GIAA.txt`
+
+---
+
+### クロスバリデーション分割（make_data_split_cv）
+
+全ユーザーを均等にn_folds個のグループに分割し、各foldでテストユーザーを交代させるクロスバリデーション用の分割を生成します。各ユーザーは必ずいずれか1つのfoldでテストユーザーになります。
+
+```bash
+# 全ジャンル（art, fashion, scenery）の5-fold クロスバリデーション分割を生成（ratings_csv と --genre はデフォルト値）
+python src/preprocessing.py make_data_split_cv --version v3
+
+# 引数を明示する場合
+python src/preprocessing.py make_data_split_cv \
+  data/maked/ratings.csv \
+  --genre all \
+  --version v3 \
+  --n-folds 5 \
+  --val-frac-images-giaa 0.1 \
+  --val-frac-users-giaa 0.1 \
+  --n-train-piaa 100 \
+  --n-test-piaa 50 \
+  --out-dir data/split
+```
+
+#### オプション引数一覧
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|------|------|------|
+| `ratings_csv` | str | `data/maked/ratings.csv` | ratings CSVのパス |
+| `--genre` | str | `all` | 分割対象のジャンル（`art` / `fashion` / `scenery` / `all`） |
+| `--version` | str | (必須) | バージョン名のプレフィックス（例: `v3` → `v3_fold1`, `v3_fold2`, ...） |
+| `--n-folds` | int | `5` | クロスバリデーションのfold数 |
+| `--val-frac-images-giaa` | float | `0.1` | GIAA画像の検証データ割合（0〜1） |
+| `--val-frac-users-giaa` | float | `0.1` | GIAAユーザーの検証データ割合（0〜1） |
+| `--n-train-piaa` | int | `100` | PIAAのユーザーごとの学習画像数 |
+| `--n-test-piaa` | int | `50` | PIAAのユーザーごとのテスト画像数 |
+| `--seed` | int | `42` | 乱数シード |
+| `--out-dir` | str | `./data/split` | 出力ディレクトリ |
+
+#### 出力（`--genre all --version v3 --n-folds 5` の場合）
+
+各fold（fold1〜fold5）ごとに以下のファイルが生成されます：
+
+**Fold 1の例:**
+- `data/split/v3_fold1/art/train_images_GIAA.txt` - GIAA学習用画像リスト
+- `data/split/v3_fold1/art/val_images_GIAA.txt` - GIAA検証用画像リスト
+- `data/split/v3_fold1/art/train_users_GIAA.txt` - GIAA学習用ユーザーリスト
+- `data/split/v3_fold1/art/val_users_GIAA.txt` - GIAA検証用ユーザーリスト
+- `data/split/v3_fold1/art/train_users_PIAA.txt` - PIAA学習用（形式: `user_id\tfilename`）
+- `data/split/v3_fold1/art/test_users_PIAA.txt` - PIAAテスト用（形式: `user_id\tfilename`）
+
+同様に `fashion` と `scenery` ジャンルについても生成され、これが fold2〜fold5 まで繰り返されます。
+
+> **注意:** GIAAプールとPIAAプールは完全に分離されています。各foldで、PIAAテストユーザー以外のユーザーがGIAAプールに含まれ、そこから画像とユーザーがtrain/valに分割されます。
+
+---
+
+### データセットと分割ファイルの対応表
+
+各データセットがどのtxtファイルに基づいて構築されるかの対応表です。txtファイルはすべて `data/split/{dataset_ver}/{genre}/` に配置されています。
+
+| データセット | txtファイル | 分割単位 | Dataset型 |
+|---|---|---|---|
+| `train_giaa_dataset` | `train_images_GIAA.txt`（+PIAAユーザー除外） | 画像名 | `Image_GIAA_HistogramDataset` |
+| `val_giaa_dataset` | `val_images_GIAA.txt`（+PIAAユーザー除外） | 画像名 | `Image_GIAA_HistogramDataset` |
+| `train_piaa_dataset` | `train_PIAA.txt` | user_id × filename | `Image_PIAA_HistogramDataset` |
+| `val_piaa_dataset` | `val_PIAA.txt` | user_id × filename | `Image_PIAA_HistogramDataset` |
+| `test_piaa_dataset` | `test_PIAA.txt` | user_id × filename | `Image_PIAA_HistogramDataset` |
+| `train_giaa_dataset_for_pretrain` | `train_users_GIAA.txt`（fallback: 全データ） | user_id | `Image_PIAA_HistogramDataset` |
+| `val_giaa_dataset_for_pretrain` | `val_users_GIAA.txt`（fallback: 全データ） | user_id | `Image_PIAA_HistogramDataset` |
+
+**補足:**
+- GIAAデータセットは同一画像の複数評価をヒストグラム（one-hot平均）に集約する。PIAAデータセットは個別の評価をそのまま保持する
+- `train/val_giaa_dataset` は `train/val/test_PIAA.txt` に含まれるuser_idを自動的に除外し、PIAAユーザーのリークを防止する
+- `train/val_giaa_dataset_for_pretrain` は `train/val_users_GIAA.txt` によるユーザー単位分割を使用する。ファイルが存在しない場合は全データ（ジャンル内の全ratings）がfallbackとして使用される
+
+---
+
+## 学習
+
+### GIAA（一般画像美的評価）
+
+#### オプション引数一覧
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|------|------|------|
+| `--genre` | str | (必須) | 学習ジャンル（例: `art`, `fashion`, `scenery`） |
+| `--dataset_ver` | str | `v1_all` | データ分割バージョン（`data/split/<version>/` を参照） |
+| `--backbone` | str | `clip_vit_b16` | バックボーンアーキテクチャ（`resnet50` / `i3d` / `vit_b_16` / `clip_rn50` / `clip_vit_b16`） |
+| `--use_video` | flag | `False` | sceneryジャンルでI3D（動画）を使用（指定しない場合はResNet50で画像を使用） |
+| `--root_dir` | str | `/home/hayashi0884/proj-xpass-DA/data` | 画像・動画データのルートディレクトリ |
+| `--num_epochs` | int | `200` | 最大エポック数 |
+| `--batch_size` | int | `16` | バッチサイズ |
+| `--lr` | float | `1e-5` | 学習率 |
+| `--lr_decay_factor` | float | `0.5` | ReduceLROnPlateauの減衰率（factor） |
+| `--lr_patience` | int | `5` | ReduceLROnPlateauのpatience（改善なしで許容するエポック数） |
+| `--max_patience_epochs` | int | `10` | Early stoppingの忍耐エポック数 |
+| `--dropout` | float | `0.1` | ドロップアウト率（`fc_aesthetic` の中間層に適用） |
+| `--num_workers` | int | `4` | DataLoaderのワーカー数 |
+| `--use_cross_eval` | flag | `True` | `--genre` 以外の全ジャンルでクロスドメイン評価を実行 |
+| `--no_log` | flag | `False` | wandbロギングを無効化 |
+
+#### コマンド例
+
+```bash
+# art
+python -m src.train_GIAA --genre art
+
+# fashion
+python -m src.train_GIAA --genre fashion
+
+# scenery (画像: CLIP ViT-B/16)
+python -m src.train_GIAA --genre scenery
+
+# scenery (動画: I3D)
+python -m src.train_GIAA --genre scenery --use_video
+```
+
+---
+
+### PIAA事前学習 & ファインチューニング（ICI）
+
+#### オプション引数一覧
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|------|------|------|
+| `--genre` | str | (必須) | 学習ジャンル（例: `art`, `fashion`, `scenery`） |
+| `--dataset_ver` | str | `v1` | データ分割バージョン（`data/split/<version>/` を参照） |
+| `--piaa_mode` | str | `PIAA_pretrain` | PIAAモード（`PIAA_pretrain` / `PIAA_finetune`） |
+| `--backbone` | str | `clip_vit_b16` | バックボーンアーキテクチャ（`resnet50` / `i3d` / `vit_b_16` / `clip_rn50` / `clip_vit_b16`） |
+| `--use_video` | flag | `False` | sceneryジャンルでI3D（動画）を使用（指定しない場合はResNet50で画像を使用） |
+| `--root_dir` | str | `/home/hayashi0884/proj-xpass/data` | 画像・動画データのルートディレクトリ |
+| `--num_epochs` | int | `200` | 最大エポック数 |
+| `--batch_size` | int | `16` | バッチサイズ（pretrain推奨: `128`、finetune推奨: `16`） |
+| `--lr` | float | `1e-5` | 学習率 |
+| `--lr_decay_factor` | float | `0.5` | ReduceLROnPlateauの減衰率（factor） |
+| `--lr_patience` | int | `5` | ReduceLROnPlateauのpatience（改善なしで許容するエポック数） |
+| `--max_patience_epochs` | int | `10` | Early stoppingの忍耐エポック数 |
+| `--dropout` | float | `0.1` | ドロップアウト率（全MLPの中間層に適用） |
+| `--num_workers` | int | `4` | DataLoaderのワーカー数 |
+| `--start_fold` | int | `1` | 再開するfold番号（1-indexed）。`--dataset_ver` が `_all` で終わる場合に使用 |
+| `--use_cross_eval` | flag | `True` | `--genre` 以外の全ジャンルでクロスドメイン評価を実行 |
+| `--use_backbone_image` | flag | `True` | バックボーン画像特徴量をインタラクション入力として追加 |
+| `--no_log` | flag | `False` | wandbロギングを無効化 |
+| `--user_grouped_batch` | flag | `False` | **[Pretrain]** バッチをユーザー単位でグループ化する。`n_users = batch_size // 32`人、各ユーザーから32サンプルを非復元抽出。ユーザー間は復元抽出 |
+| `--loss_type` | str | `rmse` | 学習損失関数（`rmse` / `ccc` / `ccc+rmse`） |
+| `--ccc_weight` | float | `0.5` | `ccc+rmse` 時のCCC項の重み。損失 = `ccc_weight × (1−CCC) + RMSE` |
+
+#### バッチ戦略の詳細（`--user_grouped_batch` 使用時）
+
+| | Pretrain | Finetune |
+|---|---|---|
+| バッチサイズ | 128（4ユーザー × 32サンプル） | 16 |
+| ユーザー構成 | 4ユーザー混在 | 1ユーザー固定 |
+| サンプリング | ユーザー間: 復元抽出 / バッチ内: 非復元抽出 | ランダムシャッフル |
+| drop_last | 不要 | True（端数バッチのCCC不安定化を回避） |
+| CCC計算単位 | ユーザーごと → 平均 | バッチ全体 |
+
+#### コマンド例
+
+```bash
+# Pretrain: ユーザーグループバッチ + CCC+RMSE損失
+python -m src.train_PIAA --genre art --dataset_ver v2 \
+  --piaa_mode PIAA_pretrain --batch_size 128 \
+  --user_grouped_batch --loss_type ccc+rmse --ccc_weight 0.5
+
+# Pretrain: 従来ランダムバッチ + RMSE損失
+python -m src.train_PIAA --genre art --dataset_ver v2 \
+  --piaa_mode PIAA_pretrain --batch_size 128 --loss_type rmse
+
+# Finetune: CCC+RMSE損失（drop_last=Trueは自動適用）
+python -m src.train_PIAA --genre art --dataset_ver v2 \
+  --piaa_mode PIAA_finetune --batch_size 16 \
+  --loss_type ccc+rmse --ccc_weight 0.5
+
+# Finetune: scenery（動画: I3D）
+python -m src.train_PIAA --genre scenery --dataset_ver v2 \
+  --use_video --piaa_mode PIAA_finetune --batch_size 16 --loss_type rmse
+```
+
+---
+
+## 分析ツール
+
+### fold結果の集約（aggregate）
+
+クロスバリデーション実験において、各foldのJSONファイルを集約し全ユーザーの平均SROCC/NDCGを出力します。
+
+```bash
+# v3の全foldからICI結果を集約
+python src/analysis.py aggregate \
+  --version v3 \
+  --genre art \
+  --pattern finetune \
+  --method ICI
+
+# 特定のfoldのみ集約
+python src/analysis.py aggregate \
+  --version v3 \
+  --genre art \
+  --pattern finetune \
+  --folds 0 2 4
+```
+
+#### オプション引数一覧
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|------|------|------|
+| `--version` | str | (必須) | データセットバージョン（例: `v3`）— `v3_fold*` ディレクトリを検索 |
+| `--genre` | str | (必須) | 分析対象のジャンル（例: `art`, `scenery`） |
+| `--pattern` | str | `""` | JSONファイルを絞り込むglobパターン（例: `pretrain`, `finetune`） |
+| `--method` | str | なし | JSONファイルをさらに絞り込むメソッド名（例: `ICI`） |
+| `--folds` | list | なし | 集約対象のfoldインデックス（例: `--folds 0 2 4`）。省略時は全fold |
+| `--reports_dir` | str | `reports/exp` | JSONファイルの検索ディレクトリ |
+
+---
+
+## 特徴量の次元構成
+
+### 個人特性ベクトル（116次元）
+
+`traits` ベクトルはユーザー固有の特性と嗜好を表現し、2つのカテゴリに分かれた116次元で構成されます。
+
+#### 1. スコアベクトル（70次元）
+
+性格および興味に関するアンケート回答。各質問は7段階（0-6）で評価され、ワンホットエンコーディングにより1問あたり7次元となります。
+
+- **Q1-Q10**（70次元）：ビッグファイブ性格モデルに基づく10問の性格特性質問
+  - 外向性、協調性、誠実性、神経症的傾向、開放性の次元を含む
+  - 各質問がワンホットエンコーディングにより7次元を寄与
+
+> **注:** 興味フィールド（art_interest, fashion_interest, photoVideo_interest）も7次元のワンホットエンコードベクトルであり、スコアベクトルの合計70次元に含まれます。
+
+#### 2. 属性ベクトル（46次元）
+
+人口統計学的属性および背景情報。各属性はカテゴリ数に応じてワンホットエンコーディングされます。
+
+| 属性 | 次元数 | 説明 |
+|------|--------|------|
+| age_onehot | 5 | 年齢グループ（5区間） |
+| gender_onehot | 3 | 性別（3カテゴリ） |
+| edu_onehot | 7 | 学歴（7カテゴリ） |
+| nationality_onehot | 4 | 国籍（4カテゴリ） |
+| art_learn_onehot | 2 | 芸術学習経験（有/無） |
+| fashion_learn_onehot | 2 | ファッション学習経験（有/無） |
+| photoVideo_learn_onehot | 2 | 写真/映像学習経験（有/無） |
+
+**合計: 70 + 46 = 116次元**
+
+### 画像知覚品質ベクトル - QIP（45次元）
+
+`QIP` ベクトルは各画像/動画から抽出された客観的視覚特徴を含みます。45個の数値特徴が視覚知覚の様々な側面を捉えます。
+
+#### 基本画像特性（6次元）
+
+| # | 特徴量 | 説明 |
+|---|--------|------|
+| 1 | 画像サイズ | 総画素数 |
+| 2 | アスペクト比 | 幅/高さの比率 |
+| 3 | RMSコントラスト | 二乗平均平方根コントラスト |
+| 4 | 輝度エントロピー | 輝度分布のエントロピー |
+| 5 | 複雑さ | 画像全体の複雑さ |
+| 6 | エッジ密度 | エッジ画素の密度 |
+
+#### 色特性（20次元）
+
+| # | 特徴量 | 説明 |
+|---|--------|------|
+| 7 | 色エントロピー | 色分布のエントロピー |
+| 8-10 | RGB平均 | R/G/Bチャンネルの平均値 |
+| 11-13 | Lab平均 | L/a/bチャンネルの平均値 |
+| 14-16 | HSV平均 | H/S/Vチャンネルの平均値 |
+| 17-19 | RGB標準偏差 | R/G/Bチャンネルの標準偏差 |
+| 20-22 | Lab標準偏差 | L/a/bチャンネルの標準偏差 |
+| 23-25 | HSV標準偏差 | H/S/Vチャンネルの標準偏差 |
+
+#### 構図とバランス（6次元）
+
+| # | 特徴量 | 説明 |
+|---|--------|------|
+| 26 | 鏡像対称性 | 鏡像対称の程度 |
+| 27 | DCM距離 | 密度補正モデルにおける距離 |
+| 28-29 | DCM位置 | DCMにおけるx/y位置 |
+| 30 | バランス | 構図全体のバランス |
+
+#### 対称性特徴（3次元）
+
+| # | 特徴量 | 説明 |
+|---|--------|------|
+| 31 | CNN対称性（左右） | CNNベースの左右対称性 |
+| 32 | CNN対称性（上下） | CNNベースの上下対称性 |
+| 33 | CNN対称性（左右＋上下） | 複合CNN対称性 |
+
+#### テクスチャと周波数特性（8次元）
+
+| # | 特徴量 | 説明 |
+|---|--------|------|
+| 34 | フーリエ勾配 | フーリエスペクトルの勾配 |
+| 35 | フーリエシグマ | フーリエ解析のシグマパラメータ |
+| 36 | 2Dフラクタル次元 | 2次元フラクタル次元 |
+| 37 | 3Dフラクタル次元 | 3次元フラクタル次元 |
+| 38 | 自己相似性（PHOG） | PHOGによる自己相似性 |
+| 39 | 自己相似性（CNN） | CNNベースの自己相似性 |
+| 40 | 異方性 | 方向依存性の指標 |
+| 41 | 均質性 | 空間的均一性の指標 |
+
+#### 視覚的複雑さ（3次元）
+
+| # | 特徴量 | 説明 |
+|---|--------|------|
+| 42 | 1次EOE | 1次エッジ方向エントロピー |
+| 43 | 2次EOE | 2次エッジ方向エントロピー |
+| 44 | スパース性 | 視覚特徴のスパース性 |
+| 45 | 変動性 | 時間的/空間的変動性 |
+
+**合計: 45次元**（img_file列を除く）
+
+これらの特徴量により、ユーザー固有の特性（116次元）と客観的な画像特性（45次元）を組み合わせ、個人化画像美的評価のための包括的な表現を学習できます。
+
+---
+
+## コミットメッセージ規則
+
+本リポジトリでは、コミットメッセージに以下のプレフィックスを使用します。
+
+| プレフィックス | 用途 |
+|----------------|------|
+| `feat:` | 新機能やモジュールの追加（モデル、関数、CLIなど） |
+| `fix:` | バグや不具合の修正 |
+| `refactor:` | 内部構造やコードの再構成（動作変更なし） |
+| `exp:` | 実験関連ファイルの追加・更新（`experiments/` 以下の変更） |
+| `data:` | データファイルの追加・更新（`data/`、`processed/` など） |
+| `docs:` | ドキュメントの更新（README、コメント、レポート） |
+| `conf:` | 設定ファイルの変更（`configs/`、環境設定） |
+| `chore:` | その他の雑務（依存関係の更新、`.gitignore` の修正など） |
+
+#### 例
+
+```text
+feat: add ResNet backbone option
+fix: correct metric calculation in evaluator
+refactor: simplify data loader structure
+exp: run baseline with smaller batch size
+data: update interim dataset split
+docs: update README with setup instructions
+conf: adjust base.yaml learning rate
+chore: bump dependency versions in pyproject.toml
+```
