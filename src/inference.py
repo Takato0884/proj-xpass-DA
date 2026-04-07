@@ -405,6 +405,13 @@ def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dic
     genres = list(datasets_dict_user.keys())
     genre = genres[0]
 
+    if num_attr is None or num_pt is None:
+        _sample = datasets_dict_user[genre]['val'][0]
+        num_attr = len(_sample['QIP'])
+        num_pt = len(_sample['traits'])
+        _tp.num_attr = num_attr
+        _tp.num_pt = num_pt
+
     model = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
     if model_state_dict is not None:
         model.load_state_dict(model_state_dict)
@@ -444,6 +451,13 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
     genres = list(datasets_dict.keys())
     genre = genres[0]
     genre_str = genre
+
+    if num_attr is None or num_pt is None:
+        _sample = datasets_dict[genre]['train'][0]
+        num_attr = len(_sample['QIP'])
+        num_pt = len(_sample['traits'])
+        _tp.num_attr = num_attr
+        _tp.num_pt = num_pt
 
     model = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
     if model_state_dict is not None:
