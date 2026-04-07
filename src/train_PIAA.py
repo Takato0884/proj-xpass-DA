@@ -897,7 +897,11 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
                     log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
                 wandb.log(log_dict, commit=True)
 
+            prev_lr = optimizer_user.param_groups[0]['lr']
             scheduler_user.step(val_ccc)
+            cur_lr = optimizer_user.param_groups[0]['lr']
+            if cur_lr < prev_lr:
+                tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (user {uid}, epoch {epoch}) <<<")
 
             if val_ccc > best_val_ccc:
                 best_val_ccc = val_ccc
@@ -987,7 +991,11 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
                 log_dict[f"{genre}/Val CCC"] = genre_metrics[genre]['ccc']
             wandb.log(log_dict, commit=True)
 
+        prev_lr = optimizer.param_groups[0]['lr']
         scheduler.step(val_ccc)
+        cur_lr = optimizer.param_groups[0]['lr']
+        if cur_lr < prev_lr:
+            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
 
         if val_ccc > best_val_ccc:
             best_val_ccc = val_ccc

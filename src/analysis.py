@@ -1,5 +1,6 @@
 import math
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ def aggregate(args):
     genre = args.genre
     pattern = args.pattern
     method = args.method  # e.g., "ICI" (optional)
+    min_id = args.min_id
     reports_dir = Path(args.reports_dir)
 
     # version に該当する fold ディレクトリを検索
@@ -66,6 +68,11 @@ def aggregate(args):
         else:
             glob_pattern = "*.json"
         matched_jsons = list(genre_dir.glob(glob_pattern))
+        if min_id is not None:
+            def _extract_id(p):
+                m = re.search(r'-(\d+)[_.]', p.name)
+                return int(m.group(1)) if m else -1
+            matched_jsons = [p for p in matched_jsons if _extract_id(p) >= min_id]
         if len(matched_jsons) == 0:
             print(f"Error: No JSON matching '{glob_pattern}' found in {genre_dir}", file=sys.stderr)
             sys.exit(1)
@@ -237,6 +244,13 @@ if __name__ == '__main__':
         nargs="+",
         default=None,
         help="Specific fold indices to aggregate (e.g., --folds 0 2 4). If omitted, all folds are used.",
+    )
+    agg_parser.add_argument(
+        "--min-id",
+        type=int,
+        default=None,
+        dest="min_id",
+        help="Minimum run ID to include (e.g., 61 filters to files with ID >= 61, like 'name-61_pretrain.json')",
     )
     agg_parser.add_argument(
         "--reports_dir",

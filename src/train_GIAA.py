@@ -89,11 +89,14 @@ def evaluate(model, dataloader, device, PIAA=False, epoch: int = None, phase_nam
                 target_mean = torch.sum(aesthetic_score_histogram * scale, dim=1, keepdim=True)
             mean_pred.append(outputs_mean.view(-1).cpu().numpy())
             mean_target.append(target_mean.view(-1).cpu().numpy())
+            # Normalize to [0, 1] for scale-consistent comparison with PIAA
+            outputs_mean_norm = outputs_mean / (num_bins - 1)
+            target_mean_norm = target_mean / (num_bins - 1)
             # MSE
-            mse = criterion_mse(outputs_mean, target_mean)
+            mse = criterion_mse(outputs_mean_norm, target_mean_norm)
             running_mse_loss += mse.item()
             # MAE
-            mae = F.l1_loss(outputs_mean, target_mean)
+            mae = F.l1_loss(outputs_mean_norm, target_mean_norm)
             running_mae_loss += mae.item()
 
             running_emd_loss += loss.item()
@@ -354,7 +357,11 @@ def trainer(dataloaders, model, optimizer, args, train_fn, evaluate_fn, device, 
             }, commit=True)
 
         eval_emd = val_emd_loss
+        prev_lr = optimizer.param_groups[0]['lr']
         scheduler.step(eval_emd)
+        cur_lr = optimizer.param_groups[0]['lr']
+        if cur_lr < prev_lr:
+            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
 
         # Early stopping check
         if eval_emd < best_test_emd:
