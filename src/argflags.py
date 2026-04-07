@@ -40,11 +40,9 @@ def parse_arguments(parse=True):
                         help='If set, keep best model in memory instead of saving to disk')
 
     # Loss function
-    parser.add_argument('--loss_type', type=str, default='rmse',
-                        choices=['rmse', 'ccc', 'ccc+rmse'],
-                        help='Training loss: rmse, ccc, or ccc+rmse')
-    parser.add_argument('--ccc_weight', type=float, default=0.5,
-                        help='Weight for CCC term when loss_type=ccc+rmse. Loss = ccc_weight*(1-CCC) + RMSE')
+    parser.add_argument('--loss_type', type=str, default='mse',
+                        choices=['mse', 'ccc'],
+                        help='Training loss: mse or ccc')
 
     if parse:
         args = parser.parse_args()

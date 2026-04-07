@@ -287,20 +287,13 @@ def ccc_loss_per_user(preds, targets, user_ids):
 def compute_loss(preds, targets, user_ids, args):
     """
     Unified loss dispatcher.
-    loss_type: 'mse' | 'rmse' | 'ccc' | 'ccc+rmse'
-    For 'ccc+rmse': loss = ccc_weight * (1-CCC) + RMSE
+    loss_type: 'mse' | 'ccc'
     """
     loss_type = args.loss_type
     if loss_type == 'mse':
         return F.mse_loss(preds, targets)
-    if loss_type == 'rmse':
-        return torch.sqrt(F.mse_loss(preds, targets) + 1e-8)
     if loss_type == 'ccc':
         return ccc_loss_per_user(preds, targets, user_ids)
-    if loss_type == 'ccc+rmse':
-        rmse = torch.sqrt(F.mse_loss(preds, targets) + 1e-8)
-        ccc_l = ccc_loss_per_user(preds, targets, user_ids)
-        return args.ccc_weight * ccc_l + rmse
     raise ValueError(f"Unknown loss_type: {loss_type}")
 
 
