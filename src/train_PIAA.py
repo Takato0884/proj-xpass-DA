@@ -8,9 +8,6 @@ from sklearn.metrics import ndcg_score
 import copy
 import pandas as pd
 from collections import defaultdict
-import json
-from datetime import datetime
-
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -21,6 +18,7 @@ from torch.amp import autocast, GradScaler
 from .argflags import parse_arguments, model_dir, wandb_tags
 from .data import load_data, collate_fn, build_global_encoders
 from .train_common import NIMA, discover_folds, num_bins, _BACKBONE_OUT_DIM
+from .inference import inference_finetune, evaluate_pretrain_on_val_piaa, inference_pretrain
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.0):
@@ -641,179 +639,6 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
     return cross_domain_results
 
 
-def inference_finetune(datasets_dict, args, device, dirname, experiment_name, backbone_dict, eval_datasets_dict=None):
-    """
-    Inference for all users across all genres after finetuning.
-    Args:
-        datasets_dict: dict of {genre: {'train': ds, 'val': ds, 'test': ds}}
-        args: arguments
-        device: device
-        dirname: directory name for saving models
-        experiment_name: experiment name
-        backbone_dict: dict of {genre: backbone_type}
-        eval_datasets_dict: optional dict of {target_genre: {'test': dataset}} for cross-domain evaluation
-    """
-    batch_size = args.batch_size
-    genres = list(datasets_dict.keys())
-    genre_str = '-'.join(genres)
-    all_user_ids = set()
-    genre_srocc_list = defaultdict(list)
-    genre_mae_list = defaultdict(list)
-    genre_ndcg_list = defaultdict(list)
-    genre_ccc_list = defaultdict(list)
-    for genre in genres:
-        all_user_ids.update(datasets_dict[genre]['test'].data['user_id'].values)
-
-    model_name_base = experiment_name
-
-    results = {}
-    cd_per_target = defaultdict(lambda: {'per_user': {}, 'per_user_per_head': {},
-                                          'head_sroccs': defaultdict(list), 'head_ndcgs': defaultdict(list),
-                                          'avg_sroccs': [], 'avg_ndcgs': []}) if eval_datasets_dict is not None else None
-
-    for uid in sorted(list(all_user_ids)):
-        print(f"Running inference for user {uid} using saved best model...")
-        best_model_path = os.path.join(dirname, f'{genre_str}_ICI_user_{uid}_{model_name_base}_finetune.pth')
-        model_user = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
-        try:
-            model_user.load_state_dict(torch.load(best_model_path))
-        except Exception as e:
-            print(f"Warning: best model not found for user {uid} at {best_model_path}, skipping. Error: {e}")
-            results[uid] = (np.nan, np.nan)
-            continue
-
-        # In-domain evaluation
-        test_loaders_dict = {}
-        total_test_samples = 0
-        for genre in genres:
-            user_test_ds = copy.copy(datasets_dict[genre]['test'])
-            user_test_ds.data = datasets_dict[genre]['test'].data[datasets_dict[genre]['test'].data['user_id'] == uid].reset_index(drop=True)
-            if len(user_test_ds) > 0:
-                test_loaders_dict[genre] = DataLoader(user_test_ds, batch_size=batch_size, shuffle=False,
-                                                       num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-                total_test_samples += len(user_test_ds)
-        if total_test_samples == 0:
-            print(f"No test samples for user {uid}, skipping.")
-            results[uid] = ({}, np.nan)
-        else:
-            genre_metrics, total_mae = evaluate(model_user, test_loaders_dict, device)
-            for genre, metrics in genre_metrics.items():
-                genre_srocc_list[genre].append(metrics['srocc'])
-                genre_mae_list[genre].append(metrics['mae'])
-                genre_ndcg_list[genre].append(metrics['ndcg@10'])
-                genre_ccc_list[genre].append(metrics['ccc'])
-            if args.is_log:
-                for genre, metrics in genre_metrics.items():
-                    wandb.log({
-                        f"{genre}/Test SROCC user_{uid}": metrics['srocc'],
-                        f"{genre}/Test MAE user_{uid}": metrics['mae'],
-                        f"{genre}/Test NDCG@10 user_{uid}": metrics['ndcg@10'],
-                        f"{genre}/Test CCC user_{uid}": metrics['ccc'],
-                    }, commit=False)
-                wandb.log({}, commit=True)
-            results[uid] = (genre_metrics, total_mae)
-
-        # Cross-domain evaluation
-        if eval_datasets_dict is not None:
-            eval_loaders_dict = {}
-            for target_genre, ds_dict in eval_datasets_dict.items():
-                user_eval_ds = copy.copy(ds_dict['test'])
-                user_eval_ds.data = ds_dict['test'].data[ds_dict['test'].data['user_id'] == uid].reset_index(drop=True)
-                if len(user_eval_ds) > 0:
-                    eval_loaders_dict[target_genre] = DataLoader(
-                        user_eval_ds, batch_size=batch_size, shuffle=False,
-                        num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-            if len(eval_loaders_dict) > 0:
-                cd_results = evaluate_cross_domain(model_user, eval_loaders_dict, device, genres)
-                for tg, tg_result in cd_results.items():
-                    for uid_str, metrics in tg_result['per_user'].items():
-                        cd_per_target[tg]['per_user'][uid_str] = metrics
-                        cd_per_target[tg]['avg_sroccs'].append(metrics['srocc'])
-                        cd_per_target[tg]['avg_ndcgs'].append(metrics['ndcg@10'])
-                    for uid_str, head_metrics in tg_result['per_user_per_head'].items():
-                        cd_per_target[tg]['per_user_per_head'][uid_str] = head_metrics
-                        for sg, m in head_metrics.items():
-                            cd_per_target[tg]['head_sroccs'][sg].append(m['srocc'])
-                            cd_per_target[tg]['head_ndcgs'][sg].append(m['ndcg@10'])
-
-    # Calculate genre-specific averages
-    genre_avg_metrics = {}
-    for genre in genres:
-        if genre in genre_srocc_list and len(genre_srocc_list[genre]) > 0:
-            genre_avg_metrics[genre] = {
-                'srocc': np.mean(genre_srocc_list[genre]),
-                'mae': np.mean(genre_mae_list[genre]),
-                'ndcg@10': np.mean(genre_ndcg_list[genre]),
-                'ccc': np.mean(genre_ccc_list[genre]),
-            }
-
-    if args.is_log:
-        log_dict = {}
-        for genre, metrics in genre_avg_metrics.items():
-            log_dict[f"{genre}/Avg. Test SROCC"] = metrics['srocc']
-            log_dict[f"{genre}/Avg. Test MAE"] = metrics['mae']
-            log_dict[f"{genre}/Avg. Test NDCG@10"] = metrics['ndcg@10']
-            log_dict[f"{genre}/Avg. Test CCC"] = metrics['ccc']
-        wandb.log(log_dict, commit=True)
-
-    cross_domain_results = {}
-    if cd_per_target is not None:
-        for tg, data in cd_per_target.items():
-            cross_domain_results[tg] = {
-                'source_heads': genres,
-                'method': 'average',
-                'average': {
-                    'srocc': float(np.mean(data['avg_sroccs'])) if data['avg_sroccs'] else 0.0,
-                    'ndcg@10': float(np.mean(data['avg_ndcgs'])) if data['avg_ndcgs'] else 0.0,
-                },
-                'per_head': {
-                    sg: {
-                        'srocc': float(np.mean(data['head_sroccs'][sg])) if data['head_sroccs'][sg] else 0.0,
-                        'ndcg@10': float(np.mean(data['head_ndcgs'][sg])) if data['head_ndcgs'][sg] else 0.0,
-                    }
-                    for sg in genres
-                },
-                'per_user': data['per_user'],
-                'per_user_per_head': data['per_user_per_head'],
-            }
-
-    # Save test performance to JSON
-    save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, genre_str)
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Prepare per-user results
-    per_user_results = {}
-    for uid, (genre_metrics_user, total_mae) in results.items():
-        if isinstance(genre_metrics_user, dict):
-            per_user_results[str(uid)] = {
-                genre: {'srocc': float(metrics['srocc']), 'mae': float(metrics['mae']), 'ndcg@10': float(metrics['ndcg@10']), 'ccc': float(metrics['ccc'])}
-                for genre, metrics in genre_metrics_user.items()
-            }
-
-    result_data = {
-        'experiment_name': model_name_base,
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'mode': 'PIAA_finetune',
-        'genres': genres,
-        'average_metrics': {
-            genre: {'srocc': float(metrics['srocc']), 'mae': float(metrics['mae']), 'ndcg@10': float(metrics['ndcg@10']), 'ccc': float(metrics['ccc'])}
-            for genre, metrics in genre_avg_metrics.items()
-        },
-        'per_user_metrics': per_user_results
-    }
-    if cross_domain_results:
-        result_data['cross_domain_metrics'] = cross_domain_results
-
-    # Remove trailing mode suffix to avoid duplication (e.g., "name_finetune_finetune.json")
-    base_name = model_name_base.removesuffix('_finetune')
-    json_filename = f"{genre_str}_ICI_{base_name}_finetune.json"
-    json_path = os.path.join(save_dir, json_filename)
-    with open(json_path, 'w') as f:
-        json.dump(result_data, f, indent=2)
-    print(f"Test results saved to {json_path}")
-
-    return results
-
 def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict):
     """
     Finetune trainer for a single genre.
@@ -1012,143 +837,6 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
 
     return best_model_path, best_state_dict
 
-def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dict, best_model_path, model_state_dict=None):
-    """
-    Pretrain後のベストモデルでval_piaa_datasetを使い、
-    ユーザーごとにSROCC/NDCGを算出し、wandbに100回分ログする。
-    """
-    batch_size = args.batch_size
-    genres = list(datasets_dict_user.keys())
-    genre = genres[0]
-
-    model = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
-    if model_state_dict is not None:
-        model.load_state_dict(model_state_dict)
-    else:
-        model.load_state_dict(torch.load(best_model_path))
-
-    all_user_ids = set(datasets_dict_user[genre]['val'].data['user_id'].values)
-    unique_user_ids = sorted(list(all_user_ids))
-
-    user_metrics = {}
-    for uid in unique_user_ids:
-        user_val_ds = copy.copy(datasets_dict_user[genre]['val'])
-        user_val_ds.data = datasets_dict_user[genre]['val'].data[datasets_dict_user[genre]['val'].data['user_id'] == uid].reset_index(drop=True)
-        if len(user_val_ds) > 0:
-            val_loaders_dict = {genre: DataLoader(user_val_ds, batch_size=batch_size, shuffle=False,
-                                                   num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-            genre_metrics, _ = evaluate(model, val_loaders_dict, device)
-            user_metrics[uid] = genre_metrics
-
-    print(f"Pretrain val PIAA evaluation done: {len(user_metrics)} users evaluated")
-
-def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict, best_model_path, eval_datasets_dict=None, model_state_dict=None):
-    """
-    Per-user evaluation after pretraining, separated from training.
-    Args:
-        datasets_dict: dict of {genre: {'train': ds, 'val': ds, 'test': ds}} (PIAA data)
-        eval_datasets_dict: optional dict of {target_genre: {'test': dataset}} for cross-domain evaluation
-        model_state_dict: if provided, load from this state dict instead of best_model_path
-    """
-    batch_size = args.batch_size
-    genres = list(datasets_dict.keys())
-    genre = genres[0]
-    genre_str = genre
-
-    model = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
-    if model_state_dict is not None:
-        model.load_state_dict(model_state_dict)
-    else:
-        model.load_state_dict(torch.load(best_model_path))
-
-    all_user_ids = set(datasets_dict[genre]['test'].data['user_id'].values)
-    unique_user_ids = sorted(list(all_user_ids))
-
-    genre_srocc_list = defaultdict(list)
-    genre_mae_list = defaultdict(list)
-    genre_ndcg_list = defaultdict(list)
-    genre_ccc_list = defaultdict(list)
-    per_user_results = {}
-
-    for uid in unique_user_ids:
-        user_test_ds = copy.copy(datasets_dict[genre]['test'])
-        user_test_ds.data = datasets_dict[genre]['test'].data[datasets_dict[genre]['test'].data['user_id'] == uid].reset_index(drop=True)
-        if len(user_test_ds) > 0:
-            test_loaders_dict = {genre: DataLoader(user_test_ds, batch_size=batch_size, shuffle=False,
-                                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-            genre_metrics, total_mae = evaluate(model, test_loaders_dict, device)
-            for g, metrics in genre_metrics.items():
-                genre_srocc_list[g].append(metrics['srocc'])
-                genre_mae_list[g].append(metrics['mae'])
-                genre_ndcg_list[g].append(metrics['ndcg@10'])
-                genre_ccc_list[g].append(metrics['ccc'])
-            if args.is_log:
-                log_dict = {}
-                for g, metrics in genre_metrics.items():
-                    log_dict[f"{g}/Test SROCC user_{uid}"] = metrics['srocc']
-                    log_dict[f"{g}/Test NDCG@10 user_{uid}"] = metrics['ndcg@10']
-                wandb.log(log_dict, commit=True)
-            per_user_results[str(uid)] = {
-                g: {'srocc': float(metrics['srocc']), 'ndcg@10': float(metrics['ndcg@10']), 'mae': float(metrics['mae']), 'ccc': float(metrics['ccc'])}
-                for g, metrics in genre_metrics.items()
-            }
-
-    genre_avg_metrics = {}
-    for g in genres:
-        if g in genre_srocc_list and len(genre_srocc_list[g]) > 0:
-            genre_avg_metrics[g] = {
-                'srocc': np.mean(genre_srocc_list[g]),
-                'mae': np.mean(genre_mae_list[g]),
-                'ndcg@10': np.mean(genre_ndcg_list[g]),
-                'ccc': np.mean(genre_ccc_list[g]),
-            }
-
-    if args.is_log:
-        log_dict = {}
-        for g, metrics in genre_avg_metrics.items():
-            log_dict[f"{g}/Avg. Test SROCC"] = metrics['srocc']
-            log_dict[f"{g}/Avg. Test MAE"] = metrics['mae']
-            log_dict[f"{g}/Avg. Test NDCG@10"] = metrics['ndcg@10']
-        wandb.log(log_dict, commit=True)
-
-    # Cross-domain evaluation
-    cross_domain_results = {}
-    if eval_datasets_dict is not None:
-        eval_loaders_dict = {}
-        for target_genre, ds_dict in eval_datasets_dict.items():
-            eval_loaders_dict[target_genre] = DataLoader(
-                ds_dict['test'], batch_size=batch_size, shuffle=False,
-                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-        cross_domain_results = evaluate_cross_domain(model, eval_loaders_dict, device, genres)
-
-    # Save test performance to JSON
-    save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, genre_str)
-    os.makedirs(save_dir, exist_ok=True)
-
-    model_basename = os.path.splitext(os.path.basename(best_model_path))[0]
-    result_data = {
-        'experiment_name': model_basename,
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'mode': 'PIAA_pretrain',
-        'genres': genres,
-        'average_metrics': {
-            g: {'srocc': float(metrics['srocc']), 'ndcg@10': float(metrics['ndcg@10']), 'mae': float(metrics['mae']), 'ccc': float(metrics['ccc'])}
-            for g, metrics in genre_avg_metrics.items()
-        },
-        'per_user_metrics': per_user_results
-    }
-    if cross_domain_results:
-        result_data['cross_domain_metrics'] = cross_domain_results
-
-    base_name = model_basename.removesuffix('_pretrain')
-    json_filename = f"{base_name}_pretrain.json"
-    json_path = os.path.join(save_dir, json_filename)
-    with open(json_path, 'w') as f:
-        json.dump(result_data, f, indent=2)
-    print(f"Test results saved to {json_path}")
-
-    return None
-
 def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune'):
     """Auto-discover pretrained model files.
 
@@ -1239,26 +927,21 @@ def run_main(args):
     num_attr = len(_sample['QIP'])
     print(f"Detected num_pt={num_pt}, num_attr={num_attr} from dataset")
 
-    # Load cross-domain evaluation datasets if --use_cross_eval is enabled
+    # Cross-domain evaluation on all other genres
     ALL_GENRES = ['art', 'fashion', 'scenery']
-    eval_datasets_dict = None
-    if args.use_cross_eval:
-        eval_genres = [g for g in ALL_GENRES if g != genre]
-        if not eval_genres:
-            print("Warning: No other genres available for cross-domain evaluation.")
+    eval_genres = [g for g in ALL_GENRES if g != genre]
+    eval_datasets_dict = {}
+    print(f"Cross-domain evaluation targets: {eval_genres}")
+    for eval_genre in eval_genres:
+        args_copy = copy.deepcopy(args)
+        args_copy.genre = eval_genre
+        if eval_genre == 'scenery' and args.use_video:
+            args_copy.backbone = 'i3d'
         else:
-            print(f"Cross-domain evaluation targets: {eval_genres}")
-            eval_datasets_dict = {}
-            for eval_genre in eval_genres:
-                args_copy = copy.deepcopy(args)
-                args_copy.genre = eval_genre
-                if eval_genre == 'scenery' and args.use_video:
-                    args_copy.backbone = 'i3d'
-                else:
-                    args_copy.backbone = args.backbone
-                _, _, _, _, _, _, test_piaa_dataset_eval = load_data(args_copy, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
-                eval_datasets_dict[eval_genre] = {'test': test_piaa_dataset_eval}
-                print(f"Loaded {len(test_piaa_dataset_eval)} test samples for cross-domain eval genre '{eval_genre}'")
+            args_copy.backbone = args.backbone
+        _, _, _, _, _, _, test_piaa_dataset_eval = load_data(args_copy, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
+        eval_datasets_dict[eval_genre] = {'test': test_piaa_dataset_eval}
+        print(f"Loaded {len(test_piaa_dataset_eval)} test samples for cross-domain eval genre '{eval_genre}'")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dirname = os.path.join(model_dir(args), genre)

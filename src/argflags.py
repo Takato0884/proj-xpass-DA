@@ -20,9 +20,6 @@ def parse_arguments(parse=True):
     parser.add_argument('--root_dir', type=str, default='/home/hayashi0884/proj-xpass-DA/data')
     parser.add_argument('--piaa_mode', type=str, default='PIAA_pretrain')
 
-    parser.add_argument('--use_cross_eval', action='store_true', default=True,
-                        help='Enable cross-domain evaluation on all genres not in --genre. '
-                             'Available genres: art, fashion, scenery.')
     parser.add_argument('--no_log', action='store_false', dest='is_log', help='Disable logging')
 
     parser.add_argument('--num_epochs', type=int, default=200)
