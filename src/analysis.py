@@ -206,6 +206,284 @@ def aggregate(args):
                 print(f"    Average CCC:     {avg_ccc:.6f} (std: {std_ccc:.6f})")
 
 
+def plot_quality(args):
+    """被験者ごとの品質管理指標（p_mode, MAE, r_fast）をプロットする"""
+    import numpy as np
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    import sys as _sys
+    import json as _json
+
+    # preprocessing モジュールを import して rawデータ処理ロジックを再利用
+    _src = Path(__file__).resolve().parent
+    if str(_src) not in _sys.path:
+        _sys.path.insert(0, str(_src))
+    from preprocessing import make_user_csv, make_ratings_csv
+
+    score_col = args.score_col
+    domains = args.domains
+    mad_multiplier = args.mad_multiplier
+    outlier_method = args.outlier_method
+    fast_user_thresh = args.fast_user_thresh
+    min_rt_art_fashion = args.min_rt_art_fashion
+    min_rt_scenery = args.min_rt_scenery
+    raw_dir = Path(args.raw_dir)
+
+    # ── rawデータから完了者ユーザー情報と排除前ratingsを再構築 ────────────────
+    import tempfile, os as _os
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        _tmp_users = _os.path.join(_tmpdir, "users.csv")
+        make_user_csv(str(raw_dir), _tmp_users)
+        ratings_df = make_ratings_csv(
+            annotation_path=str(raw_dir / "user-annotation-data_rows.csv"),
+            finished_users_path=_tmp_users,
+            rel_tasks_users_path=str(raw_dir / "annotation-tasks_rows.csv"),
+            user_path=str(raw_dir / "user-data_rows.csv"),
+            url_filename_path=str(raw_dir / "url_filename_rows.csv"),
+        )
+        finished_uuids = set(pd.read_csv(_tmp_users)["uuid"].astype(str).unique())
+
+    print(f"Loaded {len(finished_uuids)} finished UUIDs from raw data.")
+    print(f"Reconstructed ratings: {len(ratings_df)} rows.")
+
+    # ── r_fast 用: 生アノテーションデータから Time を取り出す ─────────────────
+    _genre_map = {"アート作品": "art", "ファッション": "fashion", "映像": "scenery"}
+
+    def _parse_data(val):
+        if isinstance(val, dict):
+            return val
+        try:
+            return _json.loads(val)
+        except Exception:
+            try:
+                import ast as _ast
+                return _ast.literal_eval(val)
+            except Exception:
+                return None
+
+    raw_ann_df = pd.read_csv(str(raw_dir / "user-annotation-data_rows.csv"))
+    raw_ann_df = raw_ann_df[raw_ann_df["uuid"].astype(str).isin(finished_uuids)]
+
+    raw_time_rows = []
+    for _, row in raw_ann_df.iterrows():
+        d = _parse_data(row.get("data"))
+        if not isinstance(d, dict):
+            continue
+        genre_jp = d.get("genre")
+        genre_en = _genre_map.get(genre_jp)
+        if genre_en is None:
+            continue
+        results = d.get("result", [])
+        uuid = str(row.get("uuid", ""))
+        for result in results:
+            if isinstance(result, (list, tuple)) and len(result) > 10:
+                raw_time_rows.append({"uuid": uuid, "genre": genre_en, "Time": result[10]})
+    raw_time_df = pd.DataFrame(raw_time_rows)
+
+    def _threshold_high(values: np.ndarray) -> float:
+        if outlier_method == "mad":
+            med = np.median(values)
+            spread = np.median(np.abs(values - med))
+            return float(med + mad_multiplier * spread)
+        mu = float(np.mean(values))
+        sd = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+        return mu + mad_multiplier * sd
+
+    # ── 1. p_mode ──────────────────────────────────────────────────────────────
+    p_mode_data: dict = {}
+    for domain in domains:
+        dom_df = ratings_df[ratings_df["genre"] == domain]
+        if dom_df.empty or score_col not in dom_df.columns:
+            continue
+        pm: dict = {}
+        for uid, udf in dom_df.groupby(dom_df["uuid"].astype(str)):
+            scores = udf[score_col].dropna()
+            if len(scores) > 0:
+                pm[uid] = scores.value_counts().iloc[0] / len(scores)
+        p_mode_data[domain] = pm
+
+    # ── 2. MAE (retest) ────────────────────────────────────────────────────────
+    mae_data: dict = {}
+    for domain in domains:
+        dom_df = ratings_df[ratings_df["genre"] == domain]
+        if dom_df.empty or score_col not in dom_df.columns:
+            continue
+        mae: dict = {}
+        for uid, udf in dom_df.groupby(dom_df["uuid"].astype(str)):
+            dup_mask = udf.duplicated("sample_id", keep=False)
+            dup_samples = udf.loc[dup_mask, "sample_id"].unique()
+            r1_list, r2_list = [], []
+            for sid in dup_samples:
+                pair = udf[udf["sample_id"] == sid][score_col].dropna().values
+                if len(pair) >= 2:
+                    r1_list.append(pair[0])
+                    r2_list.append(pair[1])
+            if len(r1_list) >= 3:
+                mae[uid] = float(np.mean(np.abs(np.array(r1_list, dtype=float) - np.array(r2_list, dtype=float))))
+        mae_data[domain] = mae
+
+    # ── 3. r_fast (rt_prop) ────────────────────────────────────────────────────
+    # 生アノテーションデータ (raw_time_df) から計算
+    r_fast_data: dict = {}
+    if not raw_time_df.empty:
+        raw_time_df["Time"] = pd.to_numeric(raw_time_df["Time"], errors="coerce")
+        for domain in domains:
+            thresh = min_rt_scenery if domain == "scenery" else min_rt_art_fashion
+            dom_df = raw_time_df[raw_time_df["genre"] == domain]
+            if dom_df.empty:
+                continue
+            rf: dict = {}
+            for uid, udf in dom_df.groupby(dom_df["uuid"].astype(str)):
+                valid = udf["Time"].dropna()
+                if len(valid) > 0:
+                    rf[uid] = float((valid < thresh).sum() / len(valid))
+            r_fast_data[domain] = rf
+
+    # ── Determine per-metric excluded UUIDs ───────────────────────────────────
+    excluded_p_mode: set = set()
+    for domain, pm in p_mode_data.items():
+        if len(pm) < 2:
+            continue
+        uids = np.array(list(pm.keys()))
+        vals = np.array(list(pm.values()), dtype=float)
+        excluded_p_mode.update(uids[vals > _threshold_high(vals)].tolist())
+
+    excluded_mae: set = set()
+    for domain, mae in mae_data.items():
+        if len(mae) < 2:
+            continue
+        uids = np.array(list(mae.keys()))
+        vals = np.array(list(mae.values()), dtype=float)
+        excluded_mae.update(uids[vals > _threshold_high(vals)].tolist())
+
+    excluded_r_fast: set = set()
+    for domain, rf in r_fast_data.items():
+        for uid, val in rf.items():
+            if val > fast_user_thresh:
+                excluded_r_fast.add(uid)
+
+    excluded_all = excluded_p_mode | excluded_mae | excluded_r_fast
+    print(
+        f"Excluded: p_mode={len(excluded_p_mode)}, MAE={len(excluded_mae)}, "
+        f"r_fast={len(excluded_r_fast)}, total={len(excluded_all)}"
+    )
+
+    # ── per-domain excluded sets（そのドメイン・指標で閾値超えのみ赤）────────
+    def _domain_excluded(data_dict, dynamic_thresh):
+        """ドメインごとに閾値超えUUIDのsetを返す"""
+        result = {}
+        for domain, dd in data_dict.items():
+            if len(dd) < 2:
+                result[domain] = set()
+                continue
+            uids = np.array(list(dd.keys()))
+            vals = np.array(list(dd.values()), dtype=float)
+            thr = _threshold_high(vals) if dynamic_thresh else fast_user_thresh
+            result[domain] = set(uids[vals > thr].tolist())
+        return result
+
+    domain_excl_p_mode = _domain_excluded(p_mode_data, True)
+    domain_excl_mae    = _domain_excluded(mae_data,    True)
+    domain_excl_r_fast = _domain_excluded(r_fast_data, False)
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    from matplotlib.lines import Line2D
+
+    rng = np.random.default_rng(0)
+    jitter_width = 0.12
+
+    metrics = [
+        ("p_mode", p_mode_data, "Mode proportion", True,  domain_excl_p_mode),
+        ("mae",    mae_data,    "MAE",              True,  domain_excl_mae),
+        ("r_fast", r_fast_data, "Fast response rate", False, domain_excl_r_fast),
+    ]
+
+    output_base = Path(args.output)
+    stem = output_base.stem
+    suffix = output_base.suffix
+    output_base.parent.mkdir(parents=True, exist_ok=True)
+
+    for metric_key, data_dict, metric_label, dynamic_thresh, domain_excl in metrics:
+        active = [d for d in domains if data_dict.get(d)]
+        if not active:
+            continue
+
+        fig, ax = plt.subplots(figsize=(1.3 * len(active) + 0.6, 4.0))
+        ax.set_ylabel(metric_label, fontsize=13)
+        ax.tick_params(axis="both", labelsize=12)
+
+        x_positions = {d: i for i, d in enumerate(active)}
+
+        for domain in active:
+            domain_data = data_dict[domain]
+            uids = np.array(list(domain_data.keys()))
+            vals = np.array(list(domain_data.values()), dtype=float)
+            excl_here = domain_excl.get(domain, set())
+
+            x_base = x_positions[domain]
+            x_jitter = x_base + rng.uniform(-jitter_width, jitter_width, size=len(vals))
+
+            # 非排除（黒）→ 排除（赤）の順に描いて赤を前面に
+            mask_excl = np.array([uid in excl_here for uid in uids])
+            ax.scatter(x_jitter[~mask_excl], vals[~mask_excl],
+                       c="black", s=18, alpha=0.5, linewidths=0, zorder=2)
+            if mask_excl.any():
+                ax.scatter(x_jitter[mask_excl], vals[mask_excl],
+                           c="red", s=22, alpha=0.85, linewidths=0, zorder=3)
+
+            # 箱ひげ図（外れ値非表示、黒）
+            ax.boxplot(
+                vals, positions=[x_base], widths=0.5,
+                showfliers=False,
+                patch_artist=False,
+                boxprops=dict(color="black", linewidth=1.2),
+                medianprops=dict(color="black", linewidth=1.5),
+                whiskerprops=dict(color="black", linewidth=1.0),
+                capprops=dict(color="black", linewidth=1.0),
+                zorder=1,
+            )
+
+            # 排除水準（赤破線）
+            thr = _threshold_high(vals) if dynamic_thresh else fast_user_thresh
+            ax.plot(
+                [x_base - 0.35, x_base + 0.35], [thr, thr],
+                color="red", linestyle="--", linewidth=1.5, zorder=4,
+            )
+
+        ax.set_xticks(list(x_positions.values()))
+        ax.set_xticklabels(list(x_positions.keys()), fontsize=12)
+        ax.set_xlim(-0.6, len(active) - 0.4)
+
+        all_vals = [v for d in active for v in data_dict[d].values()]
+        all_thrs = [
+            _threshold_high(np.array(list(data_dict[d].values()), dtype=float))
+            if dynamic_thresh else fast_user_thresh
+            for d in active if data_dict.get(d)
+        ]
+        y_max = max(max(all_vals), max(all_thrs)) if all_vals else fast_user_thresh
+        ax.set_ylim(bottom=0, top=y_max * 1.15)
+
+        # レジェンドはMAEのみ表示
+        if metric_key == "mae":
+            legend_elements = [
+                Line2D([0], [0], marker="o", color="w", markerfacecolor="black",
+                       markersize=7, alpha=0.6, label="Annotator"),
+                Line2D([0], [0], color="red", linestyle="--", linewidth=1.5,
+                       label="Exclusion criterion"),
+            ]
+            ax.legend(handles=legend_elements, fontsize=9, loc="upper left",
+                      framealpha=0.8)
+
+        plt.tight_layout()
+        out_path = output_base.parent / f"{stem}_{metric_key}{suffix}"
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {out_path}")
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -259,9 +537,81 @@ if __name__ == '__main__':
         help="Path to reports/exp directory",
     )
 
+    # Subcommand: plot_quality
+    qc_parser = subparsers.add_parser(
+        "plot_quality",
+        help="Plot per-subject quality control metrics (p_mode, MAE, r_fast)",
+    )
+    qc_parser.add_argument(
+        "ratings_csv",
+        help="(unused for metric computation; kept for compatibility) Path to ratings CSV",
+    )
+    qc_parser.add_argument(
+        "--raw-dir",
+        default=str(Path.home() / "proj-xpass" / "data" / "raw"),
+        dest="raw_dir",
+        help=(
+            "Path to raw data directory containing user-annotation-data_rows.csv etc. "
+            "Default: ~/proj-xpass/data/raw"
+        ),
+    )
+    qc_parser.add_argument(
+        "--score-col",
+        default="Aesthetic",
+        help="Score column name used for p_mode and MAE (default: Aesthetic)",
+    )
+    qc_parser.add_argument(
+        "--domains",
+        nargs="+",
+        default=["art", "fashion", "scenery"],
+        help="Genres to evaluate (default: art fashion scenery)",
+    )
+    qc_parser.add_argument(
+        "--min-rt-art-fashion",
+        type=float,
+        default=10.0,
+        dest="min_rt_art_fashion",
+        help="Fast-response threshold (s) for art/fashion (default: 10)",
+    )
+    qc_parser.add_argument(
+        "--min-rt-scenery",
+        type=float,
+        default=30.0,
+        dest="min_rt_scenery",
+        help="Fast-response threshold (s) for scenery (default: 30)",
+    )
+    qc_parser.add_argument(
+        "--fast-user-thresh",
+        type=float,
+        default=0.2,
+        dest="fast_user_thresh",
+        help="Max allowed proportion of fast responses per user (default: 0.2)",
+    )
+    qc_parser.add_argument(
+        "--mad-multiplier",
+        type=float,
+        default=2.5,
+        dest="mad_multiplier",
+        help="Multiplier k for outlier threshold (default: 2.5)",
+    )
+    qc_parser.add_argument(
+        "--outlier-method",
+        choices=["mad", "std"],
+        default="std",
+        dest="outlier_method",
+        help="Outlier detection method: mad or std (default: std)",
+    )
+    qc_parser.add_argument(
+        "-o", "--output",
+        default="quality_check.png",
+        help="Output figure path (default: quality_check.png)",
+    )
+
     args = parser.parse_args()
 
     if args.command == 'aggregate':
         aggregate(args)
+    elif args.command == 'plot_quality':
+        plot_quality(args)
     else:
         parser.print_help()

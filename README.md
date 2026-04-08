@@ -402,6 +402,13 @@ python src/analysis.py aggregate \
   --genre art \
   --pattern finetune \
   --folds 0 2 4
+
+# run ID 61以降のファイルのみ集約
+python src/analysis.py aggregate \
+  --version v3 \
+  --genre art \
+  --pattern finetune \
+  --min-id 61
 ```
 
 #### オプション引数一覧
@@ -413,6 +420,7 @@ python src/analysis.py aggregate \
 | `--pattern` | str | `""` | JSONファイルを絞り込むglobパターン（例: `pretrain`, `finetune`） |
 | `--method` | str | なし | JSONファイルをさらに絞り込むメソッド名（例: `ICI`） |
 | `--folds` | list | なし | 集約対象のfoldインデックス（例: `--folds 0 2 4`）。省略時は全fold |
+| `--min-id` | int | なし | 集約対象のrun IDの下限（例: `61` → `name-61_*.json` 以降のみ対象） |
 | `--reports_dir` | str | `reports/exp` | JSONファイルの検索ディレクトリ |
 
 ---

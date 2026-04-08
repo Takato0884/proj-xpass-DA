@@ -232,6 +232,13 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
     genre_str = '-'.join(genres)
+
+    if num_attr is None or num_pt is None:
+        _sample = datasets_dict[genres[0]]['test'][0]
+        num_attr = len(_sample['QIP'])
+        num_pt = len(_sample['traits'])
+        _tp.num_attr = num_attr
+        _tp.num_pt = num_pt
     all_user_ids = set()
     genre_srocc_list = defaultdict(list)
     genre_mae_list = defaultdict(list)
