@@ -19,6 +19,8 @@ def parse_arguments(parse=True):
     parser.add_argument('--use_video', action='store_true', help='Use video (I3D) for scenery genre instead of images (ResNet50)')
     parser.add_argument('--root_dir', type=str, default='/home/hayashi0884/proj-xpass-DA/data')
     parser.add_argument('--piaa_mode', type=str, default='PIAA_pretrain')
+    parser.add_argument('--model_type', type=str, default='ICI', choices=['ICI', 'MIR'],
+                        help='PIAA model architecture: ICI (Interaction-based) or MIR (MLP Interaction Regression)')
 
     parser.add_argument('--no_log', action='store_false', dest='is_log', help='Disable logging')
 
@@ -68,6 +70,8 @@ def wandb_tags(args):
         f"batch_size: {args.batch_size}"
         ]
 
+    if hasattr(args, 'model_type'):
+        tags += [f"model_type={args.model_type}"]
     if args.dropout > 0.:
         tags += [f"dropout={args.dropout}"]
     if hasattr(args, 'use_backbone_image') and args.use_backbone_image:

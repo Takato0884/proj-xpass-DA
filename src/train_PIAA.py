@@ -33,6 +33,103 @@ class MLP(nn.Module):
             x = self.drop(x)
         return self.fc2(x)
 
+class SharedMLP(nn.Module):
+    """MLP with shared lower layers and genre-specific upper layers."""
+    def __init__(self, input_dim, shared_hidden_dim, genre_hidden_dim, output_dim, genres):
+        super(SharedMLP, self).__init__()
+        self.genres = genres
+        self.shared_fc1 = nn.Linear(input_dim, shared_hidden_dim)
+        self.shared_fc2 = nn.Linear(shared_hidden_dim, shared_hidden_dim)
+        self.genre_fc1_dict = nn.ModuleDict()
+        self.genre_fc2_dict = nn.ModuleDict()
+        for genre in self.genres:
+            self.genre_fc1_dict[genre] = nn.Linear(shared_hidden_dim, genre_hidden_dim)
+            self.genre_fc2_dict[genre] = nn.Linear(genre_hidden_dim, output_dim)
+
+    def forward(self, x, genre):
+        x = F.relu(self.shared_fc1(x))
+        x = F.relu(self.shared_fc2(x))
+        x = F.relu(self.genre_fc1_dict[genre](x))
+        return self.genre_fc2_dict[genre](x)
+
+
+class PIAA_MIR_CrossDomain(nn.Module):
+    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, hidden_size=1024, dropout=None, use_uncertainty_weighting=False):
+        super(PIAA_MIR_CrossDomain, self).__init__()
+        self.num_bins = num_bins
+        self.num_attr = num_attr
+        self.num_pt = num_pt
+        self.genres = genres
+        self.register_buffer('scale', torch.arange(0, num_bins).float())
+        self.use_uncertainty_weighting = use_uncertainty_weighting
+
+        if self.use_uncertainty_weighting:
+            self.log_vars = nn.ParameterDict({
+                genre: nn.Parameter(torch.zeros(1))
+                for genre in genres
+            })
+
+        self.nima_dict = nn.ModuleDict()
+        for genre in genres:
+            backbone_type = backbone_dict.get(genre, 'resnet50')
+            self.nima_dict[genre] = NIMA(num_bins, backbone_type)
+
+        # SharedMLP for interaction features (image_attr * personal_traits outer product flattened)
+        self.mlp1 = SharedMLP(
+            input_dim=(num_attr * num_pt),
+            shared_hidden_dim=hidden_size,
+            genre_hidden_dim=hidden_size // 2,
+            output_dim=1,
+            genres=genres)
+
+        # Genre-specific MLP for NIMA distribution output
+        self.mlp2_dict = nn.ModuleDict()
+        for genre in genres:
+            self.mlp2_dict[genre] = MLP(num_bins, 16, 1)
+
+    def freeze_backbone(self):
+        for genre, nima in self.nima_dict.items():
+            backbone = nima.backbone
+            for param in backbone.parameters():
+                param.requires_grad = False
+            backbone.eval()
+
+    def _set_frozen_modules_eval(self):
+        for genre, nima in self.nima_dict.items():
+            backbone = nima.backbone
+            if not any(p.requires_grad for p in backbone.parameters()):
+                backbone.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if mode:
+            self._set_frozen_modules_eval()
+        return self
+
+    def forward(self, images, personal_traits, image_attributes, genre):
+        logit = self.nima_dict[genre](images)
+        prob = F.softmax(logit, dim=1)
+
+        A_ij = image_attributes.unsqueeze(2) * personal_traits.unsqueeze(1)
+        I_ij = A_ij.view(images.size(0), -1)
+
+        interaction_outputs = self.mlp1(I_ij, genre)
+        direct_outputs = self.mlp2_dict[genre](prob * self.scale)
+        return interaction_outputs + direct_outputs
+
+
+def build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args):
+    """Instantiate PIAA_ICI or PIAA_MIR based on args.model_type."""
+    if args.model_type == 'MIR':
+        return PIAA_MIR_CrossDomain(
+            num_bins, num_attr, num_pt, genres, backbone_dict,
+            dropout=args.dropout)
+    else:
+        return PIAA_ICI_CrossDomain(
+            num_bins, num_attr, num_pt, genres, backbone_dict,
+            dropout=args.dropout, use_backbone_image=args.use_backbone_image)
+
+
 class InternalInteraction(nn.Module):
     def __init__(self, input_dim, hidden_dim, dropout=0.0):
         super(InternalInteraction, self).__init__()
@@ -673,7 +770,7 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
         val_loaders_dict = {genre: DataLoader(user_val_ds, batch_size=batch_size, shuffle=False,
                                               num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
-        model_user = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
+        model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
         pretrained_path = pretrained_model_dict[genre]
         if pretrained_path is not None and os.path.exists(pretrained_path):
             try:
@@ -697,7 +794,7 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
 
         best_val_ccc = -float('inf')
         patience = 0
-        best_model_path = os.path.join(dirname, f'{genre_str}_ICI_user_{uid}_{experiment_name}_finetune.pth')
+        best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{experiment_name}_finetune.pth')
 
         scaler = GradScaler('cuda')
         for epoch in range(args.num_epochs):
@@ -765,7 +862,7 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
     val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
                                           num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
-    model = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
+    model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
 
     # Load genre-specific NIMA weights
     pretrained_path = pretrained_model_dict[genre]
@@ -789,7 +886,7 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
 
     best_val_ccc = -float('inf')
     patience = 0
-    best_model_path = os.path.join(dirname, f'{genre_str}_ICI_{experiment_name}_pretrain.pth')
+    best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_{experiment_name}_pretrain.pth')
     best_state_dict = None
 
     scaler = GradScaler('cuda')
@@ -888,7 +985,7 @@ def run_main(args):
             tags.append("use_video")
         wandb.init(
                    project=f"XPASS",
-                   notes=f"ICI",
+                   notes=f"{args.model_type}",
                    tags=tags)
         wandb.config = {
             "learning_rate": args.lr,

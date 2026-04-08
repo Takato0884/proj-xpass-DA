@@ -225,7 +225,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
         eval_datasets_dict: optional dict of {target_genre: {'test': dataset}} for cross-domain evaluation
     """
     from . import train_PIAA as _tp
-    from .train_PIAA import evaluate, evaluate_cross_domain, PIAA_ICI_CrossDomain
+    from .train_PIAA import evaluate, evaluate_cross_domain, build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
@@ -256,8 +256,8 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
 
     for uid in sorted(list(all_user_ids)):
         print(f"Running inference for user {uid} using saved best model...")
-        best_model_path = os.path.join(dirname, f'{genre_str}_ICI_user_{uid}_{model_name_base}_finetune.pth')
-        model_user = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
+        best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{model_name_base}_finetune.pth')
+        model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
         try:
             model_user.load_state_dict(torch.load(best_model_path))
         except Exception as e:
@@ -404,7 +404,7 @@ def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dic
     ユーザーごとにSROCC/NDCGを算出し、wandbに100回分ログする。
     """
     from . import train_PIAA as _tp
-    from .train_PIAA import evaluate, PIAA_ICI_CrossDomain
+    from .train_PIAA import evaluate, build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
@@ -419,7 +419,7 @@ def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dic
         _tp.num_attr = num_attr
         _tp.num_pt = num_pt
 
-    model = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
+    model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
     if model_state_dict is not None:
         model.load_state_dict(model_state_dict)
     else:
@@ -450,7 +450,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         model_state_dict: if provided, load from this state dict instead of best_model_path
     """
     from . import train_PIAA as _tp
-    from .train_PIAA import evaluate, evaluate_cross_domain, PIAA_ICI_CrossDomain
+    from .train_PIAA import evaluate, evaluate_cross_domain, build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
@@ -466,7 +466,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         _tp.num_attr = num_attr
         _tp.num_pt = num_pt
 
-    model = PIAA_ICI_CrossDomain(num_bins, num_attr, num_pt, genres, backbone_dict, dropout=args.dropout, use_backbone_image=args.use_backbone_image).to(device)
+    model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
     if model_state_dict is not None:
         model.load_state_dict(model_state_dict)
     else:
@@ -628,9 +628,8 @@ def _run_giaa(model_path: str, genre: str, fold: str, cli, device):
 
 
 def _run_piaa_pretrain(model_path: str, genre: str, fold: str, cli, device):
-    """Run PIAA_pretrain (ICI) inference for a single model."""
+    """Run PIAA_pretrain inference for a single model."""
     from . import train_PIAA as _tp
-    from .train_PIAA import PIAA_ICI_CrossDomain
     from .data import load_data, build_global_encoders
 
     args = _build_args(genre, fold, cli)
@@ -670,7 +669,7 @@ def _run_piaa_pretrain(model_path: str, genre: str, fold: str, cli, device):
             args_copy, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
         eval_datasets_dict[eval_genre] = {'test': eval_test}
 
-    print(f"  Loading ICI model from {model_path} ...")
+    print(f"  Loading model from {model_path} ...")
     dirname = os.path.dirname(model_path)
 
     print(f"  Running PIAA_pretrain inference ...")

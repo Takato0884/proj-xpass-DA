@@ -17,7 +17,7 @@ from torch.amp import autocast, GradScaler
 import copy
 
 from .argflags import parse_arguments, model_dir, wandb_tags
-from .data import load_data, collate_fn
+from .data import load_data, load_data_giaa_only, collate_fn
 from .train_common import NIMA, EarthMoverDistance, earth_mover_distance, discover_folds, num_bins
 from .inference import inference
 
@@ -184,6 +184,7 @@ def trainer(dataloaders, model, optimizer, args, train_fn, evaluate_fn, device, 
 criterion_mse = nn.MSELoss()
 
 def run_main(args):
+    is_v_giaa = (args.dataset_ver == 'v_giaa')
     batch_size = args.batch_size
     print(args)
 
@@ -205,46 +206,67 @@ def run_main(args):
         experiment_name = ''
         model_basename = f'{args.genre}_NIMA_default.pth'
 
-    # Create dataloaders
-    train_giaa_dataset, train_piaa_dataset, _, val_giaa_dataset, val_piaa_dataset, _, test_piaa_dataset = load_data(args)
-    train_giaa_dataloader = DataLoader(train_giaa_dataset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    train_piaa_dataloader = DataLoader(train_piaa_dataset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    val_giaa_dataloader = DataLoader(val_giaa_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    val_piaa_dataloader = DataLoader(val_piaa_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    test_piaa_dataloader = DataLoader(test_piaa_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    dataloaders = (train_giaa_dataloader, val_giaa_dataloader, test_piaa_dataloader)
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize the best test loss and the best model
     dirname = os.path.join(model_dir(args), args.genre)
     best_modelname = os.path.join(dirname, model_basename)
 
-    # Cross-domain evaluation on all other genres
-    ALL_GENRES = ['art', 'fashion', 'scenery']
-    eval_genres = [g for g in ALL_GENRES if g != args.genre]
-    eval_datasets_dict = {}
-    print(f"Cross-domain evaluation targets: {eval_genres}")
-    for eval_genre in eval_genres:
-        args_copy = copy.deepcopy(args)
-        args_copy.genre = eval_genre
-        _, _, _, _, _, _, eval_test_piaa_dataset = load_data(args_copy)
-        eval_datasets_dict[eval_genre] = {'test': eval_test_piaa_dataset}
-        print(f"Loaded {len(eval_test_piaa_dataset)} test samples for cross-domain eval genre '{eval_genre}'")
-
     # Initialize the combined model
     model = NIMA(num_bins, backbone=args.backbone, dropout=args.dropout).to(device)
-
     model.freeze_backbone()
-
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
-    trainer(dataloaders, model, optimizer, args, train, evaluate, device, best_modelname)
-    test_piaa_srocc, test_piaa_mse = inference(train_piaa_dataset, val_piaa_dataset,
-        test_piaa_dataset, args, device, model, eval_split="Val", experiment_name=experiment_name, model_path=best_modelname)
-    test_piaa_srocc, test_piaa_mse = inference(train_piaa_dataset, val_piaa_dataset,
-        test_piaa_dataset, args, device, model, eval_split="Test", experiment_name=experiment_name,
-        model_path=best_modelname, eval_datasets_dict=eval_datasets_dict)
+    if is_v_giaa:
+        # v_giaa: train/val/test are image-level GIAA splits; no PIAA, no cross-validation
+        train_giaa_dataset, val_giaa_dataset, test_giaa_dataset = load_data_giaa_only(args)
+        train_giaa_dataloader = DataLoader(train_giaa_dataset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        val_giaa_dataloader = DataLoader(val_giaa_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        test_giaa_dataloader = DataLoader(test_giaa_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        dataloaders = (train_giaa_dataloader, val_giaa_dataloader, test_giaa_dataloader)
+
+        trainer(dataloaders, model, optimizer, args, train, evaluate, device, best_modelname)
+
+        # Evaluate on held-out GIAA test set
+        # Ground truth: expected value of the per-image histogram (average of multiple raters)
+        # Prediction:   expected value of the predicted softmax distribution
+        test_emd, test_srocc, _, test_mse, _, test_mae, test_ccc = evaluate(model, test_giaa_dataloader, device, phase_name="Test")
+        print(f"[{args.genre} GIAA Test] EMD: {test_emd:.4f}  SROCC: {test_srocc:.4f}  CCC: {test_ccc:.4f}  MSE: {test_mse:.4f}")
+        if args.is_log:
+            wandb.log({
+                f"{args.genre}/Test EMD GIAA": test_emd,
+                f"{args.genre}/Test SROCC GIAA": test_srocc,
+                f"{args.genre}/Test CCC GIAA": test_ccc,
+                f"{args.genre}/Test MSE GIAA": test_mse,
+            })
+    else:
+        # Create dataloaders (PIAA + GIAA)
+        train_giaa_dataset, train_piaa_dataset, _, val_giaa_dataset, val_piaa_dataset, _, test_piaa_dataset = load_data(args)
+        train_giaa_dataloader = DataLoader(train_giaa_dataset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        train_piaa_dataloader = DataLoader(train_piaa_dataset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        val_giaa_dataloader = DataLoader(val_giaa_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        val_piaa_dataloader = DataLoader(val_piaa_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        test_piaa_dataloader = DataLoader(test_piaa_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        dataloaders = (train_giaa_dataloader, val_giaa_dataloader, test_piaa_dataloader)
+
+        # Cross-domain evaluation on all other genres
+        ALL_GENRES = ['art', 'fashion', 'scenery']
+        eval_genres = [g for g in ALL_GENRES if g != args.genre]
+        eval_datasets_dict = {}
+        print(f"Cross-domain evaluation targets: {eval_genres}")
+        for eval_genre in eval_genres:
+            args_copy = copy.deepcopy(args)
+            args_copy.genre = eval_genre
+            _, _, _, _, _, _, eval_test_piaa_dataset = load_data(args_copy)
+            eval_datasets_dict[eval_genre] = {'test': eval_test_piaa_dataset}
+            print(f"Loaded {len(eval_test_piaa_dataset)} test samples for cross-domain eval genre '{eval_genre}'")
+
+        trainer(dataloaders, model, optimizer, args, train, evaluate, device, best_modelname)
+        test_piaa_srocc, test_piaa_mse = inference(train_piaa_dataset, val_piaa_dataset,
+            test_piaa_dataset, args, device, model, eval_split="Val", experiment_name=experiment_name, model_path=best_modelname)
+        test_piaa_srocc, test_piaa_mse = inference(train_piaa_dataset, val_piaa_dataset,
+            test_piaa_dataset, args, device, model, eval_split="Test", experiment_name=experiment_name,
+            model_path=best_modelname, eval_datasets_dict=eval_datasets_dict)
 
     if args.is_log:
         wandb.finish()
