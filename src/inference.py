@@ -595,6 +595,7 @@ def _build_args(genre: str, fold: str, cli):
         loss_type='rmse',
         ccc_weight=0.5,
         no_save_model=True,
+        model_type=getattr(cli, 'model_type', 'ICI'),
     )
     return args
 
@@ -701,6 +702,9 @@ if __name__ == '__main__':
     parser.add_argument('--use_backbone_image', action='store_true', default=True)
     parser.add_argument('--force', action='store_true', default=False,
                         help='Re-run even if result JSON already exists')
+    parser.add_argument('--model_type', type=str, default=None, choices=['ICI', 'MIR'],
+                        help='Filter pretrain .pth files by model type (ICI or MIR). '
+                             'If not specified, all matched pretrain files are run.')
     cli = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -749,6 +753,14 @@ if __name__ == '__main__':
                 _run_giaa(model_path, cli.genre, fold, cli, device)
             except Exception as e:
                 print(f"  [error] {e}")
+
+        # Filter pretrain files by model_type if specified
+        if cli.model_type is not None:
+            filtered = [f for f in pretrain_files if f'_{cli.model_type}_' in f]
+            if len(filtered) < len(pretrain_files):
+                excluded = [f for f in pretrain_files if f not in filtered]
+                print(f"  [filter] model_type={cli.model_type}: excluding {excluded}")
+            pretrain_files = filtered
 
         for fname in pretrain_files:
             model_path = os.path.join(genre_dir, fname)

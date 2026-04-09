@@ -950,11 +950,12 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
 
     return best_model_path, best_state_dict
 
-def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune'):
+def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', model_type=None):
     """Auto-discover pretrained model files.
 
     For PIAA_pretrain: finds *NIMA*.pth in models_pth/{dataset_ver}/{genre}/
-    For PIAA_finetune: finds *_pretrain.pth in models_pth/{dataset_ver}/{genre}/
+    For PIAA_finetune: finds *_pretrain.pth in models_pth/{dataset_ver}/{genre}/,
+                       filtered by model_type (ICI or MIR) if specified.
     """
     genre_dir = os.path.join('models_pth', dataset_ver, genre)
     if not os.path.isdir(genre_dir):
@@ -969,11 +970,15 @@ def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune'):
         else:
             raise FileNotFoundError(f"No NIMA pth file found in {genre_dir}")
     else:
-        ici_files = [f for f in os.listdir(genre_dir) if f.endswith('_pretrain.pth')]
-        if len(ici_files) == 1:
-            return {genre: os.path.join(genre_dir, ici_files[0])}
-        elif len(ici_files) > 1:
-            raise ValueError(f"Multiple pretrain pth files found in {genre_dir}: {ici_files}. Please specify --pretrained_model explicitly.")
+        all_pretrain_files = [f for f in os.listdir(genre_dir) if f.endswith('_pretrain.pth')]
+        if model_type is not None:
+            pretrain_files = [f for f in all_pretrain_files if f'_{model_type}_' in f]
+        else:
+            pretrain_files = all_pretrain_files
+        if len(pretrain_files) == 1:
+            return {genre: os.path.join(genre_dir, pretrain_files[0])}
+        elif len(pretrain_files) > 1:
+            raise ValueError(f"Multiple pretrain pth files found in {genre_dir}: {pretrain_files}. Please specify --pretrained_model explicitly.")
         else:
             raise FileNotFoundError(f"No pretrain pth file found in {genre_dir}")
 
@@ -998,7 +1003,7 @@ def run_main(args):
     print(f"Backbone: {backbone_dict[genre]}")
 
     # Auto-discover pretrained models
-    pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode)
+    pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode, getattr(args, 'model_type', None))
     print(f"Auto-discovered pretrained models: {pretrained_model_dict}")
 
     if args.is_log:
