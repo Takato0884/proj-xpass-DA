@@ -54,7 +54,7 @@ class SharedMLP(nn.Module):
 
 
 class PIAA_MIR_CrossDomain(nn.Module):
-    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, hidden_size=1024, dropout=None, use_uncertainty_weighting=False):
+    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=1024, dropout=None, use_uncertainty_weighting=False, use_backbone_image=False):
         super(PIAA_MIR_CrossDomain, self).__init__()
         self.num_bins = num_bins
         self.num_attr = num_attr
@@ -62,6 +62,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.genres = genres
         self.register_buffer('scale', torch.arange(0, num_bins).float())
         self.use_uncertainty_weighting = use_uncertainty_weighting
+        self.use_backbone_image = use_backbone_image
 
         if self.use_uncertainty_weighting:
             self.log_vars = nn.ParameterDict({
@@ -74,9 +75,22 @@ class PIAA_MIR_CrossDomain(nn.Module):
             backbone_type = backbone_dict.get(genre, 'resnet50')
             self.nima_dict[genre] = NIMA(num_bins, backbone_type)
 
+        # Backbone image projection (optional)
+        if use_backbone_image:
+            self.backbone_image_proj = nn.ModuleDict()
+            for genre in genres:
+                backbone_type = backbone_dict.get(genre, 'resnet50')
+                in_dim = _BACKBONE_OUT_DIM[backbone_type]
+                self.backbone_image_proj[genre] = nn.Sequential(
+                    nn.Linear(in_dim, hidden_size),
+                    nn.ReLU(),
+                    nn.Linear(hidden_size, input_dim),
+                )
+
         # SharedMLP for interaction features (image_attr * personal_traits outer product flattened)
+        mlp1_input_dim = (num_attr + input_dim) * num_pt if use_backbone_image else num_attr * num_pt
         self.mlp1 = SharedMLP(
-            input_dim=(num_attr * num_pt),
+            input_dim=mlp1_input_dim,
             shared_hidden_dim=hidden_size,
             genre_hidden_dim=hidden_size // 2,
             output_dim=1,
@@ -107,10 +121,19 @@ class PIAA_MIR_CrossDomain(nn.Module):
         return self
 
     def forward(self, images, personal_traits, image_attributes, genre):
-        logit = self.nima_dict[genre](images)
+        if self.use_backbone_image:
+            logit, backbone_feat = self.nima_dict[genre](images, return_feat=True)
+        else:
+            logit = self.nima_dict[genre](images)
         prob = F.softmax(logit, dim=1)
 
-        A_ij = image_attributes.unsqueeze(2) * personal_traits.unsqueeze(1)
+        if self.use_backbone_image:
+            img_feat = self.backbone_image_proj[genre](backbone_feat)  # [B, input_dim]
+            img_input = torch.cat([image_attributes, img_feat], dim=1)  # [B, num_attr + input_dim]
+        else:
+            img_input = image_attributes
+
+        A_ij = img_input.unsqueeze(2) * personal_traits.unsqueeze(1)
         I_ij = A_ij.view(images.size(0), -1)
 
         interaction_outputs = self.mlp1(I_ij, genre)
@@ -123,7 +146,7 @@ def build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args):
     if args.model_type == 'MIR':
         return PIAA_MIR_CrossDomain(
             num_bins, num_attr, num_pt, genres, backbone_dict,
-            dropout=args.dropout)
+            dropout=args.dropout, use_backbone_image=args.use_backbone_image)
     else:
         return PIAA_ICI_CrossDomain(
             num_bins, num_attr, num_pt, genres, backbone_dict,
