@@ -74,11 +74,6 @@ class PIAA_MIR_CrossDomain(nn.Module):
         for genre in genres:
             self.interaction_fc_dict[genre] = nn.Linear(interaction_input_dim, 1)
 
-        # Genre-specific linear layer for NIMA distribution output
-        self.mlp_dist_dict = nn.ModuleDict()
-        for genre in genres:
-            self.mlp_dist_dict[genre] = nn.Linear(num_bins, 1)
-
     def freeze_backbone(self):
         for genre, nima in self.nima_dict.items():
             backbone = nima.backbone
@@ -109,7 +104,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
         I_ij = A_ij.view(images.size(0), -1)
 
         interaction_outputs = self.interaction_fc_dict[genre](I_ij)
-        direct_outputs = self.mlp_dist_dict[genre](prob * self.scale)
+        direct_outputs = torch.sum(prob * self.scale, dim=1, keepdim=True) / (self.num_bins - 1)
         return interaction_outputs + direct_outputs
 
 
@@ -215,11 +210,6 @@ class PIAA_ICI_CrossDomain(nn.Module):
         # Linear layer for interaction output
         self.attr_corr = nn.Linear(input_dim, 1)
 
-        # Genre-specific linear layer for NIMA distribution output
-        self.mlp_dist_dict = nn.ModuleDict()
-        for genre in genres:
-            self.mlp_dist_dict[genre] = nn.Linear(num_bins, 1)
-
         # Backbone image projection — uses raw backbone features, independent of feat_proj
         self.backbone_image_proj = nn.ModuleDict()
         for genre in genres:
@@ -290,7 +280,7 @@ class PIAA_ICI_CrossDomain(nn.Module):
         # Final prediction
         I_ij = torch.sum(fused_features_img, dim=1, keepdim=False) + torch.sum(fused_features_user, dim=1, keepdim=False)
         interaction_outputs = self.attr_corr(I_ij)
-        direct_outputs = self.mlp_dist_dict[genre](prob * self.scale)
+        direct_outputs = torch.sum(prob * self.scale, dim=1, keepdim=True) / (self.num_bins - 1)
         if return_feat:
             return interaction_outputs + direct_outputs, I_ij
         return interaction_outputs + direct_outputs
@@ -936,16 +926,17 @@ def train_dann_piaa_pretrain(model, src_loader, tgt_loader, discriminator, grl,
 
 
 def trainer_dann_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
-                               experiment_name, backbone_dict, pretrained_model_dict):
+                               experiment_name, backbone_dict, pretrained_model_dict, domain_tag=None):
     """
     DANN pretrain trainer for PIAA（ICI）。
     ソースの train_giaa_dataset でタスク学習 + I_ij レベルのドメイン適応。
     ターゲット: tgt_train_dataset（ターゲットジャンルの train_giaa_dataset、ラベル不使用）
+    domain_tag: pthファイル名のプレフィックス（例: 'art2fashion'）。省略時はソースジャンル名を使用。
     """
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
     genre = genres[0]
-    genre_str = genre
+    genre_str = domain_tag if domain_tag else genre
 
     src_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
@@ -1050,14 +1041,17 @@ def trainer_dann_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset
     return best_model_path, best_state_dict
 
 
-def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', model_type=None):
+def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', model_type=None, domain_tag=None):
     """Auto-discover pretrained model files.
 
-    For PIAA_pretrain: finds *NIMA*.pth in models_pth/{dataset_ver}/{genre}/
-    For PIAA_finetune: finds *_pretrain.pth in models_pth/{dataset_ver}/{genre}/,
+    For PIAA_pretrain:
+      - DANN時 (domain_tag が genre と異なる): models_pth/{dataset_ver}/{domain_tag}/ から DA済みNIMAを探す
+      - 通常時: models_pth/{dataset_ver}/{genre}/ から NIMAを探す
+    For PIAA_finetune: finds *_pretrain.pth in models_pth/{dataset_ver}/{domain_tag or genre}/,
                        filtered by model_type (ICI or MIR) if specified.
     """
-    genre_dir = os.path.join('models_pth', dataset_ver, genre)
+    search_dir_name = domain_tag if (domain_tag and domain_tag != genre) else genre
+    genre_dir = os.path.join('models_pth', dataset_ver, search_dir_name)
     if not os.path.isdir(genre_dir):
         raise FileNotFoundError(f"Directory not found: {genre_dir}")
 
@@ -1102,13 +1096,14 @@ def run_main(args):
         backbone_dict[genre] = args.backbone
     print(f"Backbone: {backbone_dict[genre]}")
 
-    # Auto-discover pretrained models
-    pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode, getattr(args, 'model_type', None))
-    print(f"Auto-discovered pretrained models: {pretrained_model_dict}")
-
     use_dann = bool(getattr(args, 'dann_target', None))
     dann_target_genre = parse_dann_target(args.dann_target) if use_dann else None
     domain_tag = f'{genre}2{dann_target_genre}' if use_dann else genre
+
+    # Auto-discover pretrained models
+    # DANN時は domain_tag ディレクトリ(例: art2fashion)からDA済みNIMAを自動検出
+    pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode, getattr(args, 'model_type', None), domain_tag=domain_tag)
+    print(f"Auto-discovered pretrained models: {pretrained_model_dict}")
 
     if args.is_log:
         tags = [args.piaa_mode]
@@ -1167,7 +1162,8 @@ def run_main(args):
         print(f"Loaded {len(test_piaa_dataset_eval)} test samples for cross-domain eval genre '{eval_genre}'")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dirname = os.path.join(model_dir(args), genre)
+    # DANN時は保存先を {source}2{target} ディレクトリに切り替える
+    dirname = os.path.join(model_dir(args), domain_tag)
     os.makedirs(dirname, exist_ok=True)
 
     if args.piaa_mode == 'PIAA_pretrain':
@@ -1178,7 +1174,7 @@ def run_main(args):
                 args_tgt, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
             best_model_path, best_state_dict = trainer_dann_piaa_pretrain(
                 datasets_dict, tgt_train_giaa_dataset, tgt_val_giaa_dataset, args, device, dirname,
-                experiment_name, backbone_dict, pretrained_model_dict)
+                experiment_name, backbone_dict, pretrained_model_dict, domain_tag=domain_tag)
         else:
             eval_target = getattr(args, 'eval_target', None)
             if eval_target:

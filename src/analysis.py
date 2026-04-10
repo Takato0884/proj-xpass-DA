@@ -40,8 +40,14 @@ def aggregate(args):
             )
             sys.exit(1)
 
-    # genre が "art-scenery" のようなクロスドメインの場合、サブジャンルに分割
-    sub_genres = genre.split("-")
+    # genre が "art2fashion" のような転移ドメインの場合、フォルダはそのまま使い
+    # メトリクスのキーは source genre (genre1) を使う
+    m2 = re.match(r'^(\w+)2(\w+)$', genre)
+    if m2:
+        sub_genres = [m2.group(1)]
+    else:
+        # genre が "art-scenery" のようなクロスドメインの場合、サブジャンルに分割
+        sub_genres = genre.split("-")
 
     # サブジャンルごとに集約用辞書を用意
     all_user_srocc = {sg: {} for sg in sub_genres}

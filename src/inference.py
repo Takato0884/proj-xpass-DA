@@ -540,7 +540,15 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         cross_domain_results = evaluate_cross_domain(model, eval_loaders_dict, device, genres)
 
     # Save test performance to JSON
-    save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, genre_str)
+    # DANN時は {source}2{target} ディレクトリに保存
+    use_dann = bool(getattr(args, 'dann_target', None))
+    if use_dann:
+        from .train_common import parse_dann_target as _parse_dann_target
+        _dann_target = _parse_dann_target(args.dann_target)
+        _folder = f'{genre_str}2{_dann_target}'
+    else:
+        _folder = genre_str
+    save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, _folder)
     os.makedirs(save_dir, exist_ok=True)
 
     model_basename = os.path.splitext(os.path.basename(best_model_path))[0]
