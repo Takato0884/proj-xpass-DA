@@ -742,7 +742,8 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
 num_attr = None  # Determined dynamically from dataset
 num_pt = None    # Determined dynamically from dataset
 
-def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict):
+def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                     tgt_val_loader=None, tgt_genre=None):
     """
     Pretrain trainer for a single genre.
     Trains on GIAA data with NIMA initialization, uses val GIAA data for early stopping.
@@ -754,6 +755,8 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
         experiment_name: experiment name
         backbone_dict: dict of {genre: backbone_type}
         pretrained_model_dict: dict of {genre: nima_pretrained_model_path}
+        tgt_val_loader: optional DataLoader for target genre val set (eval_target mode)
+        tgt_genre: target genre name string (used for logging)
     Returns:
         best_model_path: path to saved best model
         best_state_dict: state dict if args.no_save_model, else None
@@ -802,6 +805,11 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
 
         val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
 
+        tgt_genre_metrics = None
+        if tgt_val_loader is not None and tgt_genre is not None:
+            tgt_val_loaders_dict = {genre: tgt_val_loader}
+            tgt_genre_metrics, _ = evaluate(model, tgt_val_loaders_dict, device, epoch=epoch, phase_name=f"Val ({tgt_genre})")
+
         if args.is_log:
             log_dict = {"epoch": epoch}
             log_dict[f"{genre}/Train Loss"] = train_loss
@@ -810,6 +818,12 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
                 log_dict[f"{genre}/Val SROCC"] = genre_metrics[genre]['srocc']
                 log_dict[f"{genre}/Val NDCG@10"] = genre_metrics[genre]['ndcg@10']
                 log_dict[f"{genre}/Val CCC"] = genre_metrics[genre]['ccc']
+            if tgt_genre_metrics is not None and genre in tgt_genre_metrics:
+                tgt_m = tgt_genre_metrics[genre]
+                log_dict[f"{tgt_genre}/Val MAE"] = tgt_m['mae']
+                log_dict[f"{tgt_genre}/Val SROCC"] = tgt_m['srocc']
+                log_dict[f"{tgt_genre}/Val NDCG@10"] = tgt_m['ndcg@10']
+                log_dict[f"{tgt_genre}/Val CCC"] = tgt_m['ccc']
             wandb.log(log_dict, commit=True)
 
         prev_lr = optimizer.param_groups[0]['lr']
@@ -1166,8 +1180,19 @@ def run_main(args):
                 datasets_dict, tgt_train_giaa_dataset, tgt_val_giaa_dataset, args, device, dirname,
                 experiment_name, backbone_dict, pretrained_model_dict)
         else:
+            eval_target = getattr(args, 'eval_target', None)
+            if eval_target:
+                args_tgt = copy.deepcopy(args)
+                args_tgt.genre = eval_target
+                _, _, tgt_giaa_dataset, _, _, tgt_val_giaa_dataset, _ = load_data(
+                    args_tgt, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
+                tgt_val_loader = DataLoader(tgt_val_giaa_dataset, batch_size=args.batch_size, shuffle=False,
+                                            num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+            else:
+                tgt_val_loader = None
             best_model_path, best_state_dict = trainer_pretrain(
-                datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict)
+                datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                tgt_val_loader=tgt_val_loader, tgt_genre=eval_target)
         evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dict, best_model_path, model_state_dict=best_state_dict)
         inference_pretrain(datasets_dict_user, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict, best_model_path, eval_datasets_dict=eval_datasets_dict, model_state_dict=best_state_dict)
     elif args.piaa_mode == 'PIAA_finetune':
