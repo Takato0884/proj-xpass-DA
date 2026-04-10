@@ -1,5 +1,5 @@
 import os
-import random as pyrandom
+import math
 import wandb
 from tqdm import tqdm
 import numpy as np
@@ -11,13 +11,14 @@ from collections import defaultdict
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
 
 from .argflags import parse_arguments, model_dir, wandb_tags
 from .data import load_data, collate_fn, build_global_encoders
-from .train_common import NIMA, discover_folds, num_bins, _BACKBONE_OUT_DIM
+from .train_common import (NIMA, discover_folds, num_bins, _BACKBONE_OUT_DIM,
+                            GradientReversalLayer, DomainDiscriminator, parse_dann_target, get_da_lambda)
 from .inference import inference_finetune, evaluate_pretrain_on_val_piaa, inference_pretrain
 
 class MLP(nn.Module):
@@ -33,28 +34,9 @@ class MLP(nn.Module):
             x = self.drop(x)
         return self.fc2(x)
 
-class SharedMLP(nn.Module):
-    """MLP with shared lower layers and genre-specific upper layers."""
-    def __init__(self, input_dim, shared_hidden_dim, genre_hidden_dim, output_dim, genres):
-        super(SharedMLP, self).__init__()
-        self.genres = genres
-        self.shared_fc1 = nn.Linear(input_dim, shared_hidden_dim)
-        self.shared_fc2 = nn.Linear(shared_hidden_dim, shared_hidden_dim)
-        self.genre_fc1_dict = nn.ModuleDict()
-        self.genre_fc2_dict = nn.ModuleDict()
-        for genre in self.genres:
-            self.genre_fc1_dict[genre] = nn.Linear(shared_hidden_dim, genre_hidden_dim)
-            self.genre_fc2_dict[genre] = nn.Linear(genre_hidden_dim, output_dim)
-
-    def forward(self, x, genre):
-        x = F.relu(self.shared_fc1(x))
-        x = F.relu(self.shared_fc2(x))
-        x = F.relu(self.genre_fc1_dict[genre](x))
-        return self.genre_fc2_dict[genre](x)
-
 
 class PIAA_MIR_CrossDomain(nn.Module):
-    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=1024, dropout=None, use_uncertainty_weighting=False, use_backbone_image=False):
+    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=1024, dropout=None, use_uncertainty_weighting=False):
         super(PIAA_MIR_CrossDomain, self).__init__()
         self.num_bins = num_bins
         self.num_attr = num_attr
@@ -62,7 +44,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.genres = genres
         self.register_buffer('scale', torch.arange(0, num_bins).float())
         self.use_uncertainty_weighting = use_uncertainty_weighting
-        self.use_backbone_image = use_backbone_image
+
 
         if self.use_uncertainty_weighting:
             self.log_vars = nn.ParameterDict({
@@ -75,31 +57,27 @@ class PIAA_MIR_CrossDomain(nn.Module):
             backbone_type = backbone_dict.get(genre, 'resnet50')
             self.nima_dict[genre] = NIMA(num_bins, backbone_type)
 
-        # Backbone image projection (optional)
-        if use_backbone_image:
-            self.backbone_image_proj = nn.ModuleDict()
-            for genre in genres:
-                backbone_type = backbone_dict.get(genre, 'resnet50')
-                in_dim = _BACKBONE_OUT_DIM[backbone_type]
-                self.backbone_image_proj[genre] = nn.Sequential(
-                    nn.Linear(in_dim, hidden_size),
-                    nn.ReLU(),
-                    nn.Linear(hidden_size, input_dim),
-                )
-
-        # SharedMLP for interaction features (image_attr * personal_traits outer product flattened)
-        mlp1_input_dim = (num_attr + input_dim) * num_pt if use_backbone_image else num_attr * num_pt
-        self.mlp1 = SharedMLP(
-            input_dim=mlp1_input_dim,
-            shared_hidden_dim=hidden_size,
-            genre_hidden_dim=hidden_size // 2,
-            output_dim=1,
-            genres=genres)
-
-        # Genre-specific MLP for NIMA distribution output
-        self.mlp2_dict = nn.ModuleDict()
+        # Backbone image projection — uses raw backbone features, independent of feat_proj
+        self.backbone_image_proj = nn.ModuleDict()
         for genre in genres:
-            self.mlp2_dict[genre] = MLP(num_bins, 16, 1)
+            backbone_type = backbone_dict.get(genre, 'resnet50')
+            in_dim = _BACKBONE_OUT_DIM[backbone_type]
+            self.backbone_image_proj[genre] = nn.Sequential(
+                nn.Linear(in_dim, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, input_dim),
+            )
+
+        # Genre-specific linear layer for interaction features (image_attr * personal_traits outer product flattened)
+        interaction_input_dim = (num_attr + input_dim) * num_pt
+        self.interaction_fc_dict = nn.ModuleDict()
+        for genre in genres:
+            self.interaction_fc_dict[genre] = nn.Linear(interaction_input_dim, 1)
+
+        # Genre-specific linear layer for NIMA distribution output
+        self.mlp_dist_dict = nn.ModuleDict()
+        for genre in genres:
+            self.mlp_dist_dict[genre] = nn.Linear(num_bins, 1)
 
     def freeze_backbone(self):
         for genre, nima in self.nima_dict.items():
@@ -121,23 +99,17 @@ class PIAA_MIR_CrossDomain(nn.Module):
         return self
 
     def forward(self, images, personal_traits, image_attributes, genre):
-        if self.use_backbone_image:
-            logit, backbone_feat = self.nima_dict[genre](images, return_feat=True)
-        else:
-            logit = self.nima_dict[genre](images)
+        logit, _, raw_feat = self.nima_dict[genre](images, return_feat=True)
         prob = F.softmax(logit, dim=1)
 
-        if self.use_backbone_image:
-            img_feat = self.backbone_image_proj[genre](backbone_feat)  # [B, input_dim]
-            img_input = torch.cat([image_attributes, img_feat], dim=1)  # [B, num_attr + input_dim]
-        else:
-            img_input = image_attributes
+        img_feat = self.backbone_image_proj[genre](raw_feat)  # [B, input_dim]
+        img_input = torch.cat([image_attributes, img_feat], dim=1)  # [B, num_attr + input_dim]
 
         A_ij = img_input.unsqueeze(2) * personal_traits.unsqueeze(1)
         I_ij = A_ij.view(images.size(0), -1)
 
-        interaction_outputs = self.mlp1(I_ij, genre)
-        direct_outputs = self.mlp2_dict[genre](prob * self.scale)
+        interaction_outputs = self.interaction_fc_dict[genre](I_ij)
+        direct_outputs = self.mlp_dist_dict[genre](prob * self.scale)
         return interaction_outputs + direct_outputs
 
 
@@ -146,11 +118,11 @@ def build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args):
     if args.model_type == 'MIR':
         return PIAA_MIR_CrossDomain(
             num_bins, num_attr, num_pt, genres, backbone_dict,
-            dropout=args.dropout, use_backbone_image=args.use_backbone_image)
+            dropout=args.dropout)
     else:
         return PIAA_ICI_CrossDomain(
             num_bins, num_attr, num_pt, genres, backbone_dict,
-            dropout=args.dropout, use_backbone_image=args.use_backbone_image)
+            dropout=args.dropout)
 
 
 class InternalInteraction(nn.Module):
@@ -210,7 +182,7 @@ class Interfusion_GRU(nn.Module):
         return results
 
 class PIAA_ICI_CrossDomain(nn.Module):
-    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=256, dropout=None, use_backbone_image=False):
+    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=256, dropout=None):
         super(PIAA_ICI_CrossDomain, self).__init__()
         self.num_bins = num_bins
         self.num_attr = num_attr
@@ -218,6 +190,7 @@ class PIAA_ICI_CrossDomain(nn.Module):
         self.genres = genres  # list of genre names, e.g., ['art']
         self.register_buffer('scale', torch.arange(0, num_bins).float())
         self.input_dim = input_dim
+
 
         # Genre-specific NIMA backbones with genre-specific backbone types
         self.nima_dict = nn.ModuleDict()
@@ -237,29 +210,26 @@ class PIAA_ICI_CrossDomain(nn.Module):
         # MLPs (shared across genres)
         _dropout = dropout if dropout else 0.0
         self.node_attr_user = MLP(num_pt, hidden_size, num_attr*input_dim, dropout=_dropout)
-        node_attr_img_input_dim = num_attr + input_dim if use_backbone_image else num_attr
-        self.node_attr_img = MLP(node_attr_img_input_dim, hidden_size, num_attr*input_dim, dropout=_dropout)
+        self.node_attr_img = MLP(num_attr + input_dim, hidden_size, num_attr*input_dim, dropout=_dropout)
 
-        # MLP for attr_corr
-        self.attr_corr = MLP(input_dim, hidden_size, 1, dropout=_dropout)
+        # Linear layer for interaction output
+        self.attr_corr = nn.Linear(input_dim, 1)
 
-        # Genre-specific mlp_dist
+        # Genre-specific linear layer for NIMA distribution output
         self.mlp_dist_dict = nn.ModuleDict()
         for genre in genres:
-            self.mlp_dist_dict[genre] = MLP(num_bins, hidden_size, 1, dropout=_dropout)
+            self.mlp_dist_dict[genre] = nn.Linear(num_bins, 1)
 
-        # Backbone image projection (optional)
-        self.use_backbone_image = use_backbone_image
-        if use_backbone_image:
-            self.backbone_image_proj = nn.ModuleDict()
-            for genre in genres:
-                backbone_type = backbone_dict.get(genre, 'resnet50')
-                in_dim = _BACKBONE_OUT_DIM[backbone_type]
-                self.backbone_image_proj[genre] = nn.Sequential(
-                        nn.Linear(in_dim, hidden_size),
-                        nn.ReLU(),
-                        nn.Linear(hidden_size, input_dim),
-                    )
+        # Backbone image projection — uses raw backbone features, independent of feat_proj
+        self.backbone_image_proj = nn.ModuleDict()
+        for genre in genres:
+            backbone_type = backbone_dict.get(genre, 'resnet50')
+            in_dim = _BACKBONE_OUT_DIM[backbone_type]
+            self.backbone_image_proj[genre] = nn.Sequential(
+                    nn.Linear(in_dim, hidden_size),
+                    nn.ReLU(),
+                    nn.Linear(hidden_size, input_dim),
+                )
 
 
     def freeze_backbone(self):
@@ -287,7 +257,7 @@ class PIAA_ICI_CrossDomain(nn.Module):
             self._set_frozen_modules_eval()
         return self
 
-    def forward(self, images, personal_traits, image_attributes, genre):
+    def forward(self, images, personal_traits, image_attributes, genre, return_feat=False):
         """
         Forward pass for a specific genre.
         Args:
@@ -295,22 +265,16 @@ class PIAA_ICI_CrossDomain(nn.Module):
             personal_traits: [B, num_pt]
             image_attributes: [B, num_attr]
             genre: str, the genre for this batch
+            return_feat: if True, also return I_ij [B, input_dim] for DANN
         """
-        # Use genre-specific NIMA
-        if self.use_backbone_image:
-            logit, backbone_feat = self.nima_dict[genre](images, return_feat=True)
-        else:
-            logit = self.nima_dict[genre](images)
+        logit, _, raw_feat = self.nima_dict[genre](images, return_feat=True)
         prob = F.softmax(logit, dim=1)
 
         # Build attribute nodes from provided image_attributes and user traits
         n_attr = image_attributes.shape[1]
-        if self.use_backbone_image:
-            img_feat = self.backbone_image_proj[genre](backbone_feat)  # [B, input_dim]
-            img_input = torch.cat([image_attributes, img_feat], dim=1)  # [B, num_attr + input_dim]
-            attr_img = self.node_attr_img(img_input).view(-1, n_attr, self.input_dim)
-        else:
-            attr_img = self.node_attr_img(image_attributes).view(-1, n_attr, self.input_dim)
+        img_feat = self.backbone_image_proj[genre](raw_feat)  # [B, input_dim]
+        img_input = torch.cat([image_attributes, img_feat], dim=1)  # [B, num_attr + input_dim]
+        attr_img = self.node_attr_img(img_input).view(-1, n_attr, self.input_dim)
         attr_user = self.node_attr_user(personal_traits).view(-1, n_attr, self.input_dim)
 
         # Internal Interaction (among image attributes)
@@ -327,47 +291,9 @@ class PIAA_ICI_CrossDomain(nn.Module):
         I_ij = torch.sum(fused_features_img, dim=1, keepdim=False) + torch.sum(fused_features_user, dim=1, keepdim=False)
         interaction_outputs = self.attr_corr(I_ij)
         direct_outputs = self.mlp_dist_dict[genre](prob * self.scale)
-        output = interaction_outputs + direct_outputs
-        return output
-
-_SAMPLES_PER_USER = 32
-
-
-class UserGroupedBatchSampler(Sampler):
-    """
-    Each batch contains n_users_per_batch = batch_size // _SAMPLES_PER_USER users,
-    each contributing _SAMPLES_PER_USER samples (without replacement within batch).
-    Users are sampled with replacement across batches; no cross-batch deduplication.
-    """
-    def __init__(self, dataset, batch_size):
-        self.user_to_indices = defaultdict(list)
-        for i, uid in enumerate(dataset.data['user_id'].values):
-            self.user_to_indices[uid].append(i)
-        self.users = list(self.user_to_indices.keys())
-        self.n_users_per_batch = max(1, batch_size // _SAMPLES_PER_USER)
-        self.steps = max(1, len(dataset) // batch_size)
-
-    def __iter__(self):
-        for _ in range(self.steps):
-            selected_users = pyrandom.choices(self.users, k=self.n_users_per_batch)
-            batch = []
-            for uid in selected_users:
-                indices = self.user_to_indices[uid]
-                k = min(_SAMPLES_PER_USER, len(indices))
-                batch += pyrandom.sample(indices, k)
-            yield batch
-
-    def __len__(self):
-        return self.steps
-
-
-def _normalize_user_ids(user_ids, device):
-    """Convert various user_id formats from collate_fn to a 1D long tensor."""
-    if isinstance(user_ids, torch.Tensor):
-        return user_ids.view(-1).long().to(device)
-    flat = [int(u.item()) if isinstance(u, torch.Tensor) else int(u) for u in user_ids]
-    return torch.tensor(flat, dtype=torch.long, device=device)
-
+        if return_feat:
+            return interaction_outputs + direct_outputs, I_ij
+        return interaction_outputs + direct_outputs
 
 def _collect_user_ids(user_ids) -> list:
     """Convert various user_id formats from collate_fn to a flat list of ints."""
@@ -378,43 +304,6 @@ def _collect_user_ids(user_ids) -> list:
         result.append(int(u.item()) if isinstance(u, torch.Tensor) else int(u))
     return result
 
-
-def ccc_loss_per_user(preds, targets, user_ids):
-    """
-    Compute (1 - CCC) per user, return the mean across users.
-    preds/targets: [B] or [B,1]; user_ids: 1D long tensor on same device.
-    """
-    preds = preds.view(-1)
-    targets = targets.view(-1)
-    losses = []
-    for uid in user_ids.unique():
-        mask = user_ids == uid
-        if mask.sum() < 2:
-            continue
-        p = preds[mask]
-        t = targets[mask]
-        mu_p, mu_t = p.mean(), t.mean()
-        var_p = p.var(unbiased=False)
-        var_t = t.var(unbiased=False)
-        cov = ((p - mu_p) * (t - mu_t)).mean()
-        ccc = 2 * cov / (var_p + var_t + (mu_p - mu_t) ** 2 + 1e-8)
-        losses.append(1.0 - ccc)
-    if not losses:
-        return preds.sum() * 0.0  # differentiable zero
-    return torch.stack(losses).mean()
-
-
-def compute_loss(preds, targets, user_ids, args):
-    """
-    Unified loss dispatcher.
-    loss_type: 'mse' | 'ccc'
-    """
-    loss_type = args.loss_type
-    if loss_type == 'mse':
-        return F.mse_loss(preds, targets)
-    if loss_type == 'ccc':
-        return ccc_loss_per_user(preds, targets, user_ids)
-    raise ValueError(f"Unknown loss_type: {loss_type}")
 
 
 def train(model, dataloader, optimizer, scaler, device, args, genre, epoch: int = None):
@@ -445,11 +334,10 @@ def train(model, dataloader, optimizer, scaler, device, args, genre, epoch: int 
         sample_pt = sample['traits'].float().to(device)
         sample_attr = sample['QIP'].float().to(device)
         aesthetic_scores = sample['Aesthetic'].to(device).view(-1, 1)
-        user_ids = _normalize_user_ids(sample['user_id'], device) if 'user_id' in sample else None
 
         with autocast('cuda'):
             score_pred = model(images, sample_pt, sample_attr, genre)
-            loss = compute_loss(score_pred, aesthetic_scores, user_ids, args)
+            loss = F.mse_loss(score_pred, aesthetic_scores)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -458,7 +346,7 @@ def train(model, dataloader, optimizer, scaler, device, args, genre, epoch: int 
         running_loss += loss.item()
         total_batches += 1
         progress_bar.update(1)
-        progress_bar.set_postfix({args.loss_type: loss.item()})
+        progress_bar.set_postfix({'loss': loss.item()})
 
     progress_bar.close()
     return running_loss / total_batches if total_batches > 0 else 0.0
@@ -875,13 +763,8 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
     genre = genres[0]
     genre_str = genre
 
-    if args.user_grouped_batch:
-        batch_sampler = UserGroupedBatchSampler(datasets_dict[genre]['train'], batch_size)
-        train_loader = DataLoader(datasets_dict[genre]['train'], batch_sampler=batch_sampler,
-                                  num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    else:
-        train_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
-                                  num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+    train_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
+                              num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
     val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
                                           num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
@@ -921,7 +804,7 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
 
         if args.is_log:
             log_dict = {"epoch": epoch}
-            log_dict[f"{genre}/Train {args.loss_type.upper()}"] = train_loss
+            log_dict[f"{genre}/Train Loss"] = train_loss
             if genre in genre_metrics:
                 log_dict[f"{genre}/Val MAE"] = genre_metrics[genre]['mae']
                 log_dict[f"{genre}/Val SROCC"] = genre_metrics[genre]['srocc']
@@ -949,6 +832,209 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
                 break
 
     return best_model_path, best_state_dict
+
+def train_dann_piaa_pretrain(model, src_loader, tgt_loader, discriminator, grl,
+                             optimizer, optimizer_disc, device, args, genre,
+                             epoch=None, global_step=0, dann_total_steps=50):
+    """
+    DANN の 1 エポック学習（PIAA pretrain レベル）。
+    ソース: タスク損失（MSE）＋ドメイン識別損失（I_ij に GRL）
+    ターゲット: ドメイン識別損失のみ（ラベル不使用）
+    Returns:
+        (avg_task_loss, avg_domain_loss, avg_domain_loss_tgt, avg_disc_acc_tgt, updated_global_step)
+    """
+    model.train()
+    discriminator.train()
+
+    scaler = GradScaler('cuda')
+    running_L_y = running_L_d = running_L_d_tgt = running_disc_acc_tgt = 0.0
+    total_batches = 0
+    tgt_iter = iter(tgt_loader)
+
+    lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+    desc = f"Epoch {epoch} [DANN λ={lambda_:.3f}]" if epoch is not None else "Train DANN"
+    progress_bar = tqdm(src_loader, leave=True, desc=desc, position=0, ncols=120, colour="#00ff00", ascii="-=")
+
+    for sample_src in progress_bar:
+        try:
+            sample_tgt = next(tgt_iter)
+        except StopIteration:
+            tgt_iter = iter(tgt_loader)
+            sample_tgt = next(tgt_iter)
+
+        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+
+        images_src = sample_src['image'].to(device)
+        aesthetic_src = sample_src['Aesthetic'].to(device).view(-1, 1)
+        pt_src = sample_src['traits'].float().to(device)
+        attr_src = sample_src['QIP'].float().to(device)
+
+        images_tgt = sample_tgt['image'].to(device)
+        pt_tgt = sample_tgt['traits'].float().to(device)
+        attr_tgt = sample_tgt['QIP'].float().to(device)
+
+        optimizer.zero_grad()
+        optimizer_disc.zero_grad()
+
+        with autocast('cuda'):
+            # タスク損失（ソースのみ）
+            score_src, I_ij_src = model(images_src, pt_src, attr_src, genre, return_feat=True)
+            L_y = F.mse_loss(score_src, aesthetic_src)
+
+            # ドメイン識別損失（ソース＋ターゲット）
+            _, I_ij_tgt = model(images_tgt, pt_tgt, attr_tgt, genre, return_feat=True)
+            feat_all = torch.cat([I_ij_src, I_ij_tgt], dim=0)
+            domain_labels = torch.cat([
+                torch.zeros(I_ij_src.size(0), 1),
+                torch.ones(I_ij_tgt.size(0), 1),
+            ], dim=0).to(device)
+            domain_logit = discriminator(grl(feat_all, lambda_))
+            L_d = F.binary_cross_entropy_with_logits(domain_logit, domain_labels)
+
+            loss = L_y + L_d
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.step(optimizer_disc)
+        scaler.update()
+
+        n_src = I_ij_src.size(0)
+        logit_tgt = domain_logit[n_src:]
+        label_tgt = domain_labels[n_src:]
+        with torch.no_grad():
+            L_d_tgt = F.binary_cross_entropy_with_logits(logit_tgt, label_tgt).item()
+            disc_acc_tgt = ((torch.sigmoid(logit_tgt) > 0.5).float() == label_tgt).float().mean().item()
+
+        running_L_y += L_y.item()
+        running_L_d += L_d.item()
+        running_L_d_tgt += L_d_tgt
+        running_disc_acc_tgt += disc_acc_tgt
+        total_batches += 1
+        global_step += 1
+        progress_bar.set_postfix({
+            'L_y': f'{L_y.item():.4f}', 'L_d': f'{L_d.item():.4f}',
+            'L_d_tgt': f'{L_d_tgt:.4f}', 'acc_tgt': f'{disc_acc_tgt:.3f}',
+            'λ': f'{lambda_:.3f}',
+        })
+
+    n = max(total_batches, 1)
+    return running_L_y / n, running_L_d / n, running_L_d_tgt / n, running_disc_acc_tgt / n, global_step
+
+
+def trainer_dann_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
+                               experiment_name, backbone_dict, pretrained_model_dict):
+    """
+    DANN pretrain trainer for PIAA（ICI）。
+    ソースの train_giaa_dataset でタスク学習 + I_ij レベルのドメイン適応。
+    ターゲット: tgt_train_dataset（ターゲットジャンルの train_giaa_dataset、ラベル不使用）
+    """
+    batch_size = args.batch_size
+    genres = list(datasets_dict.keys())
+    genre = genres[0]
+    genre_str = genre
+
+    src_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
+                            num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+    tgt_loader = DataLoader(tgt_train_dataset, batch_size=batch_size, shuffle=True,
+                            num_workers=args.num_workers, timeout=300, collate_fn=collate_fn, drop_last=True)
+    val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
+                                          num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
+    dann_target_genre = parse_dann_target(getattr(args, 'dann_target', None)) if getattr(args, 'dann_target', None) else None
+    tgt_val_loader = DataLoader(tgt_val_dataset, batch_size=batch_size, shuffle=False,
+                                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+    tgt_val_loaders_dict = {genre: tgt_val_loader}  # ソースジャンルのヘッドでターゲット val を推論
+
+    model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
+
+    # DA 済み NIMA ウェイトをロード
+    pretrained_path = pretrained_model_dict[genre]
+    if not os.path.exists(pretrained_path):
+        raise FileNotFoundError(f"Error: Pretrained NIMA model file not found: {pretrained_path}")
+    try:
+        state = torch.load(pretrained_path)
+        model.nima_dict[genre].load_state_dict(state)
+        print(f"Loaded NIMA weights for {genre} from {pretrained_path}")
+    except Exception as e:
+        raise RuntimeError(f"Error: Failed to load NIMA weights for {genre} from {pretrained_path}: {e}")
+
+    model.freeze_backbone()
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Freeze] Backbone frozen: {total_params - trainable_params:,} frozen / {trainable_params:,} trainable / {total_params:,} total")
+
+    # 識別器は I_ij の次元（input_dim=64）を入力とする
+    discriminator = DomainDiscriminator(model.input_dim).to(device)
+    grl = GradientReversalLayer()
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
+
+    steps_per_epoch = len(src_loader)
+    dann_total_steps = getattr(args, 'dann_epochs', 50) * steps_per_epoch
+
+    best_val_ccc = -float('inf')
+    patience = 0
+    global_step = 0
+    best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_{experiment_name}_pretrain.pth')
+    best_state_dict = None
+
+    for epoch in range(args.num_epochs):
+        L_y, L_d, L_d_tgt, disc_acc_tgt, global_step = train_dann_piaa_pretrain(
+            model, src_loader, tgt_loader, discriminator, grl, optimizer, optimizer_disc,
+            device, args, genre, epoch=epoch, global_step=global_step, dann_total_steps=dann_total_steps)
+        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+
+        if args.is_log:
+            wandb.log({
+                "epoch": epoch,
+                f"{genre}/Train Loss": L_y,
+                f"{genre}/Train Domain Loss": L_d,
+                f"{genre}/Train Domain Loss (tgt)": L_d_tgt,
+                f"{genre}/Train Disc Acc (tgt)": disc_acc_tgt,
+                f"{genre}/DANN lambda": lambda_,
+            }, commit=False)
+
+        genre_metrics, _ = evaluate(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
+        val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
+
+        tgt_genre_metrics, _ = evaluate(model, tgt_val_loaders_dict, device, epoch=epoch, phase_name="Val (tgt)")
+
+        if args.is_log:
+            log_dict = {"epoch": epoch}
+            if genre in genre_metrics:
+                log_dict[f"{genre}/Val MAE"] = genre_metrics[genre]['mae']
+                log_dict[f"{genre}/Val SROCC"] = genre_metrics[genre]['srocc']
+                log_dict[f"{genre}/Val NDCG@10"] = genre_metrics[genre]['ndcg@10']
+                log_dict[f"{genre}/Val CCC"] = genre_metrics[genre]['ccc']
+            if genre in tgt_genre_metrics:
+                tgt_m = tgt_genre_metrics[genre]
+                log_dict[f"{dann_target_genre}/Val MAE"] = tgt_m['mae']
+                log_dict[f"{dann_target_genre}/Val SROCC"] = tgt_m['srocc']
+                log_dict[f"{dann_target_genre}/Val NDCG@10"] = tgt_m['ndcg@10']
+                log_dict[f"{dann_target_genre}/Val CCC"] = tgt_m['ccc']
+            wandb.log(log_dict, commit=True)
+
+        prev_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(val_ccc)
+        cur_lr = optimizer.param_groups[0]['lr']
+        if cur_lr < prev_lr:
+            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
+
+        if val_ccc > best_val_ccc:
+            best_val_ccc = val_ccc
+            patience = 0
+            if args.no_save_model:
+                best_state_dict = copy.deepcopy(model.state_dict())
+            else:
+                torch.save(model.state_dict(), best_model_path)
+        else:
+            patience += 1
+            if patience >= args.max_patience_epochs:
+                print(f"DANN Pretrain: early stopping at epoch {epoch}")
+                break
+
+    return best_model_path, best_state_dict
+
 
 def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', model_type=None):
     """Auto-discover pretrained model files.
@@ -1006,11 +1092,17 @@ def run_main(args):
     pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode, getattr(args, 'model_type', None))
     print(f"Auto-discovered pretrained models: {pretrained_model_dict}")
 
+    use_dann = bool(getattr(args, 'dann_target', None))
+    dann_target_genre = parse_dann_target(args.dann_target) if use_dann else None
+    domain_tag = f'{genre}2{dann_target_genre}' if use_dann else genre
+
     if args.is_log:
         tags = [args.piaa_mode]
         tags += wandb_tags(args)
         if args.use_video:
             tags.append("use_video")
+        if use_dann:
+            tags.append(domain_tag)
         wandb.init(
                    project=f"XPASS",
                    notes=f"{args.model_type}",
@@ -1020,8 +1112,7 @@ def run_main(args):
             "batch_size": args.batch_size,
             "num_epochs": args.num_epochs,
             "genre": genre,
-            "backbone": backbone_dict[genre],
-            "use_backbone_image": args.use_backbone_image
+            "backbone": backbone_dict[genre]
         }
         experiment_name = wandb.run.name
     else:
@@ -1066,7 +1157,17 @@ def run_main(args):
     os.makedirs(dirname, exist_ok=True)
 
     if args.piaa_mode == 'PIAA_pretrain':
-        best_model_path, best_state_dict = trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict)
+        if use_dann:
+            args_tgt = copy.deepcopy(args)
+            args_tgt.genre = dann_target_genre
+            _, _, tgt_train_giaa_dataset, _, _, tgt_val_giaa_dataset, _ = load_data(
+                args_tgt, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
+            best_model_path, best_state_dict = trainer_dann_piaa_pretrain(
+                datasets_dict, tgt_train_giaa_dataset, tgt_val_giaa_dataset, args, device, dirname,
+                experiment_name, backbone_dict, pretrained_model_dict)
+        else:
+            best_model_path, best_state_dict = trainer_pretrain(
+                datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict)
         evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dict, best_model_path, model_state_dict=best_state_dict)
         inference_pretrain(datasets_dict_user, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict, best_model_path, eval_datasets_dict=eval_datasets_dict, model_state_dict=best_state_dict)
     elif args.piaa_mode == 'PIAA_finetune':
@@ -1082,7 +1183,10 @@ def run_main(args):
         wandb.finish()
 
 if __name__ == '__main__':
-    args = parse_arguments()
+    parser = parse_arguments(parse=False)
+    parser.add_argument('--model_type', type=str, default='ICI', choices=['ICI', 'MIR'],
+                        help='PIAA model architecture: ICI (Interaction-based) or MIR (MLP Interaction Regression)')
+    args = parser.parse_args()
 
     if args.dataset_ver.endswith('_all'):
         version_prefix = args.dataset_ver[:-4]  # e.g., 'v3_all' -> 'v3'

@@ -258,14 +258,20 @@ python src/preprocessing.py make_data_split_cv \
 | `--dropout` | float | `0.1` | ドロップアウト率（`fc_aesthetic` の中間層に適用） |
 | `--num_workers` | int | `4` | DataLoaderのワーカー数 |
 | `--no_log` | flag | `False` | wandbロギングを無効化 |
+| `--dann_target` | str | `None` | DANNモードを有効化。ターゲットジャンルを指定（例: `fashion`）。省略するとドメイン適応なし |
+| `--dann_epochs` | int | `50` | λスケジュール: λが〜1.0に達するまでのエポック数。内部で `total_steps = dann_epochs × (data_size / batch_size)` に変換される |
+| `--dann_gamma` | float | `10.0` | λスケジュール: シグモイドの鋭さ（Ganin et al.） |
 
 > **注:** クロスドメイン評価（`--genre` 以外の全ジャンルに対する評価）は常に実行されます。
 
 #### コマンド例
 
 ```bash
-# art
+# art（ドメイン適応なし）
 python -m src.train_GIAA --genre art
+
+# art → fashion へのDANN
+python -m src.train_GIAA --genre art --dann_target fashion
 
 # fashion
 python -m src.train_GIAA --genre fashion
@@ -304,48 +310,31 @@ python -m src.train_GIAA --genre scenery --use_video
 | `--use_backbone_image` | flag | `True` | バックボーン画像特徴量をインタラクション入力として追加 |
 | `--no_log` | flag | `False` | wandbロギングを無効化 |
 | `--no_save_model` | flag | `False` | モデルをディスクに保存せず、最良モデルをメモリに保持する |
-| `--user_grouped_batch` | flag | `False` | **[Pretrain]** バッチをユーザー単位でグループ化する。`n_users = batch_size // 32`人、各ユーザーから32サンプルを非復元抽出。ユーザー間は復元抽出 |
-| `--loss_type` | str | `mse` | 学習損失関数（`mse` / `ccc`） |
 
-> **注:** クロスドメイン評価（`--genre` 以外の全ジャンルに対する評価）は常に実行されます。
-
-#### バッチ戦略の詳細（`--user_grouped_batch` 使用時）
-
-| | Pretrain | Finetune |
-|---|---|---|
-| バッチサイズ | 128（4ユーザー × 32サンプル） | 16 |
-| ユーザー構成 | 4ユーザー混在 | 1ユーザー固定 |
-| サンプリング | ユーザー間: 復元抽出 / バッチ内: 非復元抽出 | ランダムシャッフル |
-| drop_last | 不要 | True（端数バッチのCCC不安定化を回避） |
-| CCC計算単位 | ユーザーごと → 平均 | バッチ全体 |
+> **注:** クロスドメイン評価（`--genre` 以外の全ジャンルに対する評価）は常に実行されます。損失関数はMSEで固定です。
 
 #### コマンド例
 
 ```bash
-# Pretrain: ユーザーグループバッチ + CCC損失
+# Pretrain
 python -m src.train_PIAA --genre art --dataset_ver v2_all \
-  --piaa_mode PIAA_pretrain --batch_size 128 \
-  --user_grouped_batch --loss_type ccc
+  --piaa_mode PIAA_pretrain --batch_size 128
 
-# Pretrain: 従来ランダムバッチ + MSE損失
+# Finetune
 python -m src.train_PIAA --genre art --dataset_ver v2_all \
-  --piaa_mode PIAA_pretrain --batch_size 128 --loss_type mse
-
-# Finetune: CCC損失
-python -m src.train_PIAA --genre art --dataset_ver v2_all \
-  --piaa_mode PIAA_finetune --batch_size 16 --loss_type ccc
+  --piaa_mode PIAA_finetune --batch_size 16
 
 # Finetune: scenery（動画: I3D）
 python -m src.train_PIAA --genre scenery --dataset_ver v2_all \
-  --use_video --piaa_mode PIAA_finetune --batch_size 16 --loss_type mse
+  --use_video --piaa_mode PIAA_finetune --batch_size 16
 
 # MIR: Pretrain
 python -m src.train_PIAA --genre art --dataset_ver v2_all \
-  --model_type MIR --piaa_mode PIAA_pretrain --batch_size 128 --loss_type mse
+  --model_type MIR --piaa_mode PIAA_pretrain --batch_size 128
 
 # MIR: Finetune
 python -m src.train_PIAA --genre art --dataset_ver v2_all \
-  --model_type MIR --piaa_mode PIAA_finetune --batch_size 16 --loss_type mse
+  --model_type MIR --piaa_mode PIAA_finetune --batch_size 16
 ```
 
 ---

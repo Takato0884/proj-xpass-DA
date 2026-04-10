@@ -167,7 +167,14 @@ def inference(train_dataset, val_dataset, test_dataset, args, device, model, eva
 
     # Save results to JSON file (only for Test split)
     if eval_split == 'Test':
-        save_dir = os.path.join('/home/hayashi0884/proj-xpass-DA/reports/exp', args.dataset_ver, args.genre)
+        _dann_tgt = getattr(args, 'dann_target', None)
+        if _dann_tgt:
+            from .train_common import parse_dann_target as _parse_dann
+            _tgt_genre = _parse_dann(_dann_tgt)
+            _folder = f'{args.genre}2{_tgt_genre}'
+        else:
+            _folder = args.genre
+        save_dir = os.path.join('/home/hayashi0884/proj-xpass-DA/reports/exp', args.dataset_ver, _folder)
         os.makedirs(save_dir, exist_ok=True)
 
         # Use model_path basename for both experiment_name field and json filename
@@ -389,7 +396,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
 
     # Remove trailing mode suffix to avoid duplication (e.g., "name_finetune_finetune.json")
     base_name = model_name_base.removesuffix('_finetune')
-    json_filename = f"{genre_str}_ICI_{base_name}_finetune.json"
+    json_filename = f"{genre_str}_{args.model_type}_{base_name}_finetune.json"
     json_path = os.path.join(save_dir, json_filename)
     with open(json_path, 'w') as f:
         json.dump(result_data, f, indent=2)
@@ -589,11 +596,8 @@ def _build_args(genre: str, fold: str, cli):
         batch_size=cli.batch_size,
         num_workers=cli.num_workers,
         dropout=cli.dropout,
-        use_backbone_image=cli.use_backbone_image,
         use_cross_eval=True,
         is_log=False,
-        loss_type='rmse',
-        ccc_weight=0.5,
         no_save_model=True,
         model_type=getattr(cli, 'model_type', 'ICI'),
     )
@@ -699,7 +703,6 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--use_backbone_image', action='store_true', default=True)
     parser.add_argument('--force', action='store_true', default=False,
                         help='Re-run even if result JSON already exists')
     parser.add_argument('--model_type', type=str, default=None, choices=['ICI', 'MIR'],

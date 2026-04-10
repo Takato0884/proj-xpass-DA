@@ -19,9 +19,6 @@ def parse_arguments(parse=True):
     parser.add_argument('--use_video', action='store_true', help='Use video (I3D) for scenery genre instead of images (ResNet50)')
     parser.add_argument('--root_dir', type=str, default='/home/hayashi0884/proj-xpass-DA/data')
     parser.add_argument('--piaa_mode', type=str, default='PIAA_pretrain')
-    parser.add_argument('--model_type', type=str, default='ICI', choices=['ICI', 'MIR'],
-                        help='PIAA model architecture: ICI (Interaction-based) or MIR (MLP Interaction Regression)')
-
     parser.add_argument('--no_log', action='store_false', dest='is_log', help='Disable logging')
 
     parser.add_argument('--num_epochs', type=int, default=200)
@@ -31,20 +28,21 @@ def parse_arguments(parse=True):
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--lr_decay_factor', type=float, default=0.5)
     parser.add_argument('--lr_patience', type=int, default=5)
-    parser.add_argument('--use_backbone_image', action='store_true', default=True,
-                        help='Use image backbone features (projected to input_dim) as additional image landscape features in the interaction component')
-
-    # Batching strategy
-    parser.add_argument('--user_grouped_batch', action='store_true', default=False,
-                        help='Pretrain: group each batch by user (n_users=batch_size//32, 32 samples/user). Default: standard random batching.')
-
     parser.add_argument('--no_save_model', action='store_true', default=False,
                         help='If set, keep best model in memory instead of saving to disk')
 
-    # Loss function
-    parser.add_argument('--loss_type', type=str, default='mse',
-                        choices=['mse', 'ccc'],
-                        help='Training loss: mse or ccc')
+    # Domain Adaptation
+    parser.add_argument('--dann_target', type=str, default=None,
+                        help='Enable DANN mode. Format: DANN-{target_genre} (e.g., DANN-fashion). '
+                             'Omit to disable DANN.')
+    parser.add_argument('--eval_target', type=str, default=None,
+                        help='Target genre to evaluate on during source-only training (e.g., fashion). '
+                             'Records target val EMD without doing domain adaptation.')
+    parser.add_argument('--dann_epochs', type=int, default=50,
+                        help='λ schedule: number of epochs over which λ reaches ~1.0. '
+                             'Converted internally to total_steps = dann_epochs × (data_size / batch_size).')
+    parser.add_argument('--dann_gamma', type=float, default=10.0,
+                        help='λ schedule: sharpness of the sigmoid (Ganin et al.)')
 
     if parse:
         args = parser.parse_args()
@@ -74,6 +72,4 @@ def wandb_tags(args):
         tags += [f"model_type={args.model_type}"]
     if args.dropout > 0.:
         tags += [f"dropout={args.dropout}"]
-    if hasattr(args, 'use_backbone_image') and args.use_backbone_image:
-        tags += ["use_backbone_image"]
     return tags

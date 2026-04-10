@@ -1,4 +1,5 @@
 import os
+import math
 
 import torch
 import torch.nn as nn
@@ -46,7 +47,7 @@ class NIMA(nn.Module):
     - 'clip_rn50'   (2D, expects `[B, C, H, W]`)
     - 'clip_vit_b16'(2D, expects `[B, C, H, W]`)
     """
-    def __init__(self, num_bins_aesthetic, backbone='resnet50', dropout=0.0):
+    def __init__(self, num_bins_aesthetic, backbone='resnet50', dropout=0.0, feat_dim=256):
         super(NIMA, self).__init__()
 
         self.backbone_name = backbone
@@ -82,17 +83,17 @@ class NIMA(nn.Module):
             raise ValueError(f"Backbone '{backbone}' is not supported. "
                              f"Choose from: resnet50, i3d, vit_b_16, clip_rn50, clip_vit_b16")
 
+        self.feat_dim = feat_dim
+
         def _drop():
             return nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.fc_aesthetic = nn.Sequential(
+        self.feat_proj = nn.Sequential(
             nn.Linear(backbone_out_features, 512),
             nn.ReLU(),
             _drop(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            _drop(),
-            nn.Linear(256, num_bins_aesthetic)
+            nn.Linear(512, feat_dim),
         )
+        self.fc_aesthetic = nn.Linear(feat_dim, num_bins_aesthetic)
 
     def freeze_backbone(self):
         """Freeze entire backbone. Only fc_aesthetic remains trainable."""
@@ -116,11 +117,44 @@ class NIMA(nn.Module):
     def forward(self, x, return_feat=False):
         # For 2D backbone expect `[B, C, H, W]`.
         # For 3D backbone expect `[B, C, T, H, W]`.
-        feats = self.backbone(x)
-        aesthetic_logits = self.fc_aesthetic(feats)
+        raw_feat = self.backbone(x)
+        domain_feat = self.feat_proj(raw_feat)
+        aesthetic_logits = self.fc_aesthetic(domain_feat)
         if return_feat:
-            return aesthetic_logits, feats
+            return aesthetic_logits, domain_feat, raw_feat
         return aesthetic_logits
+
+
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.save_for_backward(torch.tensor(lambda_))
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        lambda_ = ctx.saved_tensors[0].item()
+        return -lambda_ * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    def forward(self, x, lambda_):
+        return GradientReversalFunction.apply(x, lambda_)
+
+
+class DomainDiscriminator(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 def discover_folds(root_dir, version_prefix):
@@ -131,3 +165,18 @@ def discover_folds(root_dir, version_prefix):
         if d.startswith(f'{version_prefix}_fold') and os.path.isdir(os.path.join(split_dir, d))
     ])
     return folds
+
+
+# ─── Domain Adaptation Shared Utilities ───────────────────────────────────────
+
+def parse_dann_target(dann_target: str) -> str:
+    """'DANN-fashion' → 'fashion'."""
+    if dann_target and dann_target.startswith('DANN-'):
+        return dann_target[5:]
+    return dann_target
+
+
+def get_da_lambda(epoch: int, total_steps: int, gamma: float = 10.0) -> float:
+    """λ schedule from Ganin et al. (2016). λ-scheduled DA 手法で共通利用。"""
+    p = min(epoch / max(total_steps, 1), 1.0)
+    return 2.0 / (1.0 + math.exp(-gamma * p)) - 1.0

@@ -14,6 +14,7 @@ def aggregate(args):
     pattern = args.pattern
     method = args.method  # e.g., "ICI" (optional)
     min_id = args.min_id
+    max_id = args.max_id
     reports_dir = Path(args.reports_dir)
 
     # version に該当する fold ディレクトリを検索
@@ -68,11 +69,15 @@ def aggregate(args):
         else:
             glob_pattern = "*.json"
         matched_jsons = list(genre_dir.glob(glob_pattern))
-        if min_id is not None:
+        if min_id is not None or max_id is not None:
             def _extract_id(p):
                 m = re.search(r'-(\d+)[_.]', p.name)
                 return int(m.group(1)) if m else -1
-            matched_jsons = [p for p in matched_jsons if _extract_id(p) >= min_id]
+            matched_jsons = [
+                p for p in matched_jsons
+                if (min_id is None or _extract_id(p) >= min_id)
+                and (max_id is None or _extract_id(p) <= max_id)
+            ]
         if len(matched_jsons) == 0:
             print(f"Error: No JSON matching '{glob_pattern}' found in {genre_dir}", file=sys.stderr)
             sys.exit(1)
@@ -484,6 +489,280 @@ def plot_quality(args):
         print(f"Saved: {out_path}")
 
 
+def visualize_features(args):
+    """DAモデルと非DAモデルの特徴量を2D可視化して比較する。
+
+    各foldの val_images_GIAA.txt から画像を収集し、NIMAfeatを抽出。
+    ratings.csvの全ユーザー平均スコアで3クラス（low/mid/high）に分類し
+    t-SNE/UMAP/PCAで2次元にプロット。非DAとDAを横並びサブプロットで比較。
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+    import torch.nn.functional as F
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from torchvision import transforms
+    from PIL import Image
+
+    import sys as _sys
+    _src = Path(__file__).resolve().parent
+    if str(_src) not in _sys.path:
+        _sys.path.insert(0, str(_src))
+    from train_common import NIMA, num_bins
+
+    source_genre = args.source_genre
+    target_genre = args.target_genre
+    backbone = args.backbone
+    root_dir = Path(args.root_dir)
+    models_pth_dir = Path(args.models_pth_dir)
+    method = args.method
+    percentile = args.percentile
+    dataset_ver = args.dataset_ver
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Device: {device}")
+    print(f"Task: {source_genre} → {target_genre}  |  method: {method.upper()}")
+
+    # ── 1. 画像ごとの平均スコアを計算・閾値を自動算出 ────────────────────────
+    ratings = pd.read_csv(root_dir / "maked" / "ratings.csv")
+    target_ratings = ratings[ratings["genre"] == target_genre]
+    img_mean_score = target_ratings.groupby("sample_file")["Aesthetic"].mean()
+
+    low_thresh = float(np.percentile(img_mean_score.values, percentile))
+    high_thresh = float(np.percentile(img_mean_score.values, 100 - percentile))
+    print(f"Percentile: {percentile}% / {100 - percentile}%  →  low<{low_thresh:.2f}, high≥{high_thresh:.2f}")
+
+    # ── 2. 画像変換（CLIP-ViT-B/16の標準前処理） ─────────────────────────────
+    transform = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                             std=[0.26862954, 0.26130258, 0.27577711]),
+    ])
+
+    # ── 3. 全foldを回して特徴量を収集 ─────────────────────────────────────────
+    split_dir = root_dir / "split"
+    fold_dirs = sorted(split_dir.glob(f"{dataset_ver}_fold*"))
+    if not fold_dirs:
+        print(f"Error: No fold dirs for version '{dataset_ver}' in {split_dir}", file=_sys.stderr)
+        _sys.exit(1)
+    if args.folds is not None:
+        fold_set = set(args.folds)
+        fold_dirs = [d for d in fold_dirs if int(d.name.split("fold")[-1]) in fold_set]
+        if not fold_dirs:
+            print(f"Error: No fold dirs matched --folds {args.folds}", file=_sys.stderr)
+            _sys.exit(1)
+
+    samples_dir = Path.home() / "proj-xpass" / "data" / "samples"
+
+    def find_nima_pth(fold_name, subdir):
+        d = models_pth_dir / fold_name / subdir
+        ptns = list(d.glob(f"{source_genre}_NIMA_*.pth"))
+        return ptns[0] if ptns else None
+
+    def load_model(pth_path):
+        model = NIMA(num_bins, backbone=backbone)
+        state = torch.load(pth_path, map_location=device, weights_only=True)
+        model.load_state_dict(state)
+        model.to(device).eval()
+        return model
+
+    def extract_features(model, val_images):
+        feats, labels = [], []
+        with torch.no_grad():
+            for img_file in val_images:
+                if img_file not in img_mean_score.index:
+                    continue
+                score = img_mean_score[img_file]
+                label = 0 if score < low_thresh else (1 if score < high_thresh else 2)
+
+                img_path = samples_dir / target_genre / img_file
+                try:
+                    img = Image.open(img_path).convert("RGB")
+                    t = transform(img).unsqueeze(0).to(device)
+                    _, feat, _ = model(t, return_feat=True)
+                    feats.append(feat.cpu().float().numpy()[0])
+                    labels.append(label)
+                except Exception as e:
+                    print(f"  Warning: skip {img_file}: {e}")
+        return feats, labels
+
+    all_feats = {"nonda": [], "da": []}
+    all_labels = {"nonda": [], "da": []}
+    all_fold_ids = {"nonda": [], "da": []}  # foldごとのID
+    fold_sil_scores = {"nonda": [], "da": []}  # foldごとのSilhouette Score
+
+    from sklearn.metrics import silhouette_score
+
+    for fold_idx, fold_dir in enumerate(fold_dirs):
+        fold_name = fold_dir.name
+        val_img_file = fold_dir / target_genre / "train_images_GIAA.txt"
+        if not val_img_file.exists():
+            print(f"Warning: {val_img_file} not found, skipping")
+            continue
+
+        with open(val_img_file) as f:
+            val_images = [line.strip() for line in f if line.strip()]
+
+        nonda_pth = find_nima_pth(fold_name, source_genre)
+        da_pth = find_nima_pth(fold_name, f"{source_genre}2{target_genre}")
+
+        if nonda_pth is None:
+            print(f"Warning: Non-DA model not found for {fold_name}/{source_genre}, skipping")
+            continue
+        if da_pth is None:
+            print(f"Warning: DA model not found for {fold_name}/{source_genre}2{target_genre}, skipping")
+            continue
+
+        print(f"\n[{fold_name}]")
+        print(f"  Non-DA: {nonda_pth.name}")
+        print(f"  DA:     {da_pth.name}")
+        print(f"  Images: {len(val_images)}")
+
+        for key, pth_path in [("nonda", nonda_pth), ("da", da_pth)]:
+            model = load_model(pth_path)
+            feats, labels = extract_features(model, val_images)
+            all_feats[key].extend(feats)
+            all_labels[key].extend(labels)
+            all_fold_ids[key].extend([fold_idx] * len(feats))
+            del model
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            # foldごとのSilhouette Score
+            f_arr = np.array(feats)
+            l_arr = np.array(labels)
+            mask = l_arr != 1
+            f_lh, l_lh = f_arr[mask], l_arr[mask]
+            if len(np.unique(l_lh)) >= 2 and len(f_lh) >= 2:
+                s = silhouette_score(f_lh, l_lh, metric="euclidean")
+                fold_sil_scores[key].append(s)
+                print(f"  Silhouette ({key}): {s:.4f}  (low={( l_lh==0).sum()}, high={(l_lh==2).sum()})")
+            else:
+                print(f"  Silhouette ({key}): N/A (insufficient samples)")
+
+    for key in ("nonda", "da"):
+        n = len(all_feats[key])
+        if n == 0:
+            print(f"Error: No features extracted for {key} model.", file=_sys.stderr)
+            _sys.exit(1)
+        print(f"\nTotal samples ({key}): {n}")
+
+    # ── 4. Silhouette Score 集計（平均±std） ──────────────────────────────────
+    print("\n=== Silhouette Score (256-dim domain_feat, low vs high) ===")
+    for key, label in [("nonda", "Non-DA"), ("da", "DA")]:
+        scores = fold_sil_scores[key]
+        if not scores:
+            print(f"  {label}: N/A")
+            continue
+        mean_s = float(np.mean(scores))
+        std_s = float(np.std(scores))
+        print(f"  {label}: {mean_s:.4f} ± {std_s:.4f}  (n_folds={len(scores)})")
+
+    # ── 5. 次元削減＋プロット（1手法分） ─────────────────────────────────────
+    class_names = [f"Low (<{low_thresh:.2f})", f"Mid ({low_thresh:.2f}-{high_thresh:.2f})", f"High (≥{high_thresh:.2f})"]
+    colors = ["#e74c3c", "#f39c12", "#2980b9"]
+    markers = ["o", "s", "^"]
+    hide_mid = args.hide_mid
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _reduce(feats_arr, m):
+        if m == "tsne":
+            from sklearn.manifold import TSNE
+            return TSNE(n_components=2, random_state=42, perplexity=min(30, len(feats_arr) - 1)).fit_transform(feats_arr)
+        elif m == "umap":
+            import umap as umap_lib
+            return umap_lib.UMAP(n_components=2, random_state=42).fit_transform(feats_arr)
+        elif m == "pca":
+            from sklearn.decomposition import PCA
+            return PCA(n_components=2, random_state=42).fit_transform(feats_arr)
+
+    def _plot_and_save(m):
+        # 先に両モデルの埋め込みを計算してからスケールを揃える
+        keys = ["nonda", "da"]
+        subtitles = [
+            f"Non-DA  ({source_genre} only)",
+            f"DA  ({source_genre}→{target_genre})",
+        ]
+        embeds = {}
+        for key in keys:
+            feats_arr = np.array(all_feats[key])
+            print(f"\nRunning {m.upper()} on {key} ({len(feats_arr)} samples)...")
+            embeds[key] = _reduce(feats_arr, m)
+
+        # 両埋め込みのグローバル軸範囲を算出
+        all_x = np.concatenate([embeds[k][:, 0] for k in keys])
+        all_y = np.concatenate([embeds[k][:, 1] for k in keys])
+        margin_x = (all_x.max() - all_x.min()) * 0.05 or 1.0
+        margin_y = (all_y.max() - all_y.min()) * 0.05 or 1.0
+        xlim = (all_x.min() - margin_x, all_x.max() + margin_x)
+        ylim = (all_y.min() - margin_y, all_y.max() + margin_y)
+
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+        for ax, key, subtitle in zip(axes, keys, subtitles):
+            labels_arr = np.array(all_labels[key])
+            fold_ids_arr = np.array(all_fold_ids[key])
+            embed = embeds[key]
+            unique_folds = np.unique(fold_ids_arr)
+            for cls_idx, (cname, color, marker) in enumerate(zip(class_names, colors, markers)):
+                if hide_mid and cls_idx == 1:
+                    continue
+                mask = labels_arr == cls_idx
+                ax.scatter(
+                    embed[mask, 0], embed[mask, 1],
+                    c=color, label=f"{cname} (n={mask.sum()})",
+                    s=18, alpha=0.7, linewidths=0, marker=marker,
+                )
+                if mask.sum() > 0:
+                    cx, cy = embed[mask, 0].mean(), embed[mask, 1].mean()
+                    ax.scatter(cx, cy, marker="*", c=color, s=250,
+                               edgecolors="black", linewidths=0.5, zorder=5,
+                               label="_nolegend_")
+                # foldごとのクラスター重心をプロット
+                for fold_id in unique_folds:
+                    fold_cls_mask = mask & (fold_ids_arr == fold_id)
+                    if fold_cls_mask.sum() == 0:
+                        continue
+                    cx = embed[fold_cls_mask, 0].mean()
+                    cy = embed[fold_cls_mask, 1].mean()
+                    ax.scatter(
+                        cx, cy,
+                        c=color, marker="*", s=220, edgecolors="k",
+                        linewidths=0.8, zorder=5,
+                    )
+                    ax.annotate(
+                        f"f{fold_id}",
+                        xy=(cx, cy), xytext=(3, 3),
+                        textcoords="offset points",
+                        fontsize=7, color=color, zorder=6,
+                    )
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.set_title(subtitle, fontsize=12, fontweight="bold")
+            ax.legend(fontsize=9, loc="best")
+            ax.set_xlabel(f"{m.upper()} 1", fontsize=10)
+            ax.set_ylabel(f"{m.upper()} 2", fontsize=10)
+            ax.tick_params(labelsize=9)
+        fig.suptitle(
+            f"Feature space: {source_genre} → {target_genre}  [{m.upper()}]",
+            fontsize=13, y=1.01,
+        )
+        plt.tight_layout()
+        out = output_dir / f"{source_genre}2{target_genre}_{m}.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {out}")
+
+    # ── 5. 指定手法（またはall）で出力 ──────────────────────────────────────────
+    if not args.score_only:
+        methods_to_run = ["tsne", "umap", "pca"] if method == "all" else [method]
+        for m in methods_to_run:
+            _plot_and_save(m)
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -529,6 +808,13 @@ if __name__ == '__main__':
         default=None,
         dest="min_id",
         help="Minimum run ID to include (e.g., 61 filters to files with ID >= 61, like 'name-61_pretrain.json')",
+    )
+    agg_parser.add_argument(
+        "--max-id",
+        type=int,
+        default=None,
+        dest="max_id",
+        help="Maximum run ID to include (e.g., 80 filters to files with ID <= 80, like 'name-80_pretrain.json')",
     )
     agg_parser.add_argument(
         "--reports_dir",
@@ -607,11 +893,75 @@ if __name__ == '__main__':
         help="Output figure path (default: quality_check.png)",
     )
 
+    # Subcommand: visualize_features
+    vf_parser = subparsers.add_parser(
+        "visualize_features",
+        help="Visualize DA vs non-DA model features on target domain (2D projection)",
+    )
+    vf_parser.add_argument(
+        "--source-genre", type=str, default="art", dest="source_genre",
+        help="Source domain genre used to train the model (default: art)",
+    )
+    vf_parser.add_argument(
+        "--target-genre", type=str, default="fashion", dest="target_genre",
+        help="Target domain genre to visualize features on (default: fashion)",
+    )
+    vf_parser.add_argument(
+        "--dataset-ver", type=str, default="v1", dest="dataset_ver",
+        help="Dataset version prefix for fold discovery (default: v1)",
+    )
+    vf_parser.add_argument(
+        "--folds", type=int, nargs="+", default=None,
+        help="Specific fold numbers to use (e.g. --folds 1 3). If omitted, all folds are used.",
+    )
+    vf_parser.add_argument(
+        "--backbone", type=str, default="clip_vit_b16",
+        choices=["resnet50", "vit_b_16", "clip_rn50", "clip_vit_b16"],
+        help="Backbone architecture (must match saved model, default: clip_vit_b16)",
+    )
+    vf_parser.add_argument(
+        "--method", type=str, default="tsne",
+        choices=["tsne", "umap", "pca", "all"],
+        help="Dimensionality reduction method; 'all' runs tsne/umap/pca and saves each (default: tsne)",
+    )
+    vf_parser.add_argument(
+        "--percentile", type=float, default=25.0,
+        help="Bottom/top percentile for low/high class split (default: 25 → bottom 25%% = low, top 25%% = high)",
+    )
+    vf_parser.add_argument(
+        "--hide-mid", action="store_true", dest="hide_mid",
+        help="Hide the mid class from the plot (show only low and high)",
+    )
+    vf_parser.add_argument(
+        "--score-only", action="store_true", dest="score_only",
+        help="Only compute Silhouette Score; skip dimensionality reduction and plotting",
+    )
+    vf_parser.add_argument(
+        "--root-dir", type=str,
+        default="/home/hayashi0884/proj-xpass-DA/data",
+        dest="root_dir",
+        help="Root data directory containing maked/ and split/ (default: proj-xpass-DA/data)",
+    )
+    vf_parser.add_argument(
+        "--models-pth-dir", type=str,
+        default="/home/hayashi0884/proj-xpass-DA/models_pth",
+        dest="models_pth_dir",
+        help="Root directory of saved .pth models (default: proj-xpass-DA/models_pth)",
+    )
+    vf_parser.add_argument(
+        "-o", "--output-dir", default="reports/feature_viz",
+        dest="output_dir",
+        help="Output directory for figures; filenames are auto-generated as "
+             "{source}2{target}_{method}.png (default: reports/feature_viz)",
+    )
+
     args = parser.parse_args()
 
     if args.command == 'aggregate':
         aggregate(args)
     elif args.command == 'plot_quality':
         plot_quality(args)
+    elif args.command == 'visualize_features':
+        visualize_features(args)
     else:
         parser.print_help()
