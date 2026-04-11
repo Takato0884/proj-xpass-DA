@@ -15,6 +15,7 @@ def aggregate(args):
     method = args.method  # e.g., "ICI" (optional)
     min_id = args.min_id
     max_id = args.max_id
+    ids = set(args.ids) if args.ids is not None else None
     reports_dir = Path(args.reports_dir)
 
     # version に該当する fold ディレクトリを検索
@@ -75,7 +76,7 @@ def aggregate(args):
         else:
             glob_pattern = "*.json"
         matched_jsons = list(genre_dir.glob(glob_pattern))
-        if min_id is not None or max_id is not None:
+        if min_id is not None or max_id is not None or ids is not None:
             def _extract_id(p):
                 m = re.search(r'-(\d+)[_.]', p.name)
                 return int(m.group(1)) if m else -1
@@ -83,6 +84,7 @@ def aggregate(args):
                 p for p in matched_jsons
                 if (min_id is None or _extract_id(p) >= min_id)
                 and (max_id is None or _extract_id(p) <= max_id)
+                and (ids is None or _extract_id(p) in ids)
             ]
         if len(matched_jsons) == 0:
             print(f"Error: No JSON matching '{glob_pattern}' found in {genre_dir}", file=sys.stderr)
@@ -807,6 +809,13 @@ if __name__ == '__main__':
         nargs="+",
         default=None,
         help="Specific fold indices to aggregate (e.g., --folds 0 2 4). If omitted, all folds are used.",
+    )
+    agg_parser.add_argument(
+        "--ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Specific run IDs to include (e.g., --ids 61 65 70). Only files whose ID matches one of these values are aggregated.",
     )
     agg_parser.add_argument(
         "--min-id",
