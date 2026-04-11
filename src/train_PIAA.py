@@ -626,7 +626,8 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
     return cross_domain_results
 
 
-def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict):
+def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                     tgt_val_piaa_dataset=None, tgt_genre=None):
     """
     Finetune trainer for a single genre.
     Args:
@@ -637,6 +638,8 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
         experiment_name: experiment name
         backbone_dict: dict of {genre: backbone_type}
         pretrained_model_dict: dict of {genre: pretrained_model_path}
+        tgt_val_piaa_dataset: optional PIAA dataset for target domain val (filtered per user)
+        tgt_genre: target genre name string (used for logging)
     """
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
@@ -666,6 +669,18 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
                                   num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
         val_loaders_dict = {genre: DataLoader(user_val_ds, batch_size=batch_size, shuffle=False,
                                               num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
+
+        # Target val: 同ユーザーでフィルタ（存在しない場合はスキップ）
+        val_tgt_loaders = None
+        if tgt_val_piaa_dataset is not None and tgt_genre is not None:
+            tgt_val_mask = tgt_val_piaa_dataset.data['user_id'] == uid
+            if tgt_val_mask.sum() == 0:
+                print(f"User {uid}: not found in target genre '{tgt_genre}' val_piaa_dataset, skipping target eval")
+            else:
+                user_val_tgt = copy.copy(tgt_val_piaa_dataset)
+                user_val_tgt.data = tgt_val_piaa_dataset.data[tgt_val_mask].reset_index(drop=True)
+                val_tgt_loaders = {genre: DataLoader(user_val_tgt, batch_size=batch_size, shuffle=False,
+                                                     num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
         model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
         pretrained_path = pretrained_model_dict[genre]
@@ -700,6 +715,10 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
 
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
 
+            tgt_genre_metrics = None
+            if val_tgt_loaders is not None:
+                tgt_genre_metrics, _ = evaluate(model_user, val_tgt_loaders, device, epoch=epoch, phase_name=f"Val ({tgt_genre})")
+
             if args.is_log:
                 log_dict = {"epoch": epoch}
                 if genre in genre_metrics:
@@ -707,6 +726,12 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
                     log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
                     log_dict[f"{genre}/Val NDCG@10 user_{uid}"] = genre_metrics[genre]['ndcg@10']
                     log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
+                if tgt_genre_metrics is not None and genre in tgt_genre_metrics:
+                    tgt_m = tgt_genre_metrics[genre]
+                    log_dict[f"{tgt_genre}/Val MAE user_{uid}"] = tgt_m['mae']
+                    log_dict[f"{tgt_genre}/Val SROCC user_{uid}"] = tgt_m['srocc']
+                    log_dict[f"{tgt_genre}/Val NDCG@10 user_{uid}"] = tgt_m['ndcg@10']
+                    log_dict[f"{tgt_genre}/Val CCC user_{uid}"] = tgt_m['ccc']
                 wandb.log(log_dict, commit=True)
 
             prev_lr = optimizer_user.param_groups[0]['lr']
@@ -1432,7 +1457,16 @@ def run_main(args):
                 args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                 dann_target_genre=dann_target_genre)
         else:
-            trainer_finetune(datasets_dict_user, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict)
+            eval_target = getattr(args, 'eval_target', None)
+            if eval_target:
+                args_tgt = copy.deepcopy(args)
+                args_tgt.genre = eval_target
+                _, _, _, _, tgt_val_piaa_dataset, _, _ = load_data(
+                    args_tgt, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
+            else:
+                tgt_val_piaa_dataset = None
+            trainer_finetune(datasets_dict_user, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                             tgt_val_piaa_dataset=tgt_val_piaa_dataset, tgt_genre=eval_target)
         inference_finetune(datasets_dict_user, args, device, dirname, experiment_name, backbone_dict, eval_datasets_dict=eval_datasets_dict)
         for pth_file in [f for f in os.listdir(dirname) if f.endswith('_finetune.pth')]:
             os.remove(os.path.join(dirname, pth_file))
