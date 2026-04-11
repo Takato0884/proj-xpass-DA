@@ -476,13 +476,9 @@ def load_data(args, global_trait_encoders=None, global_age_bins=None):
     train_piaa_dataset, val_piaa_dataset, test_piaa_dataset = create_PIAA_split_dataset(all_dataset, dataset_ver)
 
     # User-based GIAA split for PIAA pretraining (prevents user leakage)
-    try:
-        train_giaa_usersplit, val_giaa_usersplit = create_GIAA_user_split_dataset(all_dataset, dataset_ver)
-        pretrain_train_data = train_giaa_usersplit.data
-        pretrain_val_data = val_giaa_usersplit.data
-    except FileNotFoundError:
-        pretrain_train_data = None
-        pretrain_val_data = None
+    train_giaa_usersplit, val_giaa_usersplit = create_GIAA_user_split_dataset(all_dataset, dataset_ver)
+    pretrain_train_data = train_giaa_usersplit.data
+    pretrain_val_data = val_giaa_usersplit.data
 
     """Precompute"""
     # Store precomputed cache under a versioned subfolder: data/cash/<version>/<genre>_dataset_pkl/

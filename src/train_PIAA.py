@@ -761,7 +761,7 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
     genre_str = genre
 
     train_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
-                              num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                              drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
     val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
                                           num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
