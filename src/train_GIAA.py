@@ -23,11 +23,10 @@ from .train_common import (NIMA, EarthMoverDistance, earth_mover_distance, disco
 from .inference import inference
 
 
-def train(model, dataloader, optimizer, device, args, epoch: int = None):
+def train(model, dataloader, optimizer, scaler, device, args, epoch: int = None):
     model.train()
     running_aesthetic_emd_loss = 0.0
     running_total_emd_loss = 0.0
-    scaler = GradScaler('cuda')
     # Persist progress bar in terminal per epoch
     desc = f"Epoch {epoch} [Train]" if epoch is not None else "Train"
     progress_bar = tqdm(dataloader, leave=True, desc=desc, position=0, ncols=120, colour="#00ff00", ascii="-=")
@@ -139,12 +138,14 @@ def trainer(dataloaders, model, optimizer, args, train_fn, evaluate_fn, device, 
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=args.lr_decay_factor, patience=args.lr_patience)
 
+    scaler = GradScaler('cuda')
+
     # Training loop
     best_test_emd = 1000
     num_patience_epochs = 0
     for epoch in range(args.num_epochs):
         # Training
-        train_emd_loss = train_fn(model, train_dataloader, optimizer, device, args, epoch=epoch)
+        train_emd_loss = train_fn(model, train_dataloader, optimizer, scaler, device, args, epoch=epoch)
         if args.is_log:
             wandb.log({
                 "epoch": epoch,
@@ -199,7 +200,7 @@ criterion_mse = nn.MSELoss()
 
 # ─── DANN for GIAA ────────────────────────────────────────────────────────────
 
-def train_dann_giaa(model, src_loader, tgt_loader, discriminator, grl, optimizer, optimizer_disc, device, args,
+def train_dann_giaa(model, src_loader, tgt_loader, discriminator, grl, optimizer, optimizer_disc, scaler, device, args,
                     epoch=None, global_step=0, dann_total_steps=50):
     """
     DANN の 1 エポック学習（GIAA レベル）。
@@ -210,8 +211,6 @@ def train_dann_giaa(model, src_loader, tgt_loader, discriminator, grl, optimizer
     """
     model.train()
     discriminator.train()
-
-    scaler = GradScaler('cuda')
     running_L_y = running_L_d = running_L_d_tgt = running_disc_acc_tgt = 0.0
     total_batches = 0
     tgt_iter = iter(tgt_loader)
@@ -294,9 +293,11 @@ def trainer_dann_giaa(src_dataloaders, tgt_loader, model, discriminator, grl, op
 
     target_genre = parse_dann_target(args.dann_target)
 
+    scaler = GradScaler('cuda')
+
     for epoch in range(args.num_epochs):
         L_y, L_d, L_d_tgt, disc_acc_tgt, global_step = train_dann_giaa(
-            model, src_train_loader, tgt_loader, discriminator, grl, optimizer, optimizer_disc, device, args,
+            model, src_train_loader, tgt_loader, discriminator, grl, optimizer, optimizer_disc, scaler, device, args,
             epoch=epoch, global_step=global_step, dann_total_steps=dann_total_steps)
         lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
 

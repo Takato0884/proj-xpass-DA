@@ -7,6 +7,7 @@
 
 # Wandb
 wandb/
+documents
 
 # Python
 __pycache__/

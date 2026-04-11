@@ -42,7 +42,6 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.num_attr = num_attr
         self.num_pt = num_pt
         self.genres = genres
-        self.register_buffer('scale', torch.arange(0, num_bins).float())
         self.use_uncertainty_weighting = use_uncertainty_weighting
 
 
@@ -74,6 +73,9 @@ class PIAA_MIR_CrossDomain(nn.Module):
         for genre in genres:
             self.interaction_fc_dict[genre] = nn.Linear(interaction_input_dim, 1)
 
+        # Linear layer for direct output from NIMA probability distribution
+        self.direct_fc = nn.Linear(num_bins, 1)
+
     def freeze_backbone(self):
         for genre, nima in self.nima_dict.items():
             backbone = nima.backbone
@@ -104,7 +106,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
         I_ij = A_ij.view(images.size(0), -1)
 
         interaction_outputs = self.interaction_fc_dict[genre](I_ij)
-        direct_outputs = torch.sum(prob * self.scale, dim=1, keepdim=True) / (self.num_bins - 1)
+        direct_outputs = self.direct_fc(prob)
         return interaction_outputs + direct_outputs
 
 
@@ -183,7 +185,6 @@ class PIAA_ICI_CrossDomain(nn.Module):
         self.num_attr = num_attr
         self.num_pt = num_pt
         self.genres = genres  # list of genre names, e.g., ['art']
-        self.register_buffer('scale', torch.arange(0, num_bins).float())
         self.input_dim = input_dim
 
 
@@ -209,6 +210,9 @@ class PIAA_ICI_CrossDomain(nn.Module):
 
         # Linear layer for interaction output
         self.attr_corr = nn.Linear(input_dim, 1)
+
+        # Linear layer for direct output from NIMA probability distribution
+        self.direct_fc = nn.Linear(num_bins, 1)
 
         # Backbone image projection — uses raw backbone features, independent of feat_proj
         self.backbone_image_proj = nn.ModuleDict()
@@ -280,7 +284,7 @@ class PIAA_ICI_CrossDomain(nn.Module):
         # Final prediction
         I_ij = torch.sum(fused_features_img, dim=1, keepdim=False) + torch.sum(fused_features_user, dim=1, keepdim=False)
         interaction_outputs = self.attr_corr(I_ij)
-        direct_outputs = torch.sum(prob * self.scale, dim=1, keepdim=True) / (self.num_bins - 1)
+        direct_outputs = self.direct_fc(prob)
         if return_feat:
             return interaction_outputs + direct_outputs, I_ij
         return interaction_outputs + direct_outputs
@@ -838,7 +842,7 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
     return best_model_path, best_state_dict
 
 def train_dann_piaa_pretrain(model, src_loader, tgt_loader, discriminator, grl,
-                             optimizer, optimizer_disc, device, args, genre,
+                             optimizer, optimizer_disc, scaler, device, args, genre,
                              epoch=None, global_step=0, dann_total_steps=50):
     """
     DANN の 1 エポック学習（PIAA pretrain レベル）。
@@ -849,8 +853,6 @@ def train_dann_piaa_pretrain(model, src_loader, tgt_loader, discriminator, grl,
     """
     model.train()
     discriminator.train()
-
-    scaler = GradScaler('cuda')
     running_L_y = running_L_d = running_L_d_tgt = running_disc_acc_tgt = 0.0
     total_batches = 0
     tgt_iter = iter(tgt_loader)
@@ -983,9 +985,11 @@ def trainer_dann_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset
     best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_{experiment_name}_pretrain.pth')
     best_state_dict = None
 
+    scaler = GradScaler('cuda')
+
     for epoch in range(args.num_epochs):
         L_y, L_d, L_d_tgt, disc_acc_tgt, global_step = train_dann_piaa_pretrain(
-            model, src_loader, tgt_loader, discriminator, grl, optimizer, optimizer_disc,
+            model, src_loader, tgt_loader, discriminator, grl, optimizer, optimizer_disc, scaler,
             device, args, genre, epoch=epoch, global_step=global_step, dann_total_steps=dann_total_steps)
         lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
 
