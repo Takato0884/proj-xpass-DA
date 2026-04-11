@@ -990,7 +990,7 @@ def trainer_dann_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset
     discriminator = DomainDiscriminator(model.input_dim).to(device)
     grl = GradientReversalLayer()
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-    optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr)
+    optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
     steps_per_epoch = len(src_loader)
@@ -1235,7 +1235,7 @@ def trainer_dann_piaa_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_pi
         discriminator = DomainDiscriminator(model_user.input_dim).to(device)
         grl = GradientReversalLayer()
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model_user.parameters()), lr=args.lr)
-        optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr)
+        optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
         steps_per_epoch = len(src_loader)

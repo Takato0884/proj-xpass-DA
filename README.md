@@ -261,6 +261,7 @@ python src/preprocessing.py make_data_split_cv \
 | `--dann_target` | str | `None` | DANNモードを有効化。ターゲットジャンルを指定（例: `fashion`）。省略するとドメイン適応なし |
 | `--dann_epochs` | int | `50` | λスケジュール: λが〜1.0に達するまでのエポック数。内部で `total_steps = dann_epochs × (data_size / batch_size)` に変換される |
 | `--dann_gamma` | float | `10.0` | λスケジュール: シグモイドの鋭さ（Ganin et al.） |
+| `--eval_target` | str | `None` | ソースのみ学習中にターゲットジャンルを評価（例: `fashion`）。ドメイン適応なしでターゲットのval EMDを記録する |
 
 > **注:** クロスドメイン評価（`--genre` 以外の全ジャンルに対する評価）は常に実行されます。
 
@@ -307,9 +308,12 @@ python -m src.train_GIAA --genre scenery --use_video
 | `--dropout` | float | `0.1` | ドロップアウト率（全MLPの中間層に適用） |
 | `--num_workers` | int | `4` | DataLoaderのワーカー数 |
 | `--start_fold` | int | `1` | 再開するfold番号（1-indexed）。`--dataset_ver` が `_all` で終わる場合に使用 |
-| `--use_backbone_image` | flag | `True` | バックボーン画像特徴量をインタラクション入力として追加 |
 | `--no_log` | flag | `False` | wandbロギングを無効化 |
 | `--no_save_model` | flag | `False` | モデルをディスクに保存せず、最良モデルをメモリに保持する |
+| `--dann_target` | str | `None` | DANNモードを有効化。ターゲットジャンルを指定（例: `fashion`）。省略するとドメイン適応なし |
+| `--dann_epochs` | int | `50` | λスケジュール: λが〜1.0に達するまでのエポック数。内部で `total_steps = dann_epochs × (data_size / batch_size)` に変換される |
+| `--dann_gamma` | float | `10.0` | λスケジュール: シグモイドの鋭さ（Ganin et al.） |
+| `--eval_target` | str | `None` | ソースのみ学習中にターゲットジャンルを評価（例: `fashion`）。ドメイン適応なしでターゲットのval EMDを記録する |
 
 > **注:** クロスドメイン評価（`--genre` 以外の全ジャンルに対する評価）は常に実行されます。損失関数はMSEで固定です。
 
@@ -372,7 +376,7 @@ python -m src.inference --genre art --pattern "*NIMA*" --force
 | `--batch_size` | int | `16` | 推論時のバッチサイズ |
 | `--num_workers` | int | `4` | DataLoaderのワーカー数 |
 | `--dropout` | float | `0.1` | モデル構造に合わせたドロップアウト率 |
-| `--use_backbone_image` | flag | `True` | バックボーン画像特徴量をインタラクション入力として使用（学習時と一致させること） |
+| `--model_type` | str | `None` | pretrainファイルをモデルタイプで絞り込む（`ICI` / `MIR`）。省略時は全マッチファイルを実行 |
 | `--force` | flag | `False` | 結果JSONが既に存在しても再実行する |
 
 > **注:** クロスドメイン評価は常に実行されます。`--genre` 以外の全ジャンルのテストセットに対して自動的に評価が行われます。
