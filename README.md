@@ -424,6 +424,108 @@ python src/analysis.py aggregate \
 | `--min-id` | int | なし | 集約対象のrun IDの下限（例: `61` → `name-61_*.json` 以降のみ対象） |
 | `--reports_dir` | str | `reports/exp` | JSONファイルの検索ディレクトリ |
 
+### 特徴量の2D可視化（visualize_features）
+
+DAモデルと非DAモデルの特徴量空間を2次元に投影して比較します。各foldのバリデーション画像に対してNIMAの中間特徴量（`domain_feat`）を抽出し、t-SNE / UMAP / PCA で可視化します。Low / Mid / High の3クラス（`ratings.csv` の全ユーザー平均スコアをパーセンタイルで分類）を色分けしてサブプロットで横並び表示し、クラス分離度を Silhouette Score で定量評価します。
+
+```bash
+# art→fashion を t-SNE で可視化（デフォルト設定）
+python src/analysis.py visualize_features \
+  --source-genre art \
+  --target-genre fashion
+
+# t-SNE / UMAP / PCA の3手法すべてを出力
+python src/analysis.py visualize_features \
+  --source-genre art \
+  --target-genre fashion \
+  --method all
+
+# スコア（Silhouette Score）のみ計算してプロットはスキップ
+python src/analysis.py visualize_features \
+  --source-genre art \
+  --target-genre fashion \
+  --score-only
+
+# fold 1・3 のみ使用し、Mid クラスを非表示にする
+python src/analysis.py visualize_features \
+  --source-genre art \
+  --target-genre fashion \
+  --folds 1 3 \
+  --hide-mid
+```
+
+#### 出力例（art → fashion, PCA）
+
+![art2fashion_pca](reports/feature_viz/art2fashion_pca.png)
+
+#### オプション引数一覧
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|------|------|------|
+| `--source-genre` | str | `art` | ソースドメインのジャンル（モデルの学習元） |
+| `--target-genre` | str | `fashion` | ターゲットドメインのジャンル（可視化対象） |
+| `--dataset-ver` | str | `v1` | foldディレクトリ探索に使うデータセットバージョン（例: `v1`→`v1_fold*`） |
+| `--folds` | list | なし | 使用するfold番号（例: `--folds 1 3`）。省略時は全fold |
+| `--backbone` | str | `clip_vit_b16` | バックボーン（保存済みモデルと一致させること）。選択肢: `resnet50`, `vit_b_16`, `clip_rn50`, `clip_vit_b16` |
+| `--method` | str | `tsne` | 次元削減手法。選択肢: `tsne`, `umap`, `pca`, `all`（`all` は3手法すべて実行） |
+| `--percentile` | float | `25.0` | Low/High クラスの分割パーセンタイル（例: 25 → 下位25%=Low、上位25%=High） |
+| `--hide-mid` | flag | False | Mid クラスをプロットから除外して Low/High のみ表示 |
+| `--score-only` | flag | False | Silhouette Score のみ計算し、次元削減・プロットをスキップ |
+| `--root-dir` | str | `proj-xpass-DA/data` | `maked/` および `split/` を含むデータルートディレクトリ |
+| `--models-pth-dir` | str | `proj-xpass-DA/models_pth` | 保存済み `.pth` モデルのルートディレクトリ |
+| `-o` / `--output-dir` | str | `reports/feature_viz` | 出力先ディレクトリ。ファイル名は `{source}2{target}_{method}.png` で自動生成 |
+
+---
+
+### ドメインギャップの可視化（visualize_domain_gap）
+
+non-DA モデルと DA モデルそれぞれで、ソース画像とターゲット画像の特徴量を同一空間にプロットし、DA によるドメインギャップ縮小を可視化します。各foldのソース・ターゲット両ドメインの画像を `train_images_GIAA.txt` から収集し、t-SNE / UMAP / PCA で2次元に投影。non-DA（左）では2ドメインが離れて分布し、DA（右）ではそれらが近づく様子を横並びで比較します。ドメイン分離度は Silhouette Score で定量評価し、**値が低いほどドメインギャップが小さい**ことを示します。
+
+```bash
+# art→fashion を t-SNE で可視化（デフォルト設定）
+python src/analysis.py visualize_domain_gap \
+  --source-genre art \
+  --target-genre fashion
+
+# t-SNE / UMAP / PCA の3手法すべてを出力
+python src/analysis.py visualize_domain_gap \
+  --source-genre art \
+  --target-genre fashion \
+  --method all
+
+# スコア（Silhouette Score）のみ計算してプロットはスキップ
+python src/analysis.py visualize_domain_gap \
+  --source-genre art \
+  --target-genre fashion \
+  --score-only
+
+# 画像数を絞って高速化・fold 1 のみ使用
+python src/analysis.py visualize_domain_gap \
+  --source-genre art \
+  --target-genre fashion \
+  --n-source 100 \
+  --n-target 100 \
+  --folds 1
+```
+
+#### オプション引数一覧
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|------|------|------|
+| `--source-genre` | str | `art` | ソースドメインのジャンル |
+| `--target-genre` | str | `fashion` | ターゲットドメインのジャンル |
+| `--dataset-ver` | str | `v1` | foldディレクトリ探索に使うデータセットバージョン（例: `v1`→`v1_fold*`） |
+| `--folds` | list | なし | 使用するfold番号（例: `--folds 1 3`）。省略時は全fold |
+| `--split-file` | str | `train_images_GIAA.txt` | 各 `fold/<genre>/` 内の画像リストファイル名 |
+| `--n-source` | int | なし | fold あたりのソース画像数上限（省略時は全件） |
+| `--n-target` | int | なし | fold あたりのターゲット画像数上限（省略時は全件） |
+| `--backbone` | str | `clip_vit_b16` | バックボーン（保存済みモデルと一致させること）。選択肢: `resnet50`, `vit_b_16`, `clip_rn50`, `clip_vit_b16` |
+| `--method` | str | `tsne` | 次元削減手法。選択肢: `tsne`, `umap`, `pca`, `all`（`all` は3手法すべて実行） |
+| `--score-only` | flag | False | Silhouette Score のみ計算し、次元削減・プロットをスキップ |
+| `--root-dir` | str | `proj-xpass-DA/data` | `maked/` および `split/` を含むデータルートディレクトリ |
+| `--models-pth-dir` | str | `proj-xpass-DA/models_pth` | 保存済み `.pth` モデルのルートディレクトリ |
+| `-o` / `--output-dir` | str | `reports/feature_viz` | 出力先ディレクトリ。ファイル名は `{source}2{target}_domain_gap_{method}.png` で自動生成 |
+
 ---
 
 ## 特徴量の次元構成

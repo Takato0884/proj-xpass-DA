@@ -568,7 +568,7 @@ def visualize_features(args):
 
     def find_nima_pth(fold_name, subdir):
         d = models_pth_dir / fold_name / subdir
-        ptns = list(d.glob(f"{source_genre}_NIMA_*.pth"))
+        ptns = list(d.glob(f"{subdir}_NIMA_*.pth"))
         return ptns[0] if ptns else None
 
     def load_model(pth_path):
@@ -771,6 +771,274 @@ def visualize_features(args):
             _plot_and_save(m)
 
 
+def visualize_domain_gap(args):
+    """DAモデルと非DAモデルでソース・ターゲットドメイン間の特徴量ギャップを比較可視化する。
+
+    各foldのソース画像とターゲット画像の特徴量を両モデルで抽出し、t-SNE/UMAP/PCAで2次元にプロット。
+    非DA（左）とDA（右）を横並びサブプロットで比較し、DAによるドメインギャップ縮小を可視化。
+    ドメイン分離度をSilhouette Scoreで定量評価（低いほどドメインギャップが小さい）。
+    """
+    import numpy as np
+    import torch
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from torchvision import transforms
+    from PIL import Image
+
+    import sys as _sys
+    _src = Path(__file__).resolve().parent
+    if str(_src) not in _sys.path:
+        _sys.path.insert(0, str(_src))
+    from train_common import NIMA, num_bins
+
+    source_genre = args.source_genre
+    target_genre = args.target_genre
+    backbone = args.backbone
+    root_dir = Path(args.root_dir)
+    models_pth_dir = Path(args.models_pth_dir)
+    method = args.method
+    dataset_ver = args.dataset_ver
+    split_file = args.split_file
+    n_source = args.n_source
+    n_target = args.n_target
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Device: {device}")
+    print(f"Task: {source_genre} → {target_genre}  |  method: {method.upper()}")
+
+    # ── 1. 画像変換（CLIP-ViT-B/16の標準前処理） ─────────────────────────────
+    transform = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                             std=[0.26862954, 0.26130258, 0.27577711]),
+    ])
+
+    # ── 2. foldディレクトリの取得 ─────────────────────────────────────────────
+    split_dir = root_dir / "split"
+    fold_dirs = sorted(split_dir.glob(f"{dataset_ver}_fold*"))
+    if not fold_dirs:
+        print(f"Error: No fold dirs for version '{dataset_ver}' in {split_dir}", file=_sys.stderr)
+        _sys.exit(1)
+    if args.folds is not None:
+        fold_set = set(args.folds)
+        fold_dirs = [d for d in fold_dirs if int(d.name.split("fold")[-1]) in fold_set]
+        if not fold_dirs:
+            print(f"Error: No fold dirs matched --folds {args.folds}", file=_sys.stderr)
+            _sys.exit(1)
+
+    samples_dir = Path.home() / "proj-xpass" / "data" / "samples"
+
+    # split ファイルのファイル名と実際のサンプルディレクトリが異なるジャンルのマッピング
+    # "genre_name": ("samples_subdir", "image_extension")
+    GENRE_SAMPLES_MAP = {
+        "scenery": ("scenery_image", ".jpg"),
+    }
+
+    def find_nima_pth(fold_name, subdir):
+        d = models_pth_dir / fold_name / subdir
+        ptns = list(d.glob(f"{subdir}_NIMA_*.pth"))
+        return ptns[0] if ptns else None
+
+    def load_model(pth_path):
+        model = NIMA(num_bins, backbone=backbone)
+        state = torch.load(pth_path, map_location=device, weights_only=True)
+        model.load_state_dict(state)
+        model.to(device).eval()
+        return model
+
+    def extract_domain_features(model, img_files, genre, domain_label, max_n):
+        """指定ドメインの画像から特徴量を抽出する。domain_label: 0=source, 1=target"""
+        feats, labels = [], []
+        targets = img_files[:max_n] if max_n is not None else img_files
+        samples_subdir, img_ext = GENRE_SAMPLES_MAP.get(genre, (genre, None))
+        with torch.no_grad():
+            for img_file in targets:
+                # split ファイルの拡張子を画像拡張子に置き換える（必要な場合）
+                fname = (Path(img_file).stem + img_ext) if img_ext else img_file
+                img_path = samples_dir / samples_subdir / fname
+                try:
+                    img = Image.open(img_path).convert("RGB")
+                    t = transform(img).unsqueeze(0).to(device)
+                    _, feat, _ = model(t, return_feat=True)
+                    feats.append(feat.cpu().float().numpy()[0])
+                    labels.append(domain_label)
+                except Exception as e:
+                    print(f"  Warning: skip {img_file}: {e}")
+        return feats, labels
+
+    # domain_label: 0=source, 1=target
+    all_feats = {"nonda": [], "da": []}
+    all_labels = {"nonda": [], "da": []}
+    all_fold_ids = {"nonda": [], "da": []}
+    fold_sil_scores = {"nonda": [], "da": []}
+
+    from sklearn.metrics import silhouette_score
+
+    for fold_idx, fold_dir in enumerate(fold_dirs):
+        fold_name = fold_dir.name
+
+        src_img_file = fold_dir / source_genre / split_file
+        tgt_img_file = fold_dir / target_genre / split_file
+
+        if not src_img_file.exists():
+            print(f"Warning: {src_img_file} not found, skipping")
+            continue
+        if not tgt_img_file.exists():
+            print(f"Warning: {tgt_img_file} not found, skipping")
+            continue
+
+        with open(src_img_file) as f:
+            src_images = [line.strip() for line in f if line.strip()]
+        with open(tgt_img_file) as f:
+            tgt_images = [line.strip() for line in f if line.strip()]
+
+        nonda_pth = find_nima_pth(fold_name, source_genre)
+        da_pth = find_nima_pth(fold_name, f"{source_genre}2{target_genre}")
+
+        if nonda_pth is None:
+            print(f"Warning: Non-DA model not found for {fold_name}/{source_genre}, skipping")
+            continue
+        if da_pth is None:
+            print(f"Warning: DA model not found for {fold_name}/{source_genre}2{target_genre}, skipping")
+            continue
+
+        print(f"\n[{fold_name}]")
+        print(f"  Non-DA: {nonda_pth.name}")
+        print(f"  DA:     {da_pth.name}")
+        print(f"  Source images: {len(src_images)}, Target images: {len(tgt_images)}")
+
+        for key, pth_path in [("nonda", nonda_pth), ("da", da_pth)]:
+            model = load_model(pth_path)
+            src_feats, src_labs = extract_domain_features(model, src_images, source_genre, 0, n_source)
+            tgt_feats, tgt_labs = extract_domain_features(model, tgt_images, target_genre, 1, n_target)
+            feats = src_feats + tgt_feats
+            labels = src_labs + tgt_labs
+            all_feats[key].extend(feats)
+            all_labels[key].extend(labels)
+            all_fold_ids[key].extend([fold_idx] * len(feats))
+            del model
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            # foldごとのSilhouette Score（低いほどドメインギャップが小さい）
+            f_arr = np.array(feats)
+            l_arr = np.array(labels)
+            if len(np.unique(l_arr)) >= 2 and len(f_arr) >= 2:
+                s = silhouette_score(f_arr, l_arr, metric="euclidean")
+                fold_sil_scores[key].append(s)
+                print(f"  Silhouette ({key}): {s:.4f}  "
+                      f"(source={( l_arr==0).sum()}, target={(l_arr==1).sum()})")
+            else:
+                print(f"  Silhouette ({key}): N/A (insufficient samples)")
+
+    for key in ("nonda", "da"):
+        n = len(all_feats[key])
+        if n == 0:
+            print(f"Error: No features extracted for {key} model.", file=_sys.stderr)
+            _sys.exit(1)
+        print(f"\nTotal samples ({key}): {n}")
+
+    # ── 4. Silhouette Score 集計（平均±std） ──────────────────────────────────
+    print("\n=== Domain Separation Score (256-dim domain_feat, source vs target) ===")
+    print("  (lower Silhouette = better domain alignment)")
+    for key, label in [("nonda", "Non-DA"), ("da", "DA")]:
+        scores = fold_sil_scores[key]
+        if not scores:
+            print(f"  {label}: N/A")
+            continue
+        mean_s = float(np.mean(scores))
+        std_s = float(np.std(scores))
+        print(f"  {label}: {mean_s:.4f} ± {std_s:.4f}  (n_folds={len(scores)})")
+
+    if args.score_only:
+        return
+
+    # ── 5. 次元削減＋プロット ─────────────────────────────────────────────────
+    domain_names = [source_genre, target_genre]
+    domain_colors = ["#e74c3c", "#2980b9"]
+    domain_markers = ["o", "s"]
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _reduce(feats_arr, m):
+        if m == "tsne":
+            from sklearn.manifold import TSNE
+            return TSNE(n_components=2, random_state=42, perplexity=min(30, len(feats_arr) - 1)).fit_transform(feats_arr)
+        elif m == "umap":
+            import umap as umap_lib
+            return umap_lib.UMAP(n_components=2, random_state=42).fit_transform(feats_arr)
+        elif m == "pca":
+            from sklearn.decomposition import PCA
+            return PCA(n_components=2, random_state=42).fit_transform(feats_arr)
+
+    sil_means = {}
+    for key in ("nonda", "da"):
+        s = fold_sil_scores[key]
+        sil_means[key] = float(np.mean(s)) if s else float("nan")
+
+    def _plot_and_save(m):
+        keys = ["nonda", "da"]
+        subtitles = [
+            f"Non-DA  ({source_genre} only)",
+            f"DA  ({source_genre}→{target_genre})",
+        ]
+        embeds = {}
+        for key in keys:
+            feats_arr = np.array(all_feats[key])
+            print(f"\nRunning {m.upper()} on {key} ({len(feats_arr)} samples)...")
+            embeds[key] = _reduce(feats_arr, m)
+
+        all_x = np.concatenate([embeds[k][:, 0] for k in keys])
+        all_y = np.concatenate([embeds[k][:, 1] for k in keys])
+        margin_x = (all_x.max() - all_x.min()) * 0.05 or 1.0
+        margin_y = (all_y.max() - all_y.min()) * 0.05 or 1.0
+        xlim = (all_x.min() - margin_x, all_x.max() + margin_x)
+        ylim = (all_y.min() - margin_y, all_y.max() + margin_y)
+
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+        for ax, key, subtitle in zip(axes, keys, subtitles):
+            labels_arr = np.array(all_labels[key])
+            embed = embeds[key]
+            for dom_idx, (dname, color, marker) in enumerate(
+                zip(domain_names, domain_colors, domain_markers)
+            ):
+                mask = labels_arr == dom_idx
+                ax.scatter(
+                    embed[mask, 0], embed[mask, 1],
+                    c=color, label=f"{dname} (n={mask.sum()})",
+                    s=18, alpha=0.7, linewidths=0, marker=marker,
+                )
+                if mask.sum() > 0:
+                    cx, cy = embed[mask, 0].mean(), embed[mask, 1].mean()
+                    ax.scatter(cx, cy, marker="*", c=color, s=250,
+                               edgecolors="black", linewidths=0.5, zorder=5,
+                               label="_nolegend_")
+            sil_val = sil_means[key]
+            sil_str = f"{sil_val:.4f}" if not np.isnan(sil_val) else "N/A"
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.set_title(f"{subtitle}\nSilhouette={sil_str}", fontsize=12, fontweight="bold")
+            ax.legend(fontsize=9, loc="best")
+            ax.set_xlabel(f"{m.upper()} 1", fontsize=10)
+            ax.set_ylabel(f"{m.upper()} 2", fontsize=10)
+            ax.tick_params(labelsize=9)
+        fig.suptitle(
+            f"Domain gap: {source_genre} vs {target_genre}  [{m.upper()}]",
+            fontsize=13, y=1.01,
+        )
+        plt.tight_layout()
+        out = output_dir / f"{source_genre}2{target_genre}_domain_gap_{m}.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {out}")
+
+    methods_to_run = ["tsne", "umap", "pca"] if method == "all" else [method]
+    for m in methods_to_run:
+        _plot_and_save(m)
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -970,6 +1238,72 @@ if __name__ == '__main__':
              "{source}2{target}_{method}.png (default: reports/feature_viz)",
     )
 
+    # Subcommand: visualize_domain_gap
+    vdg_parser = subparsers.add_parser(
+        "visualize_domain_gap",
+        help="Visualize domain gap reduction between source and target (non-DA vs DA)",
+    )
+    vdg_parser.add_argument(
+        "--source-genre", type=str, default="art", dest="source_genre",
+        help="Source domain genre (default: art)",
+    )
+    vdg_parser.add_argument(
+        "--target-genre", type=str, default="fashion", dest="target_genre",
+        help="Target domain genre (default: fashion)",
+    )
+    vdg_parser.add_argument(
+        "--dataset-ver", type=str, default="v1", dest="dataset_ver",
+        help="Dataset version prefix for fold discovery (default: v1)",
+    )
+    vdg_parser.add_argument(
+        "--folds", type=int, nargs="+", default=None,
+        help="Specific fold numbers to use (e.g. --folds 1 3). If omitted, all folds are used.",
+    )
+    vdg_parser.add_argument(
+        "--split-file", type=str, default="train_images_GIAA.txt", dest="split_file",
+        help="Image list filename inside each fold/<genre>/ directory (default: train_images_GIAA.txt)",
+    )
+    vdg_parser.add_argument(
+        "--n-source", type=int, default=None, dest="n_source",
+        help="Max number of source images per fold (default: all)",
+    )
+    vdg_parser.add_argument(
+        "--n-target", type=int, default=None, dest="n_target",
+        help="Max number of target images per fold (default: all)",
+    )
+    vdg_parser.add_argument(
+        "--backbone", type=str, default="clip_vit_b16",
+        choices=["resnet50", "vit_b_16", "clip_rn50", "clip_vit_b16"],
+        help="Backbone architecture (must match saved model, default: clip_vit_b16)",
+    )
+    vdg_parser.add_argument(
+        "--method", type=str, default="tsne",
+        choices=["tsne", "umap", "pca", "all"],
+        help="Dimensionality reduction method; 'all' runs tsne/umap/pca (default: tsne)",
+    )
+    vdg_parser.add_argument(
+        "--score-only", action="store_true", dest="score_only",
+        help="Only compute Silhouette Score; skip dimensionality reduction and plotting",
+    )
+    vdg_parser.add_argument(
+        "--root-dir", type=str,
+        default="/home/hayashi0884/proj-xpass-DA/data",
+        dest="root_dir",
+        help="Root data directory containing maked/ and split/ (default: proj-xpass-DA/data)",
+    )
+    vdg_parser.add_argument(
+        "--models-pth-dir", type=str,
+        default="/home/hayashi0884/proj-xpass-DA/models_pth",
+        dest="models_pth_dir",
+        help="Root directory of saved .pth models (default: proj-xpass-DA/models_pth)",
+    )
+    vdg_parser.add_argument(
+        "-o", "--output-dir", default="reports/feature_viz",
+        dest="output_dir",
+        help="Output directory for figures; filenames are auto-generated as "
+             "{source}2{target}_domain_gap_{method}.png (default: reports/feature_viz)",
+    )
+
     args = parser.parse_args()
 
     if args.command == 'aggregate':
@@ -978,5 +1312,7 @@ if __name__ == '__main__':
         plot_quality(args)
     elif args.command == 'visualize_features':
         visualize_features(args)
+    elif args.command == 'visualize_domain_gap':
+        visualize_domain_gap(args)
     else:
         parser.print_help()
