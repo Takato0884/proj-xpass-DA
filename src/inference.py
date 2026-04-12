@@ -259,7 +259,9 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
     results = {}
     cd_per_target = defaultdict(lambda: {'per_user': {}, 'per_user_per_head': {},
                                           'head_sroccs': defaultdict(list), 'head_ndcgs': defaultdict(list),
-                                          'avg_sroccs': [], 'avg_ndcgs': []}) if eval_datasets_dict is not None else None
+                                          'head_maes': defaultdict(list), 'head_cccs': defaultdict(list),
+                                          'avg_sroccs': [], 'avg_ndcgs': [],
+                                          'avg_maes': [], 'avg_cccs': []}) if eval_datasets_dict is not None else None
 
     for uid in sorted(list(all_user_ids)):
         print(f"Running inference for user {uid} using saved best model...")
@@ -320,11 +322,15 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
                         cd_per_target[tg]['per_user'][uid_str] = metrics
                         cd_per_target[tg]['avg_sroccs'].append(metrics['srocc'])
                         cd_per_target[tg]['avg_ndcgs'].append(metrics['ndcg@10'])
+                        cd_per_target[tg]['avg_maes'].append(metrics['mae'])
+                        cd_per_target[tg]['avg_cccs'].append(metrics['ccc'])
                     for uid_str, head_metrics in tg_result['per_user_per_head'].items():
                         cd_per_target[tg]['per_user_per_head'][uid_str] = head_metrics
                         for sg, m in head_metrics.items():
                             cd_per_target[tg]['head_sroccs'][sg].append(m['srocc'])
                             cd_per_target[tg]['head_ndcgs'][sg].append(m['ndcg@10'])
+                            cd_per_target[tg]['head_maes'][sg].append(m['mae'])
+                            cd_per_target[tg]['head_cccs'][sg].append(m['ccc'])
 
     # Calculate genre-specific averages
     genre_avg_metrics = {}
@@ -355,11 +361,15 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
                 'average': {
                     'srocc': float(np.mean(data['avg_sroccs'])) if data['avg_sroccs'] else 0.0,
                     'ndcg@10': float(np.mean(data['avg_ndcgs'])) if data['avg_ndcgs'] else 0.0,
+                    'mae': float(np.mean(data['avg_maes'])) if data['avg_maes'] else 0.0,
+                    'ccc': float(np.mean(data['avg_cccs'])) if data['avg_cccs'] else 0.0,
                 },
                 'per_head': {
                     sg: {
                         'srocc': float(np.mean(data['head_sroccs'][sg])) if data['head_sroccs'][sg] else 0.0,
                         'ndcg@10': float(np.mean(data['head_ndcgs'][sg])) if data['head_ndcgs'][sg] else 0.0,
+                        'mae': float(np.mean(data['head_maes'][sg])) if data['head_maes'][sg] else 0.0,
+                        'ccc': float(np.mean(data['head_cccs'][sg])) if data['head_cccs'][sg] else 0.0,
                     }
                     for sg in genres
                 },
@@ -368,7 +378,16 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
             }
 
     # Save test performance to JSON
-    save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, genre_str)
+    use_dann = bool(getattr(args, 'dann_target', None))
+    if use_dann:
+        from .train_common import parse_dann_target as _parse_dann_target
+        _dann_target = _parse_dann_target(args.dann_target)
+        _folder = f'{genre_str}2{_dann_target}'
+        _prefix = f'{genre_str}2{_dann_target}'
+    else:
+        _folder = genre_str
+        _prefix = genre_str
+    save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, _folder)
     os.makedirs(save_dir, exist_ok=True)
 
     # Prepare per-user results
@@ -396,7 +415,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
 
     # Remove trailing mode suffix to avoid duplication (e.g., "name_finetune_finetune.json")
     base_name = model_name_base.removesuffix('_finetune')
-    json_filename = f"{genre_str}_{args.model_type}_{base_name}_finetune.json"
+    json_filename = f"{_prefix}_{args.model_type}_{base_name}_finetune.json"
     json_path = os.path.join(save_dir, json_filename)
     with open(json_path, 'w') as f:
         json.dump(result_data, f, indent=2)
