@@ -528,10 +528,11 @@ def visualize_features(args):
     method = args.method
     percentile = args.percentile
     dataset_ver = args.dataset_ver
+    uda_methods = args.uda_methods  # e.g. ["DANN"], ["DJDOT"], ["DANN", "DJDOT"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Device: {device}")
-    print(f"Task: {source_genre} → {target_genre}  |  method: {method.upper()}")
+    print(f"Task: {source_genre} → {target_genre}  |  UDA: {', '.join(uda_methods)}")
 
     # ── 1. 画像ごとの平均スコアを計算・閾値を自動算出 ────────────────────────
     ratings = pd.read_csv(root_dir / "maked" / "ratings.csv")
@@ -566,9 +567,12 @@ def visualize_features(args):
 
     samples_dir = Path.home() / "proj-xpass" / "data" / "samples"
 
-    def find_nima_pth(fold_name, subdir):
+    def find_nima_pth(fold_name, subdir, uda_method=None):
         d = models_pth_dir / fold_name / subdir
-        ptns = list(d.glob(f"{subdir}_NIMA_*.pth"))
+        if uda_method:
+            ptns = list(d.glob(f"{subdir}_{uda_method}_NIMA_*.pth"))
+        else:
+            ptns = list(d.glob(f"{subdir}_NIMA_*.pth"))
         return ptns[0] if ptns else None
 
     def load_model(pth_path):
@@ -598,10 +602,11 @@ def visualize_features(args):
                     print(f"  Warning: skip {img_file}: {e}")
         return feats, labels
 
-    all_feats = {"nonda": [], "da": []}
-    all_labels = {"nonda": [], "da": []}
-    all_fold_ids = {"nonda": [], "da": []}  # foldごとのID
-    fold_sil_scores = {"nonda": [], "da": []}  # foldごとのSilhouette Score
+    keys = ["nonda"] + uda_methods
+    all_feats = {k: [] for k in keys}
+    all_labels = {k: [] for k in keys}
+    all_fold_ids = {k: [] for k in keys}  # foldごとのID
+    fold_sil_scores = {k: [] for k in keys}  # foldごとのSilhouette Score
 
     from sklearn.metrics import silhouette_score
 
@@ -616,21 +621,29 @@ def visualize_features(args):
             val_images = [line.strip() for line in f if line.strip()]
 
         nonda_pth = find_nima_pth(fold_name, source_genre)
-        da_pth = find_nima_pth(fold_name, f"{source_genre}2{target_genre}")
-
         if nonda_pth is None:
             print(f"Warning: Non-DA model not found for {fold_name}/{source_genre}, skipping")
             continue
-        if da_pth is None:
-            print(f"Warning: DA model not found for {fold_name}/{source_genre}2{target_genre}, skipping")
+
+        pth_pairs = [("nonda", nonda_pth)]
+        skip_fold = False
+        for um in uda_methods:
+            da_pth = find_nima_pth(fold_name, f"{source_genre}2{target_genre}", uda_method=um)
+            if da_pth is None:
+                print(f"Warning: {um} model not found for {fold_name}/{source_genre}2{target_genre}, skipping")
+                skip_fold = True
+                break
+            pth_pairs.append((um, da_pth))
+        if skip_fold:
             continue
 
         print(f"\n[{fold_name}]")
         print(f"  Non-DA: {nonda_pth.name}")
-        print(f"  DA:     {da_pth.name}")
+        for um, pth in pth_pairs[1:]:
+            print(f"  {um}:     {pth.name}")
         print(f"  Images: {len(val_images)}")
 
-        for key, pth_path in [("nonda", nonda_pth), ("da", da_pth)]:
+        for key, pth_path in pth_pairs:
             model = load_model(pth_path)
             feats, labels = extract_features(model, val_images)
             all_feats[key].extend(feats)
@@ -651,7 +664,7 @@ def visualize_features(args):
             else:
                 print(f"  Silhouette ({key}): N/A (insufficient samples)")
 
-    for key in ("nonda", "da"):
+    for key in keys:
         n = len(all_feats[key])
         if n == 0:
             print(f"Error: No features extracted for {key} model.", file=_sys.stderr)
@@ -660,7 +673,8 @@ def visualize_features(args):
 
     # ── 4. Silhouette Score 集計（平均±std） ──────────────────────────────────
     print("\n=== Silhouette Score (256-dim domain_feat, low vs high) ===")
-    for key, label in [("nonda", "Non-DA"), ("da", "DA")]:
+    key_label_pairs = [("nonda", "Non-DA")] + [(um, um) for um in uda_methods]
+    for key, label in key_label_pairs:
         scores = fold_sil_scores[key]
         if not scores:
             print(f"  {label}: N/A")
@@ -669,7 +683,7 @@ def visualize_features(args):
         std_s = float(np.std(scores))
         print(f"  {label}: {mean_s:.4f} ± {std_s:.4f}  (n_folds={len(scores)})")
 
-    # ── 5. 次元削減＋プロット（1手法分） ─────────────────────────────────────
+    # ── 5. 次元削減＋プロット ─────────────────────────────────────────────────
     class_names = [f"Low (<{low_thresh:.2f})", f"Mid ({low_thresh:.2f}-{high_thresh:.2f})", f"High (≥{high_thresh:.2f})"]
     colors = ["#e74c3c", "#f39c12", "#2980b9"]
     markers = ["o", "s", "^"]
@@ -689,28 +703,30 @@ def visualize_features(args):
             return PCA(n_components=2, random_state=42).fit_transform(feats_arr)
 
     def _plot_and_save(m):
-        # 先に両モデルの埋め込みを計算してからスケールを揃える
-        keys = ["nonda", "da"]
-        subtitles = [
-            f"Non-DA  ({source_genre} only)",
-            f"DA  ({source_genre}→{target_genre})",
+        # 先に全モデルの埋め込みを計算してからスケールを揃える
+        plot_keys = keys  # ["nonda"] + uda_methods
+        subtitles = [f"Non-DA  ({source_genre} only)"] + [
+            f"{um}  ({source_genre}→{target_genre})" for um in uda_methods
         ]
         embeds = {}
-        for key in keys:
+        for key in plot_keys:
             feats_arr = np.array(all_feats[key])
             print(f"\nRunning {m.upper()} on {key} ({len(feats_arr)} samples)...")
             embeds[key] = _reduce(feats_arr, m)
 
-        # 両埋め込みのグローバル軸範囲を算出
-        all_x = np.concatenate([embeds[k][:, 0] for k in keys])
-        all_y = np.concatenate([embeds[k][:, 1] for k in keys])
+        # 全埋め込みのグローバル軸範囲を算出
+        all_x = np.concatenate([embeds[k][:, 0] for k in plot_keys])
+        all_y = np.concatenate([embeds[k][:, 1] for k in plot_keys])
         margin_x = (all_x.max() - all_x.min()) * 0.05 or 1.0
         margin_y = (all_y.max() - all_y.min()) * 0.05 or 1.0
         xlim = (all_x.min() - margin_x, all_x.max() + margin_x)
         ylim = (all_y.min() - margin_y, all_y.max() + margin_y)
 
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
-        for ax, key, subtitle in zip(axes, keys, subtitles):
+        n_plots = len(plot_keys)
+        fig, axes = plt.subplots(1, n_plots, figsize=(6.5 * n_plots, 5.5))
+        if n_plots == 1:
+            axes = [axes]
+        for ax, key, subtitle in zip(axes, plot_keys, subtitles):
             labels_arr = np.array(all_labels[key])
             fold_ids_arr = np.array(all_fold_ids[key])
             embed = embeds[key]
@@ -754,12 +770,13 @@ def visualize_features(args):
             ax.set_xlabel(f"{m.upper()} 1", fontsize=10)
             ax.set_ylabel(f"{m.upper()} 2", fontsize=10)
             ax.tick_params(labelsize=9)
+        methods_str = "_".join(uda_methods)
         fig.suptitle(
             f"Feature space: {source_genre} → {target_genre}  [{m.upper()}]",
             fontsize=13, y=1.01,
         )
         plt.tight_layout()
-        out = output_dir / f"{source_genre}2{target_genre}_{m}.png"
+        out = output_dir / f"{source_genre}2{target_genre}_{methods_str}_{m}.png"
         plt.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {out}")
@@ -802,10 +819,11 @@ def visualize_domain_gap(args):
     split_file = args.split_file
     n_source = args.n_source
     n_target = args.n_target
+    uda_methods = args.uda_methods  # e.g. ["DANN"], ["DJDOT"], ["DANN", "DJDOT"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Device: {device}")
-    print(f"Task: {source_genre} → {target_genre}  |  method: {method.upper()}")
+    print(f"Task: {source_genre} → {target_genre}  |  UDA: {', '.join(uda_methods)}")
 
     # ── 1. 画像変換（CLIP-ViT-B/16の標準前処理） ─────────────────────────────
     transform = transforms.Compose([
@@ -837,9 +855,12 @@ def visualize_domain_gap(args):
         "scenery": ("scenery_image", ".jpg"),
     }
 
-    def find_nima_pth(fold_name, subdir):
+    def find_nima_pth(fold_name, subdir, uda_method=None):
         d = models_pth_dir / fold_name / subdir
-        ptns = list(d.glob(f"{subdir}_NIMA_*.pth"))
+        if uda_method:
+            ptns = list(d.glob(f"{subdir}_{uda_method}_NIMA_*.pth"))
+        else:
+            ptns = list(d.glob(f"{subdir}_NIMA_*.pth"))
         return ptns[0] if ptns else None
 
     def load_model(pth_path):
@@ -870,10 +891,11 @@ def visualize_domain_gap(args):
         return feats, labels
 
     # domain_label: 0=source, 1=target
-    all_feats = {"nonda": [], "da": []}
-    all_labels = {"nonda": [], "da": []}
-    all_fold_ids = {"nonda": [], "da": []}
-    fold_sil_scores = {"nonda": [], "da": []}
+    keys = ["nonda"] + uda_methods
+    all_feats = {k: [] for k in keys}
+    all_labels = {k: [] for k in keys}
+    all_fold_ids = {k: [] for k in keys}
+    fold_sil_scores = {k: [] for k in keys}
 
     from sklearn.metrics import silhouette_score
 
@@ -896,21 +918,29 @@ def visualize_domain_gap(args):
             tgt_images = [line.strip() for line in f if line.strip()]
 
         nonda_pth = find_nima_pth(fold_name, source_genre)
-        da_pth = find_nima_pth(fold_name, f"{source_genre}2{target_genre}")
-
         if nonda_pth is None:
             print(f"Warning: Non-DA model not found for {fold_name}/{source_genre}, skipping")
             continue
-        if da_pth is None:
-            print(f"Warning: DA model not found for {fold_name}/{source_genre}2{target_genre}, skipping")
+
+        pth_pairs = [("nonda", nonda_pth)]
+        skip_fold = False
+        for um in uda_methods:
+            da_pth = find_nima_pth(fold_name, f"{source_genre}2{target_genre}", uda_method=um)
+            if da_pth is None:
+                print(f"Warning: {um} model not found for {fold_name}/{source_genre}2{target_genre}, skipping")
+                skip_fold = True
+                break
+            pth_pairs.append((um, da_pth))
+        if skip_fold:
             continue
 
         print(f"\n[{fold_name}]")
         print(f"  Non-DA: {nonda_pth.name}")
-        print(f"  DA:     {da_pth.name}")
+        for um, pth in pth_pairs[1:]:
+            print(f"  {um}:     {pth.name}")
         print(f"  Source images: {len(src_images)}, Target images: {len(tgt_images)}")
 
-        for key, pth_path in [("nonda", nonda_pth), ("da", da_pth)]:
+        for key, pth_path in pth_pairs:
             model = load_model(pth_path)
             src_feats, src_labs = extract_domain_features(model, src_images, source_genre, 0, n_source)
             tgt_feats, tgt_labs = extract_domain_features(model, tgt_images, target_genre, 1, n_target)
@@ -933,7 +963,7 @@ def visualize_domain_gap(args):
             else:
                 print(f"  Silhouette ({key}): N/A (insufficient samples)")
 
-    for key in ("nonda", "da"):
+    for key in keys:
         n = len(all_feats[key])
         if n == 0:
             print(f"Error: No features extracted for {key} model.", file=_sys.stderr)
@@ -943,7 +973,8 @@ def visualize_domain_gap(args):
     # ── 4. Silhouette Score 集計（平均±std） ──────────────────────────────────
     print("\n=== Domain Separation Score (256-dim domain_feat, source vs target) ===")
     print("  (lower Silhouette = better domain alignment)")
-    for key, label in [("nonda", "Non-DA"), ("da", "DA")]:
+    key_label_pairs = [("nonda", "Non-DA")] + [(um, um) for um in uda_methods]
+    for key, label in key_label_pairs:
         scores = fold_sil_scores[key]
         if not scores:
             print(f"  {label}: N/A")
@@ -974,31 +1005,33 @@ def visualize_domain_gap(args):
             return PCA(n_components=2, random_state=42).fit_transform(feats_arr)
 
     sil_means = {}
-    for key in ("nonda", "da"):
+    for key in keys:
         s = fold_sil_scores[key]
         sil_means[key] = float(np.mean(s)) if s else float("nan")
 
     def _plot_and_save(m):
-        keys = ["nonda", "da"]
-        subtitles = [
-            f"Non-DA  ({source_genre} only)",
-            f"DA  ({source_genre}→{target_genre})",
+        plot_keys = keys  # ["nonda"] + uda_methods
+        subtitles = [f"Non-DA  ({source_genre} only)"] + [
+            f"{um}  ({source_genre}→{target_genre})" for um in uda_methods
         ]
         embeds = {}
-        for key in keys:
+        for key in plot_keys:
             feats_arr = np.array(all_feats[key])
             print(f"\nRunning {m.upper()} on {key} ({len(feats_arr)} samples)...")
             embeds[key] = _reduce(feats_arr, m)
 
-        all_x = np.concatenate([embeds[k][:, 0] for k in keys])
-        all_y = np.concatenate([embeds[k][:, 1] for k in keys])
+        all_x = np.concatenate([embeds[k][:, 0] for k in plot_keys])
+        all_y = np.concatenate([embeds[k][:, 1] for k in plot_keys])
         margin_x = (all_x.max() - all_x.min()) * 0.05 or 1.0
         margin_y = (all_y.max() - all_y.min()) * 0.05 or 1.0
         xlim = (all_x.min() - margin_x, all_x.max() + margin_x)
         ylim = (all_y.min() - margin_y, all_y.max() + margin_y)
 
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
-        for ax, key, subtitle in zip(axes, keys, subtitles):
+        n_plots = len(plot_keys)
+        fig, axes = plt.subplots(1, n_plots, figsize=(6.5 * n_plots, 5.5))
+        if n_plots == 1:
+            axes = [axes]
+        for ax, key, subtitle in zip(axes, plot_keys, subtitles):
             labels_arr = np.array(all_labels[key])
             embed = embeds[key]
             for dom_idx, (dname, color, marker) in enumerate(
@@ -1024,12 +1057,13 @@ def visualize_domain_gap(args):
             ax.set_xlabel(f"{m.upper()} 1", fontsize=10)
             ax.set_ylabel(f"{m.upper()} 2", fontsize=10)
             ax.tick_params(labelsize=9)
+        methods_str = "_".join(uda_methods)
         fig.suptitle(
             f"Domain gap: {source_genre} vs {target_genre}  [{m.upper()}]",
             fontsize=13, y=1.01,
         )
         plt.tight_layout()
-        out = output_dir / f"{source_genre}2{target_genre}_domain_gap_{m}.png"
+        out = output_dir / f"{source_genre}2{target_genre}_{methods_str}_domain_gap_{m}.png"
         plt.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {out}")
@@ -1232,10 +1266,16 @@ if __name__ == '__main__':
         help="Root directory of saved .pth models (default: proj-xpass-DA/models_pth)",
     )
     vf_parser.add_argument(
+        "--uda-methods", type=str, nargs="+", default=["DANN"],
+        dest="uda_methods",
+        help="UDA method name(s) to compare against Non-DA (e.g. DANN, DJDOT). "
+             "Multiple values produce one subplot per method. (default: DANN)",
+    )
+    vf_parser.add_argument(
         "-o", "--output-dir", default="reports/feature_viz",
         dest="output_dir",
         help="Output directory for figures; filenames are auto-generated as "
-             "{source}2{target}_{method}.png (default: reports/feature_viz)",
+             "{source}2{target}_{methods}_{dim_method}.png (default: reports/feature_viz)",
     )
 
     # Subcommand: visualize_domain_gap
@@ -1298,10 +1338,16 @@ if __name__ == '__main__':
         help="Root directory of saved .pth models (default: proj-xpass-DA/models_pth)",
     )
     vdg_parser.add_argument(
+        "--uda-methods", type=str, nargs="+", default=["DANN"],
+        dest="uda_methods",
+        help="UDA method name(s) to compare against Non-DA (e.g. DANN, DJDOT). "
+             "Multiple values produce one subplot per method. (default: DANN)",
+    )
+    vdg_parser.add_argument(
         "-o", "--output-dir", default="reports/feature_viz",
         dest="output_dir",
         help="Output directory for figures; filenames are auto-generated as "
-             "{source}2{target}_domain_gap_{method}.png (default: reports/feature_viz)",
+             "{source}2{target}_{methods}_domain_gap_{dim_method}.png (default: reports/feature_viz)",
     )
 
     args = parser.parse_args()

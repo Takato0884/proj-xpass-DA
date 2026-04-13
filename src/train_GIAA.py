@@ -207,6 +207,9 @@ if __name__ == '__main__':
                 f"{os.path.join(args.root_dir, 'split')}")
         print(f"Running all {len(folds)} folds sequentially: {folds}")
         for i, fold in enumerate(folds):
+            if i + 1 < args.start_fold:
+                print(f"Skipping fold {i+1}/{len(folds)}: {fold} (start_fold={args.start_fold})")
+                continue
             print(f"\n{'='*60}\n  Fold {i+1}/{len(folds)}: {fold}\n{'='*60}\n")
             args_fold = copy.deepcopy(args)
             args_fold.dataset_ver = fold
