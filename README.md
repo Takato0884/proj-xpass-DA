@@ -534,10 +534,16 @@ python src/analysis.py visualize_features \
 non-DA モデルと DA モデルそれぞれで、ソース画像とターゲット画像の特徴量を同一空間にプロットし、DA によるドメインギャップ縮小を可視化します。各foldのソース・ターゲット両ドメインの画像を `train_images_GIAA.txt` から収集し、t-SNE / UMAP / PCA で2次元に投影。non-DA（左）では2ドメインが離れて分布し、DA（右）ではそれらが近づく様子を横並びで比較します。ドメイン分離度は Silhouette Score で定量評価し、**値が低いほどドメインギャップが小さい**ことを示します。
 
 ```bash
-# art→fashion を t-SNE で可視化（デフォルト設定）
+# art→fashion を t-SNE で可視化（デフォルト設定: DANN と Non-DA を比較）
 python src/analysis.py visualize_domain_gap \
   --source-genre art \
   --target-genre fashion
+
+# 複数のUDA手法を並べて比較（Non-DA / DANN / DJDOT の3列サブプロット）
+python src/analysis.py visualize_domain_gap \
+  --source-genre art \
+  --target-genre fashion \
+  --uda-methods DANN DJDOT
 
 # t-SNE / UMAP / PCA の3手法すべてを出力
 python src/analysis.py visualize_domain_gap \
@@ -560,6 +566,10 @@ python src/analysis.py visualize_domain_gap \
   --folds 1
 ```
 
+#### 出力例（art → fashion, PCA）
+
+![art2fashion_pca](/reports/feature_viz/art2scenery_DANN_DJDOT_domain_gap_pca.png)
+
 #### オプション引数一覧
 
 | 引数 | 型 | デフォルト | 説明 |
@@ -572,11 +582,12 @@ python src/analysis.py visualize_domain_gap \
 | `--n-source` | int | なし | fold あたりのソース画像数上限（省略時は全件） |
 | `--n-target` | int | なし | fold あたりのターゲット画像数上限（省略時は全件） |
 | `--backbone` | str | `clip_vit_b16` | バックボーン（保存済みモデルと一致させること）。選択肢: `resnet50`, `vit_b_16`, `clip_rn50`, `clip_vit_b16` |
+| `--uda-methods` | list | `DANN` | Non-DA と比較するUDA手法名（複数指定可）。複数指定するとサブプロットが手法数+1列になる（例: `--uda-methods DANN DJDOT`） |
 | `--method` | str | `tsne` | 次元削減手法。選択肢: `tsne`, `umap`, `pca`, `all`（`all` は3手法すべて実行） |
 | `--score-only` | flag | False | Silhouette Score のみ計算し、次元削減・プロットをスキップ |
 | `--root-dir` | str | `proj-xpass-DA/data` | `maked/` および `split/` を含むデータルートディレクトリ |
 | `--models-pth-dir` | str | `proj-xpass-DA/models_pth` | 保存済み `.pth` モデルのルートディレクトリ |
-| `-o` / `--output-dir` | str | `reports/feature_viz` | 出力先ディレクトリ。ファイル名は `{source}2{target}_domain_gap_{method}.png` で自動生成 |
+| `-o` / `--output-dir` | str | `reports/feature_viz` | 出力先ディレクトリ。ファイル名は `{source}2{target}_{uda_methods}_domain_gap_{method}.png` で自動生成 |
 
 ---
 
