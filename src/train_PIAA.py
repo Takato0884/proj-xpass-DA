@@ -1629,12 +1629,13 @@ def trainer_djdot_piaa_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_p
                     break
 
 
-def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', model_type=None, domain_tag=None):
+def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', model_type=None, domain_tag=None, da_method=None):
     """Auto-discover pretrained model files.
 
     For PIAA_pretrain:
       - DANN時 (domain_tag が genre と異なる): models_pth/{dataset_ver}/{domain_tag}/ から DA済みNIMAを探す
       - 通常時: models_pth/{dataset_ver}/{genre}/ から NIMAを探す
+      - da_method が指定された場合: ファイル名に da_method を含むものに絞り込む
     For PIAA_finetune: finds *_pretrain.pth in models_pth/{dataset_ver}/{domain_tag or genre}/,
                        filtered by model_type (ICI or MIR) if specified.
     """
@@ -1645,6 +1646,10 @@ def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', mo
 
     if piaa_mode == 'PIAA_pretrain':
         nima_files = [f for f in os.listdir(genre_dir) if 'NIMA' in f and f.endswith('.pth')]
+        if da_method and len(nima_files) > 1:
+            filtered = [f for f in nima_files if f'_{da_method}_' in f]
+            if filtered:
+                nima_files = filtered
         if len(nima_files) == 1:
             return {genre: os.path.join(genre_dir, nima_files[0])}
         elif len(nima_files) > 1:
@@ -1690,7 +1695,7 @@ def run_main(args):
 
     # Auto-discover pretrained models
     # DANN時は domain_tag ディレクトリ(例: art2fashion)からDA済みNIMAを自動検出
-    pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode, getattr(args, 'model_type', None), domain_tag=domain_tag)
+    pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode, getattr(args, 'model_type', None), domain_tag=domain_tag, da_method=method_name)
     print(f"Auto-discovered pretrained models: {pretrained_model_dict}")
 
     if args.is_log:
