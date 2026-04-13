@@ -23,7 +23,7 @@ def inference(train_dataset, val_dataset, test_dataset, args, device, model, eva
     eval_datasets_dict: optional dict of {target_genre: {'test': dataset}} for cross-domain evaluation
     Returns mean_user_srocc, mean_user_mse
     """
-    from .train_GIAA import evaluate
+    from .evaluate import evaluate
 
     batch_size = args.batch_size
     user_sroccs = []
@@ -167,14 +167,12 @@ def inference(train_dataset, val_dataset, test_dataset, args, device, model, eva
 
     # Save results to JSON file (only for Test split)
     if eval_split == 'Test':
-        _dann_tgt = getattr(args, 'dann_target', None)
-        if _dann_tgt:
-            from .train_common import parse_dann_target as _parse_dann
-            _tgt_genre = _parse_dann(_dann_tgt)
-            _folder = f'{args.genre}2{_tgt_genre}'
-        else:
-            _folder = args.genre
-        save_dir = os.path.join('/home/hayashi0884/proj-xpass-DA/reports/exp', args.dataset_ver, _folder)
+        from .train_common import parse_da_method as _parse_da
+        _method_name, _tgt_genre = _parse_da(getattr(args, 'da_method', None))
+        _method_tag = _method_name if _method_name else 'Only'
+        _domain_tag = f'{args.genre}2{_tgt_genre}' if _tgt_genre else args.genre
+        save_dir = os.path.join('/home/hayashi0884/proj-xpass-DA/reports/exp', args.dataset_ver,
+                                _domain_tag)
         os.makedirs(save_dir, exist_ok=True)
 
         # Use model_path basename for both experiment_name field and json filename
@@ -378,12 +376,11 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
             }
 
     # Save test performance to JSON
-    use_dann = bool(getattr(args, 'dann_target', None))
-    if use_dann:
-        from .train_common import parse_dann_target as _parse_dann_target
-        _dann_target = _parse_dann_target(args.dann_target)
-        _folder = f'{genre_str}2{_dann_target}'
-        _prefix = f'{genre_str}2{_dann_target}'
+    from .train_common import parse_da_method as _parse_da_method
+    _method, _da_target = _parse_da_method(getattr(args, 'da_method', None))
+    if _da_target:
+        _folder = f'{genre_str}2{_da_target}'
+        _prefix = f'{genre_str}2{_da_target}'
     else:
         _folder = genre_str
         _prefix = genre_str
@@ -559,12 +556,11 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         cross_domain_results = evaluate_cross_domain(model, eval_loaders_dict, device, genres)
 
     # Save test performance to JSON
-    # DANN時は {source}2{target} ディレクトリに保存
-    use_dann = bool(getattr(args, 'dann_target', None))
-    if use_dann:
-        from .train_common import parse_dann_target as _parse_dann_target
-        _dann_target = _parse_dann_target(args.dann_target)
-        _folder = f'{genre_str}2{_dann_target}'
+    # DA時は {source}2{target} ディレクトリに保存
+    from .train_common import parse_da_method as _parse_da_method
+    _method, _da_target = _parse_da_method(getattr(args, 'da_method', None))
+    if _da_target:
+        _folder = f'{genre_str}2{_da_target}'
     else:
         _folder = genre_str
     save_dir = os.path.join(os.path.dirname(__file__), '..', 'reports', 'exp', args.dataset_ver, _folder)

@@ -169,11 +169,12 @@ def discover_folds(root_dir, version_prefix):
 
 # ─── Domain Adaptation Shared Utilities ───────────────────────────────────────
 
-def parse_dann_target(dann_target: str) -> str:
-    """'DANN-fashion' → 'fashion'."""
-    if dann_target and dann_target.startswith('DANN-'):
-        return dann_target[5:]
-    return dann_target
+def parse_da_method(da_method: str):
+    """'DANN-fashion' → ('DANN', 'fashion').  None → (None, None)."""
+    if da_method and '-' in da_method:
+        method, target = da_method.split('-', 1)
+        return method, target
+    return None, None
 
 
 def get_da_lambda(epoch: int, total_steps: int, gamma: float = 10.0) -> float:

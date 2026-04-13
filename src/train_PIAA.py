@@ -3,6 +3,7 @@ import math
 import wandb
 from tqdm import tqdm
 import numpy as np
+import ot
 from scipy.stats import spearmanr
 from sklearn.metrics import ndcg_score
 import copy
@@ -18,7 +19,7 @@ from torch.amp import autocast, GradScaler
 from .argflags import parse_arguments, model_dir, wandb_tags
 from .data import load_data, collate_fn, build_global_encoders
 from .train_common import (NIMA, discover_folds, num_bins, _BACKBONE_OUT_DIM,
-                            GradientReversalLayer, DomainDiscriminator, parse_dann_target, get_da_lambda)
+                            GradientReversalLayer, DomainDiscriminator, parse_da_method, get_da_lambda)
 from .inference import inference_finetune, evaluate_pretrain_on_val_piaa, inference_pretrain
 
 class MLP(nn.Module):
@@ -963,7 +964,7 @@ def trainer_dann_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset
                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn, drop_last=True)
     val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
                                           num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-    dann_target_genre = parse_dann_target(getattr(args, 'dann_target', None)) if getattr(args, 'dann_target', None) else None
+    dann_target_genre = parse_da_method(getattr(args, 'da_method', None))[1]
     tgt_val_loader = DataLoader(tgt_val_dataset, batch_size=batch_size, shuffle=False,
                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
     tgt_val_loaders_dict = {genre: tgt_val_loader}  # ソースジャンルのヘッドでターゲット val を推論
@@ -1296,6 +1297,338 @@ def trainer_dann_piaa_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_pi
                     break
 
 
+# ─── DeepJDOT PIAA ────────────────────────────────────────────────────────────
+
+def _djdot_piaa_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
+                           epoch=None, global_step=0, desc_suffix=""):
+    """DeepJDOT 1エポック学習（pretrain / finetune 共通）。
+    ラベルコスト: (score_s_i - score_t_j)^2（スカラー回帰）
+    特徴量: I_ij（model.forward return_feat=True で取得、ICI専用）
+    """
+    model.train()
+    alpha = getattr(args, 'djdot_alpha', 0.001)
+    lambda_t = getattr(args, 'djdot_lambda_t', 0.0001)
+
+    running_L_y = running_L_feat = running_L_label = 0.0
+    total_batches = 0
+    tgt_iter = iter(tgt_loader)
+
+    desc = f"Epoch {epoch} [DJDOT{desc_suffix}]" if epoch is not None else f"Train DJDOT{desc_suffix}"
+    progress_bar = tqdm(src_loader, leave=True, desc=desc, position=0, ncols=120, colour="#00ff00", ascii="-=")
+
+    for sample_src in progress_bar:
+        try:
+            sample_tgt = next(tgt_iter)
+        except StopIteration:
+            tgt_iter = iter(tgt_loader)
+            sample_tgt = next(tgt_iter)
+
+        images_src = sample_src['image'].to(device)
+        aesthetic_src = sample_src['Aesthetic'].to(device).view(-1, 1)
+        pt_src = sample_src['traits'].float().to(device)
+        attr_src = sample_src['QIP'].float().to(device)
+
+        images_tgt = sample_tgt['image'].to(device)
+        pt_tgt = sample_tgt['traits'].float().to(device)
+        attr_tgt = sample_tgt['QIP'].float().to(device)
+
+        optimizer.zero_grad()
+
+        with autocast('cuda'):
+            score_src, I_ij_src = model(images_src, pt_src, attr_src, genre, return_feat=True)
+            L_y = F.mse_loss(score_src, aesthetic_src)
+
+            score_tgt, I_ij_tgt = model(images_tgt, pt_tgt, attr_tgt, genre, return_feat=True)
+
+            # ── Step 1: OT 輸送計画を解く（勾配グラフから切り離し）────────────
+            with torch.no_grad():
+                feat_dist_d = torch.cdist(I_ij_src.float(), I_ij_tgt.float(), p=2).pow(2)  # (n_s, n_t)
+                label_cost_d = (score_src.float() - score_tgt.float().T).pow(2)            # (n_s, n_t)
+                C = (alpha * feat_dist_d + lambda_t * label_cost_d).cpu().numpy().astype(np.float64)
+                n_s, n_t = C.shape
+                a = np.ones(n_s, dtype=np.float64) / n_s
+                b = np.ones(n_t, dtype=np.float64) / n_t
+                gamma = torch.from_numpy(
+                    ot.emd(a, b, C)
+                ).to(dtype=I_ij_src.dtype, device=device)
+
+            # ── Step 2: 整合損失（γ固定、勾配あり）──────────────────────────
+            feat_dist  = torch.cdist(I_ij_src, I_ij_tgt, p=2).pow(2)       # (n_s, n_t)
+            label_cost = (score_src - score_tgt.T).pow(2)                   # (n_s, n_t)
+
+            L_feat  = (gamma * feat_dist).sum()
+            L_label = (gamma * label_cost).sum()
+
+            loss = L_y + alpha * L_feat + lambda_t * L_label
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        running_L_y     += L_y.item()
+        running_L_feat  += L_feat.item()
+        running_L_label += L_label.item()
+        total_batches   += 1
+        global_step     += 1
+        progress_bar.set_postfix({
+            'L_y':     f'{L_y.item():.4f}',
+            'L_feat':  f'{L_feat.item():.4f}',
+            'L_label': f'{L_label.item():.4f}',
+        })
+
+    n = max(total_batches, 1)
+    return running_L_y / n, running_L_feat / n, running_L_label / n, global_step
+
+
+def trainer_djdot_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
+                                 experiment_name, backbone_dict, pretrained_model_dict, domain_tag=None):
+    """DeepJDOT pretrain trainer for PIAA（ICI のみ）。
+    ソース: train_giaa_dataset でタスク学習 + I_ij レベルの OT 整合。
+    ターゲット: tgt_train_dataset（ターゲットジャンルの GIAA data、ラベル不使用）。
+    早期停止: ソース val CCC。
+    """
+    if args.model_type != 'ICI':
+        raise NotImplementedError("DJDOT pretrain は ICI モデルのみサポートしています")
+
+    batch_size = args.batch_size
+    genres = list(datasets_dict.keys())
+    genre = genres[0]
+    genre_str = domain_tag if domain_tag else genre
+    tgt_genre_name = domain_tag.split('2')[1] if domain_tag and '2' in domain_tag else 'target'
+
+    src_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
+                            drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+    tgt_loader = DataLoader(tgt_train_dataset, batch_size=batch_size, shuffle=True,
+                            drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+    val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
+                                          num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
+    tgt_val_loaders_dict = {genre: DataLoader(tgt_val_dataset, batch_size=batch_size, shuffle=False,
+                                              num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
+
+    model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
+
+    pretrained_path = pretrained_model_dict[genre]
+    if not os.path.exists(pretrained_path):
+        raise FileNotFoundError(f"Pretrained NIMA model not found: {pretrained_path}")
+    try:
+        state = torch.load(pretrained_path)
+        model.nima_dict[genre].load_state_dict(state)
+        print(f"Loaded NIMA weights for {genre} from {pretrained_path}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load NIMA weights for {genre}: {e}")
+
+    model.freeze_backbone()
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Freeze] {total_params - trainable_params:,} frozen / {trainable_params:,} trainable / {total_params:,} total")
+
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
+
+    best_val_ccc = -float('inf')
+    patience = 0
+    global_step = 0
+    best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_{experiment_name}_pretrain.pth')
+    best_state_dict = None
+    scaler = GradScaler('cuda')
+
+    for epoch in range(args.num_epochs):
+        L_y, L_feat, L_label, global_step = _djdot_piaa_one_epoch(
+            model, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
+            epoch=epoch, global_step=global_step, desc_suffix=" pretrain")
+
+        if args.is_log:
+            wandb.log({
+                "epoch": epoch,
+                f"{genre}/Train Loss":         L_y,
+                f"{genre}/Train Feature Loss": L_feat,
+                f"{genre}/Train Label Loss":   L_label,
+            }, commit=False)
+
+        genre_metrics, _ = evaluate(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
+        val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
+
+        tgt_genre_metrics, _ = evaluate(model, tgt_val_loaders_dict, device, epoch=epoch, phase_name="Val (tgt)")
+
+        if args.is_log:
+            log_dict = {"epoch": epoch}
+            if genre in genre_metrics:
+                log_dict[f"{genre}/Val MAE"]      = genre_metrics[genre]['mae']
+                log_dict[f"{genre}/Val SROCC"]    = genre_metrics[genre]['srocc']
+                log_dict[f"{genre}/Val NDCG@10"]  = genre_metrics[genre]['ndcg@10']
+                log_dict[f"{genre}/Val CCC"]      = genre_metrics[genre]['ccc']
+            if genre in tgt_genre_metrics:
+                tgt_m = tgt_genre_metrics[genre]
+                log_dict[f"{tgt_genre_name}/Val MAE"]     = tgt_m['mae']
+                log_dict[f"{tgt_genre_name}/Val SROCC"]   = tgt_m['srocc']
+                log_dict[f"{tgt_genre_name}/Val NDCG@10"] = tgt_m['ndcg@10']
+                log_dict[f"{tgt_genre_name}/Val CCC"]     = tgt_m['ccc']
+            wandb.log(log_dict, commit=True)
+
+        prev_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(val_ccc)
+        cur_lr = optimizer.param_groups[0]['lr']
+        if cur_lr < prev_lr:
+            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
+
+        if val_ccc > best_val_ccc:
+            best_val_ccc = val_ccc
+            patience = 0
+            if args.no_save_model:
+                best_state_dict = copy.deepcopy(model.state_dict())
+            else:
+                torch.save(model.state_dict(), best_model_path)
+        else:
+            patience += 1
+            if patience >= args.max_patience_epochs:
+                print(f"DJDOT Pretrain: early stopping at epoch {epoch}")
+                break
+
+    return best_model_path, best_state_dict
+
+
+def trainer_djdot_piaa_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                                 args, device, dirname, experiment_name, backbone_dict,
+                                 pretrained_model_dict, djdot_target_genre=None):
+    """DeepJDOT finetune trainer for PIAA（ICI のみ）。
+    ユーザーごとに：
+      - ソース: 該当ユーザーの train_piaa_dataset でタスク学習 + I_ij レベルの OT 整合
+      - ターゲット: 同ユーザーの target genre train_piaa_dataset（ラベル不使用）
+      - 早期停止: ソース val CCC
+      - ターゲット val: 同ユーザーの val_piaa_dataset で観察のみ
+    同ユーザーがターゲットに存在しない場合はエラー。
+    """
+    if args.model_type != 'ICI':
+        raise NotImplementedError("DJDOT finetune は ICI モデルのみサポートしています")
+
+    batch_size = args.batch_size
+    genres = list(datasets_dict.keys())
+    genre = genres[0]
+    genre_str = genre
+
+    all_user_ids    = set(datasets_dict[genre]['train'].data['user_id'].values)
+    unique_user_ids = sorted(list(all_user_ids))
+
+    for uid in unique_user_ids:
+        print(f"DJDOT finetune for user {uid}...")
+
+        # ── ソースユーザーデータ ──────────────────────────────────────────────
+        user_train_src = copy.copy(datasets_dict[genre]['train'])
+        user_train_src.data = datasets_dict[genre]['train'].data[
+            datasets_dict[genre]['train'].data['user_id'] == uid].reset_index(drop=True)
+        user_val_src = copy.copy(datasets_dict[genre]['val'])
+        user_val_src.data = datasets_dict[genre]['val'].data[
+            datasets_dict[genre]['val'].data['user_id'] == uid].reset_index(drop=True)
+
+        # ── ターゲット train（同ユーザー必須）────────────────────────────────
+        tgt_train_mask = tgt_train_piaa_dataset.data['user_id'] == uid
+        if tgt_train_mask.sum() == 0:
+            raise ValueError(
+                f"User {uid} not found in target genre '{djdot_target_genre}' train_piaa_dataset. "
+                f"All finetune users must exist in the target genre."
+            )
+        user_train_tgt = copy.copy(tgt_train_piaa_dataset)
+        user_train_tgt.data = tgt_train_piaa_dataset.data[tgt_train_mask].reset_index(drop=True)
+
+        # ── ターゲット val（同ユーザー必須）─────────────────────────────────
+        tgt_val_mask = tgt_val_piaa_dataset.data['user_id'] == uid
+        if tgt_val_mask.sum() == 0:
+            raise ValueError(
+                f"User {uid} not found in target genre '{djdot_target_genre}' val_piaa_dataset. "
+                f"All finetune users must exist in the target genre."
+            )
+        user_val_tgt = copy.copy(tgt_val_piaa_dataset)
+        user_val_tgt.data = tgt_val_piaa_dataset.data[tgt_val_mask].reset_index(drop=True)
+
+        total_train_src = len(user_train_src)
+        total_train_tgt = len(user_train_tgt)
+        total_val_src   = len(user_val_src)
+        print(f"User {uid}: train src={total_train_src}, train tgt={total_train_tgt}, val src={total_val_src}")
+        if total_train_src < batch_size or total_train_tgt < batch_size or total_val_src == 0:
+            print(f"Skipping user {uid}: need >={batch_size} samples per domain (val>0)")
+            continue
+
+        src_loader = DataLoader(user_train_src, batch_size=batch_size, shuffle=True, drop_last=True,
+                                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        tgt_loader = DataLoader(user_train_tgt, batch_size=batch_size, shuffle=True, drop_last=True,
+                                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        val_src_loaders = {genre: DataLoader(user_val_src, batch_size=batch_size, shuffle=False,
+                                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
+        val_tgt_loaders = {genre: DataLoader(user_val_tgt, batch_size=batch_size, shuffle=False,
+                                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
+
+        model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
+        pretrained_path = pretrained_model_dict[genre]
+        if pretrained_path is None or not os.path.exists(pretrained_path):
+            raise FileNotFoundError(f"DJDOT pretrained model not found: {pretrained_path}")
+        try:
+            state = torch.load(pretrained_path)
+            model_user.load_state_dict(state)
+            print(f"Loaded DJDOT pretrain weights from {pretrained_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model weights from {pretrained_path}: {e}")
+
+        model_user.freeze_backbone()
+        if uid == unique_user_ids[0]:
+            total_params     = sum(p.numel() for p in model_user.parameters())
+            trainable_params = sum(p.numel() for p in model_user.parameters() if p.requires_grad)
+            frozen_params    = total_params - trainable_params
+            print(f"[Freeze] {frozen_params:,} frozen / {trainable_params:,} trainable / {total_params:,} total")
+
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model_user.parameters()), lr=args.lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
+
+        best_val_ccc = -float('inf')
+        patience = 0
+        global_step = 0
+        best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{experiment_name}_finetune.pth')
+        scaler = GradScaler('cuda')
+
+        for epoch in range(args.num_epochs):
+            L_y, L_feat, L_label, global_step = _djdot_piaa_one_epoch(
+                model_user, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
+                epoch=epoch, global_step=global_step, desc_suffix=" finetune")
+
+            genre_metrics, _ = evaluate(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
+            val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
+
+            tgt_genre_metrics, _ = evaluate(model_user, val_tgt_loaders, device, epoch=epoch, phase_name="Val (tgt)")
+
+            if args.is_log:
+                log_dict = {"epoch": epoch}
+                log_dict[f"{genre}/Train Loss user_{uid}"]         = L_y
+                log_dict[f"{genre}/Train Feature Loss user_{uid}"] = L_feat
+                log_dict[f"{genre}/Train Label Loss user_{uid}"]   = L_label
+                if genre in genre_metrics:
+                    log_dict[f"{genre}/Val MAE user_{uid}"]     = genre_metrics[genre]['mae']
+                    log_dict[f"{genre}/Val SROCC user_{uid}"]   = genre_metrics[genre]['srocc']
+                    log_dict[f"{genre}/Val NDCG@10 user_{uid}"] = genre_metrics[genre]['ndcg@10']
+                    log_dict[f"{genre}/Val CCC user_{uid}"]     = genre_metrics[genre]['ccc']
+                if genre in tgt_genre_metrics:
+                    tgt_m = tgt_genre_metrics[genre]
+                    log_dict[f"{djdot_target_genre}/Val MAE user_{uid}"]     = tgt_m['mae']
+                    log_dict[f"{djdot_target_genre}/Val SROCC user_{uid}"]   = tgt_m['srocc']
+                    log_dict[f"{djdot_target_genre}/Val NDCG@10 user_{uid}"] = tgt_m['ndcg@10']
+                    log_dict[f"{djdot_target_genre}/Val CCC user_{uid}"]     = tgt_m['ccc']
+                wandb.log(log_dict, commit=True)
+
+            prev_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(val_ccc)
+            cur_lr = optimizer.param_groups[0]['lr']
+            if cur_lr < prev_lr:
+                tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (user {uid}, epoch {epoch}) <<<")
+
+            if val_ccc > best_val_ccc:
+                best_val_ccc = val_ccc
+                patience = 0
+                torch.save(model_user.state_dict(), best_model_path)
+            else:
+                patience += 1
+                if patience >= args.max_patience_epochs:
+                    print(f"User {uid}: early stopping at epoch {epoch}")
+                    break
+
+
 def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', model_type=None, domain_tag=None):
     """Auto-discover pretrained model files.
 
@@ -1351,9 +1684,9 @@ def run_main(args):
         backbone_dict[genre] = args.backbone
     print(f"Backbone: {backbone_dict[genre]}")
 
-    use_dann = bool(getattr(args, 'dann_target', None))
-    dann_target_genre = parse_dann_target(args.dann_target) if use_dann else None
-    domain_tag = f'{genre}2{dann_target_genre}' if use_dann else genre
+    method_name, target_genre = parse_da_method(getattr(args, 'da_method', None))
+    use_da = method_name is not None
+    domain_tag = f'{genre}2{target_genre}' if use_da else genre
 
     # Auto-discover pretrained models
     # DANN時は domain_tag ディレクトリ(例: art2fashion)からDA済みNIMAを自動検出
@@ -1365,7 +1698,8 @@ def run_main(args):
         tags += wandb_tags(args)
         if args.use_video:
             tags.append("use_video")
-        if use_dann:
+        if use_da:
+            tags.append(method_name)
             tags.append(domain_tag)
         wandb.init(
                    project=f"XPASS",
@@ -1422,14 +1756,19 @@ def run_main(args):
     os.makedirs(dirname, exist_ok=True)
 
     if args.piaa_mode == 'PIAA_pretrain':
-        if use_dann:
+        if method_name in ('DANN', 'DJDOT'):
             args_tgt = copy.deepcopy(args)
-            args_tgt.genre = dann_target_genre
+            args_tgt.genre = target_genre
             _, _, tgt_train_giaa_dataset, _, _, tgt_val_giaa_dataset, _ = load_data(
                 args_tgt, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
-            best_model_path, best_state_dict = trainer_dann_piaa_pretrain(
-                datasets_dict, tgt_train_giaa_dataset, tgt_val_giaa_dataset, args, device, dirname,
-                experiment_name, backbone_dict, pretrained_model_dict, domain_tag=domain_tag)
+            if method_name == 'DANN':
+                best_model_path, best_state_dict = trainer_dann_piaa_pretrain(
+                    datasets_dict, tgt_train_giaa_dataset, tgt_val_giaa_dataset, args, device, dirname,
+                    experiment_name, backbone_dict, pretrained_model_dict, domain_tag=domain_tag)
+            else:  # DJDOT
+                best_model_path, best_state_dict = trainer_djdot_piaa_pretrain(
+                    datasets_dict, tgt_train_giaa_dataset, tgt_val_giaa_dataset, args, device, dirname,
+                    experiment_name, backbone_dict, pretrained_model_dict, domain_tag=domain_tag)
         else:
             eval_target = getattr(args, 'eval_target', None)
             if eval_target:
@@ -1447,15 +1786,21 @@ def run_main(args):
         evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dict, best_model_path, model_state_dict=best_state_dict)
         inference_pretrain(datasets_dict_user, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict, best_model_path, eval_datasets_dict=eval_datasets_dict, model_state_dict=best_state_dict)
     elif args.piaa_mode == 'PIAA_finetune':
-        if use_dann:
+        if method_name in ('DANN', 'DJDOT'):
             args_tgt = copy.deepcopy(args)
-            args_tgt.genre = dann_target_genre
+            args_tgt.genre = target_genre
             _, tgt_train_piaa_dataset, _, _, tgt_val_piaa_dataset, _, _ = load_data(
                 args_tgt, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
-            trainer_dann_piaa_finetune(
-                datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
-                args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
-                dann_target_genre=dann_target_genre)
+            if method_name == 'DANN':
+                trainer_dann_piaa_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    dann_target_genre=target_genre)
+            else:  # DJDOT
+                trainer_djdot_piaa_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    djdot_target_genre=target_genre)
         else:
             eval_target = getattr(args, 'eval_target', None)
             if eval_target:

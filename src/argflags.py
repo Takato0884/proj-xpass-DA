@@ -22,7 +22,7 @@ def parse_arguments(parse=True):
     parser.add_argument('--no_log', action='store_false', dest='is_log', help='Disable logging')
 
     parser.add_argument('--num_epochs', type=int, default=200)
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--max_patience_epochs', type=int, default=10)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=1e-5)
@@ -32,17 +32,24 @@ def parse_arguments(parse=True):
                         help='If set, keep best model in memory instead of saving to disk')
 
     # Domain Adaptation
-    parser.add_argument('--dann_target', type=str, default=None,
-                        help='Enable DANN mode. Format: DANN-{target_genre} (e.g., DANN-fashion). '
-                             'Omit to disable DANN.')
+    parser.add_argument('--da_method', type=str, default=None,
+                        help='Domain adaptation method and target domain. '
+                             'Format: METHOD-target (e.g., DANN-fashion, DJDOT-scenery). '
+                             'Omit to run source-only training.')
     parser.add_argument('--eval_target', type=str, default=None,
-                        help='Target genre to evaluate on during source-only training (e.g., fashion). '
+                        help='Target genre to monitor during source-only training (e.g., fashion). '
                              'Records target val EMD without doing domain adaptation.')
+    # DANN-specific hyperparameters
     parser.add_argument('--dann_epochs', type=int, default=50,
-                        help='λ schedule: number of epochs over which λ reaches ~1.0. '
+                        help='[DANN] λ schedule: number of epochs over which λ reaches ~1.0. '
                              'Converted internally to total_steps = dann_epochs × (data_size / batch_size).')
     parser.add_argument('--dann_gamma', type=float, default=10.0,
-                        help='λ schedule: sharpness of the sigmoid (Ganin et al.)')
+                        help='[DANN] λ schedule: sharpness of the sigmoid (Ganin et al.)')
+    # DeepJDOT-specific hyperparameters
+    parser.add_argument('--djdot_alpha', type=float, default=0.001,
+                        help='[DJDOT] Weight for feature alignment term (L2 feature distance).')
+    parser.add_argument('--djdot_lambda_t', type=float, default=0.0001,
+                        help='[DJDOT] Weight for label alignment term (EMD label cost).')
 
     if parse:
         args = parser.parse_args()
