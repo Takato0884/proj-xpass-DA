@@ -1000,7 +1000,8 @@ def trainer_dann_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset
     best_val_ccc = -float('inf')
     patience = 0
     global_step = 0
-    best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_{experiment_name}_pretrain.pth')
+    _dann_run = experiment_name.removeprefix('DANN_')
+    best_model_path = os.path.join(dirname, f'{genre_str}_DANN_{args.model_type}_{_dann_run}_pretrain.pth')
     best_state_dict = None
 
     scaler = GradScaler('cuda')
@@ -1428,7 +1429,8 @@ def trainer_djdot_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_datase
     best_val_ccc = -float('inf')
     patience = 0
     global_step = 0
-    best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_{experiment_name}_pretrain.pth')
+    _djdot_run = experiment_name.removeprefix('DJDOT_')
+    best_model_path = os.path.join(dirname, f'{genre_str}_DJDOT_{args.model_type}_{_djdot_run}_pretrain.pth')
     best_state_dict = None
     scaler = GradScaler('cuda')
 

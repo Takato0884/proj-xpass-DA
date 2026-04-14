@@ -412,7 +412,12 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
 
     # Remove trailing mode suffix to avoid duplication (e.g., "name_finetune_finetune.json")
     base_name = model_name_base.removesuffix('_finetune')
-    json_filename = f"{_prefix}_{args.model_type}_{base_name}_finetune.json"
+    # Use {UDA手法名}_{モデル} order when a DA method is used
+    if _method and base_name.startswith(_method + '_'):
+        _run_suffix = base_name[len(_method) + 1:]
+        json_filename = f"{_prefix}_{_method}_{args.model_type}_{_run_suffix}_finetune.json"
+    else:
+        json_filename = f"{_prefix}_{args.model_type}_{base_name}_finetune.json"
     json_path = os.path.join(save_dir, json_filename)
     with open(json_path, 'w') as f:
         json.dump(result_data, f, indent=2)
