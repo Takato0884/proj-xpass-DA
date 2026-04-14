@@ -1662,6 +1662,10 @@ def discover_pretrained_models(dataset_ver, genre, piaa_mode='PIAA_finetune', mo
             pretrain_files = [f for f in all_pretrain_files if f'_{model_type}_' in f]
         else:
             pretrain_files = all_pretrain_files
+        if da_method and len(pretrain_files) > 1:
+            filtered = [f for f in pretrain_files if f'_{da_method}_' in f]
+            if filtered:
+                pretrain_files = filtered
         if len(pretrain_files) == 1:
             return {genre: os.path.join(genre_dir, pretrain_files[0])}
         elif len(pretrain_files) > 1:
@@ -1717,9 +1721,11 @@ def run_main(args):
             "genre": genre,
             "backbone": backbone_dict[genre]
         }
-        experiment_name = wandb.run.name
+        method_tag = method_name if method_name else 'Only'
+        experiment_name = f"{method_tag}_{wandb.run.name}"
     else:
-        experiment_name = ''
+        method_tag = method_name if method_name else 'Only'
+        experiment_name = method_tag
 
     print(args)
 
