@@ -350,8 +350,8 @@ python -m src.train_GIAA --genre fashion --da_method DJDOT-scenery \
 | `--use_video` | flag | `False` | sceneryジャンルで動画データを使用。`--backbone resnet50` と併用時のみ自動的にI3Dバックボーンへ切り替わる。指定しない場合は画像データを使用（バックボーンは `--backbone` の指定に従う） |
 | `--root_dir` | str | `/home/hayashi0884/proj-xpass-DA/data` | 画像・動画データのルートディレクトリ |
 | `--num_epochs` | int | `200` | 最大エポック数 |
-| `--batch_size` | int | `16` | バッチサイズ（pretrain推奨: `128`、finetune推奨: `16`） |
-| `--lr` | float | `1e-5` | 学習率 |
+| `--batch_size` | int | `32`（pretrain） / `8`（finetune） | バッチサイズ（`--batch_size` 未指定時は `--piaa_mode` に応じて自動設定） |
+| `--lr` | float | `5e-6`（pretrain） / `1e-6`（finetune） | 学習率（`--lr` 未指定時は `--piaa_mode` に応じて自動設定） |
 | `--lr_decay_factor` | float | `0.5` | ReduceLROnPlateauの減衰率（factor） |
 | `--lr_patience` | int | `5` | ReduceLROnPlateauのpatience（改善なしで許容するエポック数） |
 | `--max_patience_epochs` | int | `10` | Early stoppingの忍耐エポック数 |
@@ -364,8 +364,8 @@ python -m src.train_GIAA --genre fashion --da_method DJDOT-scenery \
 | `--eval_target` | str | `None` | ソースのみ学習中にターゲットジャンルを評価（例: `fashion`）。ドメイン適応なしでターゲットのval EMDを記録する |
 | `--dann_epochs` | int | `50` | `[DANN]` λスケジュール: λが〜1.0に達するまでのエポック数。内部で `total_steps = dann_epochs × (data_size / batch_size)` に変換される |
 | `--dann_gamma` | float | `10.0` | `[DANN]` λスケジュール: シグモイドの鋭さ（Ganin et al.） |
-| `--djdot_alpha` | float | `0.001` | `[DJDOT]` 特徴整合項の重み（L2特徴距離） |
-| `--djdot_lambda_t` | float | `0.0001` | `[DJDOT]` ラベル整合項の重み（EMDラベルコスト） |
+| `--djdot_alpha` | float | `0.1` | `[DJDOT]` 特徴整合項の重み（L2特徴距離） |
+| `--djdot_lambda_t` | float | `1` | `[DJDOT]` ラベル整合項の重み（EMDラベルコスト） |
 
 > **注:** クロスドメイン評価（`--genre` 以外の全ジャンルに対する評価）は常に実行されます。損失関数はMSEで固定です。
 

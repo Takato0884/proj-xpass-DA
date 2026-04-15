@@ -782,14 +782,10 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
                 log_dict = {"epoch": epoch}
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
-                    log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
-                    log_dict[f"{genre}/Val NDCG@10 user_{uid}"] = genre_metrics[genre]['ndcg@10']
                     log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
                 if tgt_genre_metrics is not None and genre in tgt_genre_metrics:
                     tgt_m = tgt_genre_metrics[genre]
                     log_dict[f"{tgt_genre}/Val MAE user_{uid}"] = tgt_m['mae']
-                    log_dict[f"{tgt_genre}/Val SROCC user_{uid}"] = tgt_m['srocc']
-                    log_dict[f"{tgt_genre}/Val NDCG@10 user_{uid}"] = tgt_m['ndcg@10']
                     log_dict[f"{tgt_genre}/Val CCC user_{uid}"] = tgt_m['ccc']
                 wandb.log(log_dict, commit=True)
 
@@ -1338,14 +1334,10 @@ def trainer_dann_piaa_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_pi
                 log_dict[f"{genre}/DANN lambda user_{uid}"] = lambda_
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
-                    log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
-                    log_dict[f"{genre}/Val NDCG@10 user_{uid}"] = genre_metrics[genre]['ndcg@10']
                     log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
                 if genre in tgt_genre_metrics:
                     tgt_m = tgt_genre_metrics[genre]
                     log_dict[f"{dann_target_genre}/Val MAE user_{uid}"] = tgt_m['mae']
-                    log_dict[f"{dann_target_genre}/Val SROCC user_{uid}"] = tgt_m['srocc']
-                    log_dict[f"{dann_target_genre}/Val NDCG@10 user_{uid}"] = tgt_m['ndcg@10']
                     log_dict[f"{dann_target_genre}/Val CCC user_{uid}"] = tgt_m['ccc']
                 wandb.log(log_dict, commit=True)
 
@@ -1676,14 +1668,10 @@ def trainer_djdot_piaa_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_p
                 log_dict[f"{genre}/Train Label Loss user_{uid}"]   = L_label
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"]     = genre_metrics[genre]['mae']
-                    log_dict[f"{genre}/Val SROCC user_{uid}"]   = genre_metrics[genre]['srocc']
-                    log_dict[f"{genre}/Val NDCG@10 user_{uid}"] = genre_metrics[genre]['ndcg@10']
                     log_dict[f"{genre}/Val CCC user_{uid}"]     = genre_metrics[genre]['ccc']
                 if genre in tgt_genre_metrics:
                     tgt_m = tgt_genre_metrics[genre]
                     log_dict[f"{djdot_target_genre}/Val MAE user_{uid}"]     = tgt_m['mae']
-                    log_dict[f"{djdot_target_genre}/Val SROCC user_{uid}"]   = tgt_m['srocc']
-                    log_dict[f"{djdot_target_genre}/Val NDCG@10 user_{uid}"] = tgt_m['ndcg@10']
                     log_dict[f"{djdot_target_genre}/Val CCC user_{uid}"]     = tgt_m['ccc']
                 wandb.log(log_dict, commit=True)
 
@@ -1912,7 +1900,15 @@ if __name__ == '__main__':
     parser = parse_arguments(parse=False)
     parser.add_argument('--model_type', type=str, default='ICI', choices=['ICI', 'MIR'],
                         help='PIAA model architecture: ICI (Interaction-based) or MIR (MLP Interaction Regression)')
+    import sys
+    parser.set_defaults(lr=5e-6, batch_size=32, djdot_alpha=0.1, djdot_lambda_t=1)
     args = parser.parse_args()
+    # Override defaults for finetune when not explicitly specified
+    if args.piaa_mode == 'PIAA_finetune':
+        if not any(a.startswith('--lr') for a in sys.argv[1:]):
+            args.lr = 1e-6
+        if not any(a.startswith('--batch_size') for a in sys.argv[1:]):
+            args.batch_size = 8
 
     if args.dataset_ver.endswith('_all'):
         version_prefix = args.dataset_ver[:-4]  # e.g., 'v3_all' -> 'v3'
