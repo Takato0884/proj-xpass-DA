@@ -65,6 +65,10 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.interaction_fc_dict = nn.ModuleDict()
         for genre in genres:
             self.interaction_fc_dict[genre] = nn.Linear(interaction_input_dim, 1)
+        # [pretrain temp] zero-init interaction output layers
+        for genre in genres:
+            nn.init.zeros_(self.interaction_fc_dict[genre].weight)
+            nn.init.zeros_(self.interaction_fc_dict[genre].bias)
 
         # Linear layer for direct output from NIMA probability distribution
         self.direct_fc = nn.Linear(num_bins, 1)
@@ -75,12 +79,20 @@ class PIAA_MIR_CrossDomain(nn.Module):
             for param in backbone.parameters():
                 param.requires_grad = False
             backbone.eval()
+            # [pretrain temp] freeze feat_proj + fc_aesthetic to fix direct_outputs as true NIMA expected value
+            for param in nima.feat_proj.parameters():
+                param.requires_grad = False
+            nima.feat_proj.eval()
+            for param in nima.fc_aesthetic.parameters():
+                param.requires_grad = False
 
     def _set_frozen_modules_eval(self):
         for genre, nima in self.nima_dict.items():
             backbone = nima.backbone
             if not any(p.requires_grad for p in backbone.parameters()):
                 backbone.eval()
+            if not any(p.requires_grad for p in nima.feat_proj.parameters()):
+                nima.feat_proj.eval()
 
     def train(self, mode=True):
         super().train(mode)
@@ -99,7 +111,12 @@ class PIAA_MIR_CrossDomain(nn.Module):
         I_ij = A_ij.view(images.size(0), -1)
 
         interaction_outputs = self.interaction_fc_dict[genre](I_ij)
-        direct_outputs = self.direct_fc(prob)
+        # [pretrain temp] direct_outputs: expected value of NIMA distribution instead of direct_fc
+        # direct_outputs = self.direct_fc(prob)
+        bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
+        direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
+        self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
+        self._last_direct_mean = direct_outputs.detach().abs().mean().item()
         return interaction_outputs + direct_outputs
 
 
@@ -203,6 +220,9 @@ class PIAA_ICI_CrossDomain(nn.Module):
 
         # Linear layer for interaction output
         self.attr_corr = nn.Linear(input_dim, 1)
+        # [pretrain temp] zero-init interaction output layer
+        nn.init.zeros_(self.attr_corr.weight)
+        nn.init.zeros_(self.attr_corr.bias)
 
         # Linear layer for direct output from NIMA probability distribution
         self.direct_fc = nn.Linear(num_bins, 1)
@@ -222,13 +242,20 @@ class PIAA_ICI_CrossDomain(nn.Module):
     def freeze_backbone(self):
         """
         Freeze entire backbone of all NIMA models.
-        Only fc_aesthetic remains trainable (plus ICI interaction modules outside NIMA).
+        # [pretrain temp] fc_aesthetic も凍結し direct_outputs を真の NIMA 期待値に固定
+        # Only fc_aesthetic remains trainable (plus ICI interaction modules outside NIMA).
         """
         for genre, nima in self.nima_dict.items():
             backbone = nima.backbone
             for param in backbone.parameters():
                 param.requires_grad = False
             backbone.eval()
+            # [pretrain temp] freeze feat_proj + fc_aesthetic to fix direct_outputs as true NIMA expected value
+            for param in nima.feat_proj.parameters():
+                param.requires_grad = False
+            nima.feat_proj.eval()
+            for param in nima.fc_aesthetic.parameters():
+                param.requires_grad = False
 
     def _set_frozen_modules_eval(self):
         """Ensure frozen backbone modules stay in eval mode during model.train()."""
@@ -236,6 +263,8 @@ class PIAA_ICI_CrossDomain(nn.Module):
             backbone = nima.backbone
             if not any(p.requires_grad for p in backbone.parameters()):
                 backbone.eval()
+            if not any(p.requires_grad for p in nima.feat_proj.parameters()):
+                nima.feat_proj.eval()
 
     def train(self, mode=True):
         """Override train() to keep frozen backbone modules in eval mode."""
@@ -277,7 +306,12 @@ class PIAA_ICI_CrossDomain(nn.Module):
         # Final prediction
         I_ij = torch.sum(fused_features_img, dim=1, keepdim=False) + torch.sum(fused_features_user, dim=1, keepdim=False)
         interaction_outputs = self.attr_corr(I_ij)
-        direct_outputs = self.direct_fc(prob)
+        # [pretrain temp] direct_outputs: expected value of NIMA distribution instead of direct_fc
+        # direct_outputs = self.direct_fc(prob)
+        bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
+        direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
+        self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
+        self._last_direct_mean = direct_outputs.detach().abs().mean().item()
         if return_feat:
             return interaction_outputs + direct_outputs, I_ij
         return interaction_outputs + direct_outputs
@@ -310,6 +344,8 @@ def train(model, dataloader, optimizer, scaler, device, args, genre, epoch: int 
     """
     model.train()
     running_loss = 0.0
+    running_interaction = 0.0
+    running_direct = 0.0
     total_batches = 0
 
     desc = f"Epoch {epoch} [Train]" if epoch is not None else "Train"
@@ -331,12 +367,15 @@ def train(model, dataloader, optimizer, scaler, device, args, genre, epoch: int 
         scaler.update()
 
         running_loss += loss.item()
+        running_interaction += getattr(model, '_last_interaction_mean', 0.0)
+        running_direct += getattr(model, '_last_direct_mean', 0.0)
         total_batches += 1
         progress_bar.update(1)
         progress_bar.set_postfix({'loss': loss.item()})
 
     progress_bar.close()
-    return running_loss / total_batches if total_batches > 0 else 0.0
+    n = total_batches if total_batches > 0 else 1
+    return running_loss / n, running_interaction / n, running_direct / n
 
 def evaluate(model, dataloaders_dict, device, epoch: int = None, phase_name: str = "Val"):
     """
@@ -366,6 +405,10 @@ def evaluate(model, dataloaders_dict, device, epoch: int = None, phase_name: str
     genre_mae_losses = {}
     genre_batch_counts = {}
 
+    component_interaction = defaultdict(float)
+    component_direct = defaultdict(float)
+    component_batch_counts = defaultdict(int)
+
     with torch.no_grad():
         for genre, dataloader in dataloaders_dict.items():
             running_mae = 0.0
@@ -388,12 +431,27 @@ def evaluate(model, dataloaders_dict, device, epoch: int = None, phase_name: str
                 genre_targets[genre].append(target.view(-1).cpu().numpy())
                 mae = F.l1_loss(outputs, target)
                 running_mae += mae.item()
+                component_interaction[genre] += getattr(model, '_last_interaction_mean', 0.0)
+                component_direct[genre] += getattr(model, '_last_direct_mean', 0.0)
+                component_batch_counts[genre] += 1
                 batch_count += 1
                 progress_bar.update(1)
                 progress_bar.set_postfix({'MAE': mae.item(), 'genre': genre})
 
             genre_mae_losses[genre] = running_mae
             genre_batch_counts[genre] = batch_count
+
+    # Store per-genre component averages on model for wandb logging
+    model._eval_component_stats = {}
+    for genre in dataloaders_dict.keys():
+        n = max(component_batch_counts[genre], 1)
+        i_mean = component_interaction[genre] / n
+        d_mean = component_direct[genre] / n
+        model._eval_component_stats[genre] = {
+            'interaction_mean': i_mean,
+            'direct_mean': d_mean,
+            'ratio': i_mean / d_mean if d_mean > 0 else 0.0,
+        }
 
     progress_bar.close()
 
@@ -711,7 +769,7 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
 
         scaler = GradScaler('cuda')
         for epoch in range(args.num_epochs):
-            train_loss = train(model_user, train_loader, optimizer_user, scaler, device, args, genre, epoch=epoch)
+            train_loss, _, _ = train(model_user, train_loader, optimizer_user, scaler, device, args, genre, epoch=epoch)
             genre_metrics, val_mae = evaluate(model_user, val_loaders_dict, device, epoch=epoch, phase_name="Val")
 
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
@@ -812,7 +870,7 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
 
     scaler = GradScaler('cuda')
     for epoch in range(args.num_epochs):
-        train_loss = train(model, train_loader, optimizer, scaler, device, args, genre, epoch=epoch)
+        train_loss, _, _ = train(model, train_loader, optimizer, scaler, device, args, genre, epoch=epoch)
         genre_metrics, val_mae = evaluate(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
 
         val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
@@ -830,6 +888,11 @@ def trainer_pretrain(datasets_dict, args, device, dirname, experiment_name, back
                 log_dict[f"{genre}/Val SROCC"] = genre_metrics[genre]['srocc']
                 log_dict[f"{genre}/Val NDCG@10"] = genre_metrics[genre]['ndcg@10']
                 log_dict[f"{genre}/Val CCC"] = genre_metrics[genre]['ccc']
+            if hasattr(model, '_eval_component_stats') and genre in model._eval_component_stats:
+                cs = model._eval_component_stats[genre]
+                log_dict[f"{genre}/Val interaction_mean"] = cs['interaction_mean']
+                log_dict[f"{genre}/Val direct_mean"] = cs['direct_mean']
+                log_dict[f"{genre}/Val interaction_ratio"] = cs['ratio']
             if tgt_genre_metrics is not None and genre in tgt_genre_metrics:
                 tgt_m = tgt_genre_metrics[genre]
                 log_dict[f"{tgt_genre}/Val MAE"] = tgt_m['mae']
@@ -1034,6 +1097,11 @@ def trainer_dann_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset
                 log_dict[f"{genre}/Val SROCC"] = genre_metrics[genre]['srocc']
                 log_dict[f"{genre}/Val NDCG@10"] = genre_metrics[genre]['ndcg@10']
                 log_dict[f"{genre}/Val CCC"] = genre_metrics[genre]['ccc']
+            if hasattr(model, '_eval_component_stats') and genre in model._eval_component_stats:
+                cs = model._eval_component_stats[genre]
+                log_dict[f"{genre}/Val interaction_mean"] = cs['interaction_mean']
+                log_dict[f"{genre}/Val direct_mean"] = cs['direct_mean']
+                log_dict[f"{genre}/Val interaction_ratio"] = cs['ratio']
             if genre in tgt_genre_metrics:
                 tgt_m = tgt_genre_metrics[genre]
                 log_dict[f"{dann_target_genre}/Val MAE"] = tgt_m['mae']
@@ -1459,6 +1527,11 @@ def trainer_djdot_piaa_pretrain(datasets_dict, tgt_train_dataset, tgt_val_datase
                 log_dict[f"{genre}/Val SROCC"]    = genre_metrics[genre]['srocc']
                 log_dict[f"{genre}/Val NDCG@10"]  = genre_metrics[genre]['ndcg@10']
                 log_dict[f"{genre}/Val CCC"]      = genre_metrics[genre]['ccc']
+            if hasattr(model, '_eval_component_stats') and genre in model._eval_component_stats:
+                cs = model._eval_component_stats[genre]
+                log_dict[f"{genre}/Val interaction_mean"] = cs['interaction_mean']
+                log_dict[f"{genre}/Val direct_mean"]      = cs['direct_mean']
+                log_dict[f"{genre}/Val interaction_ratio"] = cs['ratio']
             if genre in tgt_genre_metrics:
                 tgt_m = tgt_genre_metrics[genre]
                 log_dict[f"{tgt_genre_name}/Val MAE"]     = tgt_m['mae']
