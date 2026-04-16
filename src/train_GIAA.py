@@ -32,7 +32,7 @@ def _load_method(method_name):
 def run_main(args):
     is_v_giaa = (args.dataset_ver == 'v_giaa')
     batch_size = args.batch_size
-    print(args)
+    print(args, flush=True)
 
     method_name, target_genre = parse_da_method(args.da_method)
     method = _load_method(method_name)
