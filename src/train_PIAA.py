@@ -65,13 +65,10 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.interaction_fc_dict = nn.ModuleDict()
         for genre in genres:
             self.interaction_fc_dict[genre] = nn.Linear(interaction_input_dim, 1)
-        # [pretrain temp] zero-init interaction output layers
+        # zero-init interaction output layers
         for genre in genres:
             nn.init.zeros_(self.interaction_fc_dict[genre].weight)
             nn.init.zeros_(self.interaction_fc_dict[genre].bias)
-
-        # Linear layer for direct output from NIMA probability distribution
-        self.direct_fc = nn.Linear(num_bins, 1)
 
     def freeze_backbone(self):
         for genre, nima in self.nima_dict.items():
@@ -79,12 +76,12 @@ class PIAA_MIR_CrossDomain(nn.Module):
             for param in backbone.parameters():
                 param.requires_grad = False
             backbone.eval()
-            # [pretrain temp] freeze feat_proj + fc_aesthetic to fix direct_outputs as true NIMA expected value
             for param in nima.feat_proj.parameters():
                 param.requires_grad = False
             nima.feat_proj.eval()
             for param in nima.fc_aesthetic.parameters():
                 param.requires_grad = False
+            nima.fc_aesthetic.eval()
 
     def _set_frozen_modules_eval(self):
         for genre, nima in self.nima_dict.items():
@@ -93,6 +90,8 @@ class PIAA_MIR_CrossDomain(nn.Module):
                 backbone.eval()
             if not any(p.requires_grad for p in nima.feat_proj.parameters()):
                 nima.feat_proj.eval()
+            if not any(p.requires_grad for p in nima.fc_aesthetic.parameters()):
+                nima.fc_aesthetic.eval()
 
     def train(self, mode=True):
         super().train(mode)
@@ -111,8 +110,6 @@ class PIAA_MIR_CrossDomain(nn.Module):
         I_ij = A_ij.view(images.size(0), -1)
 
         interaction_outputs = self.interaction_fc_dict[genre](I_ij)
-        # [pretrain temp] direct_outputs: expected value of NIMA distribution instead of direct_fc
-        # direct_outputs = self.direct_fc(prob)
         bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
         direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
         self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
@@ -220,12 +217,9 @@ class PIAA_ICI_CrossDomain(nn.Module):
 
         # Linear layer for interaction output
         self.attr_corr = nn.Linear(input_dim, 1)
-        # [pretrain temp] zero-init interaction output layer
+        # zero-init interaction output layer
         nn.init.zeros_(self.attr_corr.weight)
         nn.init.zeros_(self.attr_corr.bias)
-
-        # Linear layer for direct output from NIMA probability distribution
-        self.direct_fc = nn.Linear(num_bins, 1)
 
         # Backbone image projection — uses raw backbone features, independent of feat_proj
         self.backbone_image_proj = nn.ModuleDict()
@@ -240,22 +234,18 @@ class PIAA_ICI_CrossDomain(nn.Module):
 
 
     def freeze_backbone(self):
-        """
-        Freeze entire backbone of all NIMA models.
-        # [pretrain temp] fc_aesthetic も凍結し direct_outputs を真の NIMA 期待値に固定
-        # Only fc_aesthetic remains trainable (plus ICI interaction modules outside NIMA).
-        """
+        """Freeze entire direct_output side (backbone, feat_proj, fc_aesthetic) of all NIMA models."""
         for genre, nima in self.nima_dict.items():
             backbone = nima.backbone
             for param in backbone.parameters():
                 param.requires_grad = False
             backbone.eval()
-            # [pretrain temp] freeze feat_proj + fc_aesthetic to fix direct_outputs as true NIMA expected value
             for param in nima.feat_proj.parameters():
                 param.requires_grad = False
             nima.feat_proj.eval()
             for param in nima.fc_aesthetic.parameters():
                 param.requires_grad = False
+            nima.fc_aesthetic.eval()
 
     def _set_frozen_modules_eval(self):
         """Ensure frozen backbone modules stay in eval mode during model.train()."""
@@ -265,6 +255,8 @@ class PIAA_ICI_CrossDomain(nn.Module):
                 backbone.eval()
             if not any(p.requires_grad for p in nima.feat_proj.parameters()):
                 nima.feat_proj.eval()
+            if not any(p.requires_grad for p in nima.fc_aesthetic.parameters()):
+                nima.fc_aesthetic.eval()
 
     def train(self, mode=True):
         """Override train() to keep frozen backbone modules in eval mode."""
@@ -306,8 +298,6 @@ class PIAA_ICI_CrossDomain(nn.Module):
         # Final prediction
         I_ij = torch.sum(fused_features_img, dim=1, keepdim=False) + torch.sum(fused_features_user, dim=1, keepdim=False)
         interaction_outputs = self.attr_corr(I_ij)
-        # [pretrain temp] direct_outputs: expected value of NIMA distribution instead of direct_fc
-        # direct_outputs = self.direct_fc(prob)
         bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
         direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
         self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
@@ -746,7 +736,9 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
         if pretrained_path is not None and os.path.exists(pretrained_path):
             try:
                 state = torch.load(pretrained_path)
-                model_user.load_state_dict(state)
+                incompatible = model_user.load_state_dict(state, strict=False)
+                if incompatible.unexpected_keys:
+                    print(f"[load_state_dict] Ignored unexpected keys: {incompatible.unexpected_keys}")
                 print(f"Loaded PIAA_ICI_CrossDomain weights from {pretrained_path}")
             except Exception as e:
                 raise RuntimeError(f"Error: Failed to load model weights from {pretrained_path}: {e}")
@@ -1286,7 +1278,9 @@ def trainer_dann_piaa_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_pi
             raise FileNotFoundError(f"DANN pretrained model not found: {pretrained_path}")
         try:
             state = torch.load(pretrained_path)
-            model_user.load_state_dict(state)
+            incompatible = model_user.load_state_dict(state, strict=False)
+            if incompatible.unexpected_keys:
+                print(f"[load_state_dict] Ignored unexpected keys: {incompatible.unexpected_keys}")
             print(f"Loaded DANN pretrain weights from {pretrained_path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load model weights from {pretrained_path}: {e}")
@@ -1630,7 +1624,9 @@ def trainer_djdot_piaa_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_p
             raise FileNotFoundError(f"DJDOT pretrained model not found: {pretrained_path}")
         try:
             state = torch.load(pretrained_path)
-            model_user.load_state_dict(state)
+            incompatible = model_user.load_state_dict(state, strict=False)
+            if incompatible.unexpected_keys:
+                print(f"[load_state_dict] Ignored unexpected keys: {incompatible.unexpected_keys}")
             print(f"Loaded DJDOT pretrain weights from {pretrained_path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load model weights from {pretrained_path}: {e}")

@@ -16,6 +16,7 @@ from .inference import inference
 _DA_METHOD_MODULES = {
     'DANN':  '.methods.dann',
     'DJDOT': '.methods.djdot',
+    'MCD':   '.methods.mcd',
 }
 
 

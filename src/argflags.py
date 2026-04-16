@@ -50,6 +50,11 @@ def parse_arguments(parse=True):
                         help='[DJDOT] Weight for feature alignment term (L2 feature distance).')
     parser.add_argument('--djdot_lambda_t', type=float, default=0.0001,
                         help='[DJDOT] Weight for label alignment term (EMD label cost).')
+    # MCD-specific hyperparameters
+    parser.add_argument('--mcd_lambda', type=float, default=1.0,
+                        help='[MCD] Weight for the discrepancy loss in Step B (lambda in L_s - lambda * L_adv).')
+    parser.add_argument('--mcd_n_steps', type=int, default=4,
+                        help='[MCD] Number of Step C (generator update) repetitions per batch.')
 
     if parse:
         args = parser.parse_args()
