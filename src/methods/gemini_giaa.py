@@ -102,6 +102,25 @@ def run_sequential(genre: str, n: int = 0):
     user_prompt = _make_user_prompt(genre)
     per_sample_results = {}
 
+    os.makedirs(_SAVE_DIR, exist_ok=True)
+    save_path = os.path.join(_SAVE_DIR, f'{genre}_results_sequential.json')
+    _CHECKPOINT_INTERVAL = 100
+
+    def _save(completed_files):
+        output = {
+            "genre": genre,
+            "model": _MODEL,
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "n_total_images": len(all_files),
+            "per_sample": [
+                {"sample_file": f, "pred_dist": per_sample_results.get(f, [0.143]*7)}
+                for f in completed_files
+            ]
+        }
+        with open(save_path, 'w') as fp:
+            json.dump(output, fp, indent=2)
+
+    completed = []
     for idx, fname in enumerate(all_files):
         img_path = os.path.join(samples_dir, fname)
         ext = os.path.splitext(fname)[1].lower()
@@ -125,22 +144,14 @@ def run_sequential(genre: str, n: int = 0):
         )
         dist = _parse_distribution(response.text)
         per_sample_results[fname] = dist
+        completed.append(fname)
         print(f"  [{idx + 1}/{len(all_files)}] {fname} → {dist}")
 
-    os.makedirs(_SAVE_DIR, exist_ok=True)
-    save_path = os.path.join(_SAVE_DIR, f'{genre}_results_sequential.json')
-    final_output = {
-        "genre": genre,
-        "model": _MODEL,
-        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "n_total_images": len(all_files),
-        "per_sample": [
-            {"sample_file": f, "pred_dist": per_sample_results.get(f, [0.143]*7)}
-            for f in all_files
-        ]
-    }
-    with open(save_path, 'w') as f:
-        json.dump(final_output, f, indent=2)
+        if (idx + 1) % _CHECKPOINT_INTERVAL == 0:
+            _save(completed)
+            print(f"  [checkpoint] {idx + 1} images saved → {save_path}")
+
+    _save(completed)
     print(f"\nSequential completed! Results saved → {save_path}")
 
 
