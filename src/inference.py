@@ -230,7 +230,8 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
         eval_datasets_dict: optional dict of {target_genre: {'test': dataset}} for cross-domain evaluation
     """
     from . import train_PIAA as _tp
-    from .train_PIAA import evaluate, evaluate_cross_domain, build_piaa_model
+    from .evaluate import evaluate_piaa as evaluate, evaluate_cross_domain
+    from .train_common import build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
@@ -432,7 +433,8 @@ def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dic
     ユーザーごとにSROCC/NDCGを算出し、wandbに100回分ログする。
     """
     from . import train_PIAA as _tp
-    from .train_PIAA import evaluate, build_piaa_model
+    from .evaluate import evaluate_piaa as evaluate
+    from .train_common import build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
@@ -478,7 +480,8 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         model_state_dict: if provided, load from this state dict instead of best_model_path
     """
     from . import train_PIAA as _tp
-    from .train_PIAA import evaluate, evaluate_cross_domain, build_piaa_model
+    from .evaluate import evaluate_piaa as evaluate, evaluate_cross_domain
+    from .train_common import build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
