@@ -377,7 +377,43 @@ python -m src.train_GIAA --genre fashion --da_method MCD-scenery \
   --dataset_ver v_giaa
 ```
 
-> **注:** MCD は現在 GIAAのみに実装されています。PIAA（pretrain / finetune）への適用は未対応です。
+> **注:** PIAA用のMCDについては[後述](#mcd-piaa)を参照してください。ICI モデルのみ対応。
+
+### MCD（PIAA） {#mcd-piaa}
+
+PIAAでは出力がスカラー値（個人スコア）のため、GIAAとは一部異なる設計になっています。
+
+| 項目 | GIAA MCD | PIAA MCD |
+|------|----------|----------|
+| ラッパークラス | `NIMA_MCD` | `PIAA_MCD` |
+| G の範囲 | `backbone + feat_proj` | backbone以外の全訓練可能パラメータ（`attr_corr` を除く） |
+| F1 | `fc_aesthetic`（分布出力） | `attr_corr`（スカラー出力） |
+| F2 | 独立した同形線形層（分布出力） | 独立した `nn.Linear(input_dim, 1)`（スカラー出力） |
+| Discrepancy | L1-EMD（累積和のL1距離） | L1絶対差 `\|F1(G(x^t)) - F2(G(x^t))\|` |
+| ソース損失 | L2-EMD | MSE |
+| 早期停止基準 | ソース Val EMD | ソース Val CCC |
+| 対応モード | GIAA学習のみ | Pretrain + Finetune |
+| 対応モデル | — | ICI のみ（MIR 不可） |
+
+**Pretrain** では `train_giaa_dataset`（ソース）と `train_giaa_dataset`（ターゲット）を用いて I_ij レベルでドメイン適応を行い、**Finetune** ではユーザーごとに `train_piaa_dataset`（ソース/ターゲット）を用いて同じ3ステップを実行します。
+
+#### ペアワイズ適応の例
+
+```bash
+# Pretrain: art → fashion
+python -m src.train_PIAA --genre art --dataset_ver v2_all \
+  --piaa_mode PIAA_pretrain --da_method MCD-fashion \
+  --mcd_lambda 10.0 --mcd_n_steps 4
+
+# Finetune: art → fashion
+python -m src.train_PIAA --genre art --dataset_ver v2_all \
+  --piaa_mode PIAA_finetune --da_method MCD-fashion \
+  --mcd_lambda 10.0 --mcd_n_steps 4
+
+# Pretrain: art → scenery
+python -m src.train_PIAA --genre art --dataset_ver v2_all \
+  --piaa_mode PIAA_pretrain --da_method MCD-scenery
+```
 
 ---
 
@@ -411,6 +447,8 @@ python -m src.train_GIAA --genre fashion --da_method MCD-scenery \
 | `--dann_gamma` | float | `10.0` | `[DANN]` λスケジュール: シグモイドの鋭さ（Ganin et al.） |
 | `--djdot_alpha` | float | `0.1` | `[DJDOT]` 特徴整合項の重み（L2特徴距離） |
 | `--djdot_lambda_t` | float | `1` | `[DJDOT]` ラベル整合項の重み（EMDラベルコスト） |
+| `--mcd_lambda` | float | `10.0` | `[MCD]` Step B における Discrepancy損失の重み（`L_s - lambda * L_adv` の lambda） |
+| `--mcd_n_steps` | int | `4` | `[MCD]` Step C（ジェネレータ更新）の1バッチあたり繰り返し回数 |
 
 > **注:** クロスドメイン評価（`--genre` 以外の全ジャンルに対する評価）は常に実行されます。損失関数はMSEで固定です。
 

@@ -14,6 +14,7 @@ from .inference import inference_finetune, evaluate_pretrain_on_val_piaa, infere
 _DA_METHOD_MODULES_PIAA = {
     'DANN':  '.methods.dann',
     'DJDOT': '.methods.djdot',
+    'MCD':   '.methods.mcd',
 }
 
 num_attr = None  # Determined dynamically from dataset
@@ -190,6 +191,11 @@ def run_main(args):
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                     args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                     num_attr, num_pt, dann_target_genre=target_genre)
+            elif method_name == 'MCD':
+                mod.trainer_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    num_attr, num_pt, mcd_target_genre=target_genre)
             else:  # DJDOT
                 mod.trainer_finetune(
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
