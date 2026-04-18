@@ -31,8 +31,8 @@ _SAMPLES_DIR_MAP = {
     'scenery': '/home/hayashi0884/proj-xpass/data/samples/scenery_image',
 }
 
-_MODEL         = "gpt-4o"
-_MAX_TOKENS    = 64
+_MODEL         = "gpt-5.4"
+_MAX_TOKENS    = 5000
 _POLL_INTERVAL = 60   # seconds
 _BATCH_SIZE    = 500  # images per batch
 
@@ -172,7 +172,7 @@ def run_sequential(genre: str, trial: int = 0):
 
         response = client.chat.completions.create(
             model=_MODEL,
-            max_tokens=_MAX_TOKENS,
+            max_completion_tokens=_MAX_TOKENS,
             temperature=0.0,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
@@ -257,7 +257,7 @@ def run_batch(genre: str, trial: int = 0, batch_ids: list = None):
                     "url": "/v1/chat/completions",
                     "body": {
                         "model": _MODEL,
-                        "max_tokens": _MAX_TOKENS,
+                        "max_completion_tokens": _MAX_TOKENS,
                         "temperature": 0.0,
                         "messages": [
                             {"role": "system", "content": _SYSTEM_PROMPT},

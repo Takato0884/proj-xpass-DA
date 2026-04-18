@@ -53,8 +53,8 @@ def _ndcg_at_k(true_scores, pred_scores, k=10):
     return dcg / idcg if idcg > 0.0 else 0.0
 
 
-def _aggregate_claude(args):
-    """Claudeの予測分布（期待値）を使い，全ユーザーの平均指標を出力する。"""
+def _aggregate_model(args, model_name: str):
+    """LLMモデル（Claude/Gemini等）の予測分布（期待値）を使い，全ユーザーの平均指標を出力する。"""
     import csv
 
     version = args.version
@@ -64,15 +64,15 @@ def _aggregate_claude(args):
     data_dir = Path(getattr(args, "data_dir", None) or
                     Path(__file__).resolve().parent.parent / "data")
 
-    claude_dir = Path(__file__).resolve().parent.parent / "reports" / "exp" / "claude"
-    claude_json = claude_dir / f"{genre}_results.json"
-
-    if not claude_json.exists():
-        print(f"Error: Claude results not found: {claude_json}", file=sys.stderr)
+    model_dir = Path(__file__).resolve().parent.parent / "reports" / "exp" / model_name
+    matched = list(model_dir.glob(f"{genre}_results*.json"))
+    if not matched:
+        print(f"Error: {model_name} results not found in {model_dir} (pattern: {genre}_results*.json)", file=sys.stderr)
         sys.exit(1)
+    model_json = matched[0]
 
-    # ── 1. Claude 予測の読み込み (期待値: 0-indexed bins → 0–6) ──────────────
-    with open(claude_json) as f:
+    # ── 1. モデル予測の読み込み (期待値: 0-indexed bins → 0–6) ──────────────
+    with open(model_json) as f:
         claude_data = json.load(f)
 
     pred_score = {}       # {sample_file (as stored in JSON): expected_score}
@@ -84,7 +84,7 @@ def _aggregate_claude(args):
         pred_score[sf] = e
         pred_score_stem[Path(sf).stem] = e
 
-    print(f"Loaded {len(pred_score)} Claude predictions  (genre='{genre}')")
+    print(f"Loaded {len(pred_score)} {model_name} predictions  (genre='{genre}')")
 
     # ── 2. Ground truth ratings の読み込み ───────────────────────────────────
     ratings_path = data_dir / "maked" / "ratings.csv"
@@ -207,7 +207,7 @@ def _aggregate_claude(args):
     std_srocc = math.sqrt(sum((x - avg_srocc) ** 2 for x in user_avg_srocc) / n_users)
     std_ccc   = math.sqrt(sum((x - avg_ccc)   ** 2 for x in user_avg_ccc)   / n_users)
 
-    print(f"\n=== Claude Zero-Shot Results ({version}, {genre}) ===")
+    print(f"\n=== {model_name.capitalize()} Zero-Shot Results ({version}, {genre}) ===")
     print(f"  Folds:           {len(fold_dirs)}")
     print(f"  Total users:     {n_users}")
     print(f"  Average MAE:     {avg_mae:.6f} (std: {std_mae:.6f})")
@@ -216,14 +216,18 @@ def _aggregate_claude(args):
     print(f"  Average CCC:     {avg_ccc:.6f} (std: {std_ccc:.6f})")
 
 
+def _aggregate_claude(args):
+    _aggregate_model(args, "claude")
+
+
 def aggregate(args):
     """指定されたversionとgenreの各foldからJSONを集約し，全ユーザーの平均srocc/ndcgを出力する"""
     version = args.version
     genre = args.genre
     pattern = args.pattern
 
-    if pattern == "claude":
-        _aggregate_claude(args)
+    if pattern in ("claude", "gemini", "gpt"):
+        _aggregate_model(args, pattern)
         return
     method = args.method  # e.g., "ICI" (optional)
     min_id = args.min_id
