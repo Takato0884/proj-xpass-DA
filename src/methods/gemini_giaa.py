@@ -81,8 +81,8 @@ def _parse_distribution(text: str) -> list:
 # Main Batch Logic
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_sequential(genre: str, n: int = 0):
-    """逐次処理モード。n=0 のときは全件処理する。"""
+def run_sequential(genre: str, n: int = 0, resume: bool = False):
+    """逐次処理モード。n=0 のときは全件処理する。resume=True で途中から再開。"""
     api_key = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
     if not api_key:
         raise EnvironmentError("Set GEMINI_API_KEY in .env")
@@ -106,6 +106,18 @@ def run_sequential(genre: str, n: int = 0):
     save_path = os.path.join(_SAVE_DIR, f'{genre}_results_sequential.json')
     _CHECKPOINT_INTERVAL = 100
 
+    # resume: 既存の結果を読み込み、処理済みファイルをスキップ
+    completed = []
+    if resume and os.path.exists(save_path):
+        with open(save_path) as fp:
+            existing = json.load(fp)
+        for entry in existing.get('per_sample', []):
+            per_sample_results[entry['sample_file']] = entry['pred_dist']
+            completed.append(entry['sample_file'])
+        print(f"[resume] Loaded {len(completed)} already-processed results from {save_path}")
+
+    done_set = set(completed)
+
     def _save(completed_files):
         output = {
             "genre": genre,
@@ -120,8 +132,9 @@ def run_sequential(genre: str, n: int = 0):
         with open(save_path, 'w') as fp:
             json.dump(output, fp, indent=2)
 
-    completed = []
     for idx, fname in enumerate(all_files):
+        if fname in done_set:
+            continue
         img_path = os.path.join(samples_dir, fname)
         ext = os.path.splitext(fname)[1].lower()
         mime_type = _MIME_MAP.get(ext, 'image/jpeg')
@@ -308,9 +321,10 @@ if __name__ == '__main__':
     parser.add_argument('--genre', required=True, choices=['art', 'fashion', 'scenery'])
     parser.add_argument('--mode', required=True, choices=['sequential', 'batch'])
     parser.add_argument('--trial', type=int, default=0, help='Limit to N images (0 = all)')
+    parser.add_argument('--resume', action='store_true', help='Resume from existing results JSON')
     args = parser.parse_args()
 
     if args.mode == 'sequential':
-        run_sequential(genre=args.genre, n=args.trial)
+        run_sequential(genre=args.genre, n=args.trial, resume=args.resume)
     else:
         run_batch(genre=args.genre, n=args.trial)

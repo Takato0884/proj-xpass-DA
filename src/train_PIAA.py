@@ -231,7 +231,10 @@ if __name__ == '__main__':
     import sys
     parser.set_defaults(lr=5e-6, batch_size=32, djdot_alpha=0.1, djdot_lambda_t=1)
     args = parser.parse_args()
-    if args.piaa_mode == 'PIAA_finetune':
+    if args.piaa_mode == 'PIAA_pretrain':
+        if not any(a.startswith('--mcd_lambda') for a in sys.argv[1:]):
+            args.mcd_lambda = 0.1
+    elif args.piaa_mode == 'PIAA_finetune':
         if not any(a.startswith('--lr') for a in sys.argv[1:]):
             args.lr = 1e-6
         if not any(a.startswith('--batch_size') for a in sys.argv[1:]):
