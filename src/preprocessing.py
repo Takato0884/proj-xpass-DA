@@ -612,92 +612,24 @@ def make_users_and_ratings_pipeline(
         f"after removing {len(suspect_uuids)} UUIDs (annotator-quality criteria)"
     )
 
-def make_data_split_giaa(
-    annotation_df,
-    genre=None,
-    val_frac=0.15,
-    test_frac=0.15,
-    seed=42,
-    out_dir='data/split',
-    version='v1',
-):
-    """
-    Create GIAA-only train/val/test split at image level.
-
-    Splits all unique images into three disjoint sets (train/val/test).
-    Independent of cross-validation and PIAA splits.
-
-    Args:
-      annotation_df (pd.DataFrame): Must contain columns ['genre','sample_file'].
-      genre (str | None): If provided, filter rows to this genre.
-      val_frac (float): Fraction of images for validation (default: 0.15).
-      test_frac (float): Fraction of images for test (default: 0.15).
-      seed (int): Random seed.
-      out_dir (str | Path): Base output directory (defaults to ./data/split).
-      version (str): Version folder name under out_dir.
-
-    Writes:
-      - {out_dir}/{version}/{genre}/train_images_GIAA.txt
-      - {out_dir}/{version}/{genre}/val_images_GIAA.txt
-      - {out_dir}/{version}/{genre}/test_images_GIAA.txt
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Optionally filter by genre
-    if genre is not None:
-        annotation_df = annotation_df[annotation_df['genre'] == genre]
-
-    # Get all unique images
-    all_images = annotation_df['sample_file'].astype(str).drop_duplicates().tolist()
-    random.seed(seed)
-    shuffled = all_images[:]
-    random.shuffle(shuffled)
-
-    # Split: test -> val -> train
-    n_test = int(len(shuffled) * float(test_frac))
-    n_val = int(len(shuffled) * float(val_frac))
-    test_images = shuffled[:n_test]
-    val_images = shuffled[n_test:n_test + n_val]
-    train_images = shuffled[n_test + n_val:]
-
-    # Ensure output directory
-    out_base = out_dir / version / genre if genre is not None else out_dir / version
-    out_base.mkdir(parents=True, exist_ok=True)
-
-    # Write split files
-    for fname, images in [
-        ('train_images_GIAA.txt', train_images),
-        ('val_images_GIAA.txt', val_images),
-        ('test_images_GIAA.txt', test_images),
-    ]:
-        with (out_base / fname).open('w', encoding='utf-8') as f:
-            for im in images:
-                f.write(im + '\n')
-
-    print(
-        f"[make_data_split_giaa] genre={genre}: "
-        f"train={len(train_images)}, val={len(val_images)}, test={len(test_images)} "
-        f"(total unique images={len(all_images)}). Output: {out_base}"
-    )
-
-
 def make_data_split_cv(
     annotation_df,
+    mode='piaa',
     n_folds=5,
     genre=None,
     val_frac_images_giaa=0.2,
     val_frac_users_giaa=0.2,
     n_train_PIAA=100,
     n_test_PIAA=60,
+    val_frac_giaa=0.1,
     seed=42,
     out_dir='data/split',
     version='v3',
 ):
     """
-    Create cross-validation data splits with user-level folding.
+    Create cross-validation data splits.
 
-    Behavior:
+    mode='piaa':
       - Split all users into n_folds groups evenly
       - For each fold i, use group i as test users (PIAA)
       - Remaining users form GIAA pool:
@@ -705,19 +637,27 @@ def make_data_split_cv(
         * Split the users themselves into train/val by val_frac_users_giaa
       - For each test user, split their images into train/test/val for PIAA
 
+    mode='giaa':
+      - Split all unique images into n_folds groups evenly
+      - For each fold i, use group i as test images (~20% each)
+      - From remaining images, randomly select val_frac_giaa (10%) as val, rest as train
+      - Each image appears in exactly one test fold
+
     Args:
       annotation_df (pd.DataFrame): Must contain columns ['user_id','genre','sample_file']
+      mode (str): 'piaa' for user-level CV, 'giaa' for image-level CV (default: 'piaa')
       n_folds (int): Number of cross-validation folds (default: 5)
       genre (str | None): If provided, filter rows to this genre
-      val_frac_images_giaa (float): Fraction of GIAA images for validation (default: 0.2)
-      val_frac_users_giaa (float): Fraction of GIAA users for validation (default: 0.2)
-      n_train_PIAA (int): Per-user train images count (PIAA) sampled from test pool
-      n_test_PIAA (int): Per-user test images count (PIAA) sampled from test pool
+      val_frac_images_giaa (float): [piaa mode] Fraction of GIAA images for validation (default: 0.2)
+      val_frac_users_giaa (float): [piaa mode] Fraction of GIAA users for validation (default: 0.2)
+      n_train_PIAA (int): [piaa mode] Per-user train images count sampled from test pool
+      n_test_PIAA (int): [piaa mode] Per-user test images count sampled from test pool
+      val_frac_giaa (float): [giaa mode] Fraction of train images used for validation (default: 0.1)
       seed (int): Random seed
       out_dir (str | Path): Base output directory (defaults to ./data/split)
       version (str): Version folder name prefix (e.g., 'v3' -> 'v3_fold1', 'v3_fold2', ...)
 
-    Writes for each fold:
+    Writes for each fold (piaa mode):
       - {out_dir}/{version}_fold{i}/{genre}/train_images_GIAA.txt
       - {out_dir}/{version}_fold{i}/{genre}/val_images_GIAA.txt
       - {out_dir}/{version}_fold{i}/{genre}/train_users_GIAA.txt
@@ -725,6 +665,11 @@ def make_data_split_cv(
       - {out_dir}/{version}_fold{i}/{genre}/train_PIAA.txt (lines: user_id\tfilename)
       - {out_dir}/{version}_fold{i}/{genre}/val_PIAA.txt (lines: user_id\tfilename)
       - {out_dir}/{version}_fold{i}/{genre}/test_PIAA.txt (lines: user_id\tfilename)
+
+    Writes for each fold (giaa mode):
+      - {out_dir}/{version}_fold{i}/{genre}/train_images_GIAA.txt
+      - {out_dir}/{version}_fold{i}/{genre}/val_images_GIAA.txt
+      - {out_dir}/{version}_fold{i}/{genre}/test_images_GIAA.txt
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -733,120 +678,165 @@ def make_data_split_cv(
     if genre is not None:
         annotation_df = annotation_df[annotation_df['genre'] == genre]
 
-    # Get all unique users and split them into n_folds groups
-    all_users = annotation_df['user_id'].dropna().astype(str).drop_duplicates().tolist()
-    random.seed(seed)
-    shuffled_users = all_users[:]
-    random.shuffle(shuffled_users)
+    if mode == 'giaa':
+        # Image-level CV: each image appears in exactly one test fold
+        all_images = annotation_df['sample_file'].astype(str).drop_duplicates().tolist()
+        random.seed(seed)
+        shuffled_images = all_images[:]
+        random.shuffle(shuffled_images)
 
-    # Split users into n_folds groups as evenly as possible
-    fold_size = len(shuffled_users) // n_folds
-    user_folds = []
-    for i in range(n_folds):
-        start_idx = i * fold_size
-        end_idx = start_idx + fold_size if i < n_folds - 1 else len(shuffled_users)
-        user_folds.append(shuffled_users[start_idx:end_idx])
+        # Split images into n_folds groups as evenly as possible
+        fold_size = len(shuffled_images) // n_folds
+        image_folds = []
+        for i in range(n_folds):
+            start_idx = i * fold_size
+            end_idx = start_idx + fold_size if i < n_folds - 1 else len(shuffled_images)
+            image_folds.append(shuffled_images[start_idx:end_idx])
 
-    # Process each fold
-    for fold_idx in range(n_folds):
-        fold_num = fold_idx + 1
-        test_users = user_folds[fold_idx]
-        train_users = [u for i, fold in enumerate(user_folds) if i != fold_idx for u in fold]
+        for fold_idx in range(n_folds):
+            fold_num = fold_idx + 1
+            test_images = image_folds[fold_idx]
+            train_pool = [im for i, fold in enumerate(image_folds) if i != fold_idx for im in fold]
 
-        # Split rows into test and train pools
-        test_rows = annotation_df[annotation_df['user_id'].astype(str).isin(test_users)]
-        train_rows = annotation_df[annotation_df['user_id'].astype(str).isin(train_users)]
+            # Randomly select val_frac_giaa from train pool as validation
+            random.seed(seed + fold_idx)
+            train_pool_shuffled = train_pool[:]
+            random.shuffle(train_pool_shuffled)
+            n_val = int(len(train_pool_shuffled) * float(val_frac_giaa))
+            val_images = train_pool_shuffled[:n_val]
+            train_images = train_pool_shuffled[n_val:]
 
-        # GIAA: split images from train pool
-        train_images = train_rows['sample_file'].astype(str).drop_duplicates().tolist()
-        random.seed(seed + fold_idx)  # Different seed per fold for variance
-        train_images_shuffled = train_images[:]
-        random.shuffle(train_images_shuffled)
-        n_val_images_giaa = int(len(train_images_shuffled) * float(val_frac_images_giaa))
-        val_images_GIAA = train_images_shuffled[:n_val_images_giaa]
-        train_images_GIAA = train_images_shuffled[n_val_images_giaa:]
+            fold_version = f"{version}_fold{fold_num}"
+            out_base = out_dir / fold_version / genre if genre is not None else out_dir / fold_version
+            out_base.mkdir(parents=True, exist_ok=True)
 
-        # GIAA: split users from train pool
-        random.seed(seed + fold_idx)
-        train_users_shuffled = train_users[:]
-        random.shuffle(train_users_shuffled)
-        n_val_users_giaa = int(len(train_users_shuffled) * float(val_frac_users_giaa))
-        val_users_GIAA = train_users_shuffled[:n_val_users_giaa]
-        train_users_GIAA = train_users_shuffled[n_val_users_giaa:]
+            for fname, images in [
+                ('train_images_GIAA.txt', train_images),
+                ('val_images_GIAA.txt', val_images),
+                ('test_images_GIAA.txt', test_images),
+            ]:
+                with (out_base / fname).open('w', encoding='utf-8') as f:
+                    for im in images:
+                        f.write(im + '\n')
 
-        # PIAA: per-user split from test pool
-        train_images_PIAA, test_images_PIAA, val_images_PIAA = [], [], []
-        for uid in test_users:
-            user_rows = test_rows[test_rows['user_id'].astype(str) == uid]
-            user_images = user_rows['sample_file'].astype(str).drop_duplicates().tolist()
-            user_shuffled = user_images[:]
-            random.seed(seed + fold_idx + hash(uid) % 10000)  # Reproducible per-user shuffle
-            random.shuffle(user_shuffled)
-            t = user_shuffled[:n_test_PIAA]
-            tr = user_shuffled[n_test_PIAA:n_test_PIAA + n_train_PIAA]
-            va = user_shuffled[n_test_PIAA + n_train_PIAA:]
-            test_images_PIAA.extend([(uid, im) for im in t])
-            train_images_PIAA.extend([(uid, im) for im in tr])
-            val_images_PIAA.extend([(uid, im) for im in va])
-
-        # Create output directory for this fold
-        fold_version = f"{version}_fold{fold_num}"
-        out_base = out_dir / fold_version / genre if genre is not None else out_dir / fold_version
-        out_base.mkdir(parents=True, exist_ok=True)
-
-        # Write GIAA image files
-        train_path_GIAA = out_base / 'train_images_GIAA.txt'
-        val_path_GIAA = out_base / 'val_images_GIAA.txt'
-        with train_path_GIAA.open('w', encoding='utf-8') as f:
-            for im in train_images_GIAA:
-                f.write(im + '\n')
-        with val_path_GIAA.open('w', encoding='utf-8') as f:
-            for im in val_images_GIAA:
-                f.write(im + '\n')
-
-        # Write GIAA user files
-        train_users_path_GIAA = out_base / 'train_users_GIAA.txt'
-        val_users_path_GIAA = out_base / 'val_users_GIAA.txt'
-        with train_users_path_GIAA.open('w', encoding='utf-8') as f:
-            for uid in train_users_GIAA:
-                f.write(uid + '\n')
-        with val_users_path_GIAA.open('w', encoding='utf-8') as f:
-            for uid in val_users_GIAA:
-                f.write(uid + '\n')
-
-        # Write PIAA user-image pair files
-        train_path_PIAA = out_base / 'train_PIAA.txt'
-        val_path_PIAA = out_base / 'val_PIAA.txt'
-        test_path_PIAA = out_base / 'test_PIAA.txt'
-        with train_path_PIAA.open('w', encoding='utf-8') as f:
-            for uid, im in train_images_PIAA:
-                f.write(f"{uid}\t{im}\n")
-        with val_path_PIAA.open('w', encoding='utf-8') as f:
-            for uid, im in val_images_PIAA:
-                f.write(f"{uid}\t{im}\n")
-        with test_path_PIAA.open('w', encoding='utf-8') as f:
-            for uid, im in test_images_PIAA:
-                f.write(f"{uid}\t{im}\n")
-
-        # Summary for this fold
-        piaa_train_users = len({uid for uid, _ in train_images_PIAA})
-        piaa_val_users = len({uid for uid, _ in val_images_PIAA})
-        piaa_test_users = len({uid for uid, _ in test_images_PIAA})
+            print(
+                f"[make_data_split_cv giaa] Fold {fold_num}/{n_folds}: "
+                f"train={len(train_images)}, val={len(val_images)}, test={len(test_images)} "
+                f"(total unique images={len(all_images)}). Output: {out_base}"
+            )
 
         print(
-            f"[make_data_split_cv] Fold {fold_num}/{n_folds}: "
-            f"GIAA train_images={len(train_images_GIAA)}, val_images={len(val_images_GIAA)}, "
-            f"train_users={len(train_users_GIAA)}, val_users={len(val_users_GIAA)}. "
-            f"PIAA train_samples={len(train_images_PIAA)} (unique_users={piaa_train_users}), "
-            f"val_samples={len(val_images_PIAA)} (unique_users={piaa_val_users}), "
-            f"test_samples={len(test_images_PIAA)} (unique_users={piaa_test_users}). "
-            f"Output: {out_base}"
+            f"[make_data_split_cv giaa] Completed {n_folds}-fold CV. "
+            f"Total images: {len(all_images)}, images per test fold: ~{len(all_images)//n_folds}"
         )
 
-    print(
-        f"[make_data_split_cv] Completed {n_folds}-fold cross-validation split. "
-        f"Total users: {len(all_users)}, users per fold: ~{len(all_users)//n_folds}"
-    )
+    else:
+        # piaa mode: user-level CV
+        all_users = annotation_df['user_id'].dropna().astype(str).drop_duplicates().tolist()
+        random.seed(seed)
+        shuffled_users = all_users[:]
+        random.shuffle(shuffled_users)
+
+        # Split users into n_folds groups as evenly as possible
+        fold_size = len(shuffled_users) // n_folds
+        user_folds = []
+        for i in range(n_folds):
+            start_idx = i * fold_size
+            end_idx = start_idx + fold_size if i < n_folds - 1 else len(shuffled_users)
+            user_folds.append(shuffled_users[start_idx:end_idx])
+
+        # Process each fold
+        for fold_idx in range(n_folds):
+            fold_num = fold_idx + 1
+            test_users = user_folds[fold_idx]
+            train_users = [u for i, fold in enumerate(user_folds) if i != fold_idx for u in fold]
+
+            # Split rows into test and train pools
+            test_rows = annotation_df[annotation_df['user_id'].astype(str).isin(test_users)]
+            train_rows = annotation_df[annotation_df['user_id'].astype(str).isin(train_users)]
+
+            # GIAA: split images from train pool
+            train_images = train_rows['sample_file'].astype(str).drop_duplicates().tolist()
+            random.seed(seed + fold_idx)
+            train_images_shuffled = train_images[:]
+            random.shuffle(train_images_shuffled)
+            n_val_images_giaa = int(len(train_images_shuffled) * float(val_frac_images_giaa))
+            val_images_GIAA = train_images_shuffled[:n_val_images_giaa]
+            train_images_GIAA = train_images_shuffled[n_val_images_giaa:]
+
+            # GIAA: split users from train pool
+            random.seed(seed + fold_idx)
+            train_users_shuffled = train_users[:]
+            random.shuffle(train_users_shuffled)
+            n_val_users_giaa = int(len(train_users_shuffled) * float(val_frac_users_giaa))
+            val_users_GIAA = train_users_shuffled[:n_val_users_giaa]
+            train_users_GIAA = train_users_shuffled[n_val_users_giaa:]
+
+            # PIAA: per-user split from test pool
+            train_images_PIAA, test_images_PIAA, val_images_PIAA = [], [], []
+            for uid in test_users:
+                user_rows = test_rows[test_rows['user_id'].astype(str) == uid]
+                user_images = user_rows['sample_file'].astype(str).drop_duplicates().tolist()
+                user_shuffled = user_images[:]
+                random.seed(seed + fold_idx + hash(uid) % 10000)
+                random.shuffle(user_shuffled)
+                t = user_shuffled[:n_test_PIAA]
+                tr = user_shuffled[n_test_PIAA:n_test_PIAA + n_train_PIAA]
+                va = user_shuffled[n_test_PIAA + n_train_PIAA:]
+                test_images_PIAA.extend([(uid, im) for im in t])
+                train_images_PIAA.extend([(uid, im) for im in tr])
+                val_images_PIAA.extend([(uid, im) for im in va])
+
+            # Create output directory for this fold
+            fold_version = f"{version}_fold{fold_num}"
+            out_base = out_dir / fold_version / genre if genre is not None else out_dir / fold_version
+            out_base.mkdir(parents=True, exist_ok=True)
+
+            # Write GIAA image files
+            with (out_base / 'train_images_GIAA.txt').open('w', encoding='utf-8') as f:
+                for im in train_images_GIAA:
+                    f.write(im + '\n')
+            with (out_base / 'val_images_GIAA.txt').open('w', encoding='utf-8') as f:
+                for im in val_images_GIAA:
+                    f.write(im + '\n')
+
+            # Write GIAA user files
+            with (out_base / 'train_users_GIAA.txt').open('w', encoding='utf-8') as f:
+                for uid in train_users_GIAA:
+                    f.write(uid + '\n')
+            with (out_base / 'val_users_GIAA.txt').open('w', encoding='utf-8') as f:
+                for uid in val_users_GIAA:
+                    f.write(uid + '\n')
+
+            # Write PIAA user-image pair files
+            with (out_base / 'train_PIAA.txt').open('w', encoding='utf-8') as f:
+                for uid, im in train_images_PIAA:
+                    f.write(f"{uid}\t{im}\n")
+            with (out_base / 'val_PIAA.txt').open('w', encoding='utf-8') as f:
+                for uid, im in val_images_PIAA:
+                    f.write(f"{uid}\t{im}\n")
+            with (out_base / 'test_PIAA.txt').open('w', encoding='utf-8') as f:
+                for uid, im in test_images_PIAA:
+                    f.write(f"{uid}\t{im}\n")
+
+            piaa_train_users = len({uid for uid, _ in train_images_PIAA})
+            piaa_val_users = len({uid for uid, _ in val_images_PIAA})
+            piaa_test_users = len({uid for uid, _ in test_images_PIAA})
+
+            print(
+                f"[make_data_split_cv piaa] Fold {fold_num}/{n_folds}: "
+                f"GIAA train_images={len(train_images_GIAA)}, val_images={len(val_images_GIAA)}, "
+                f"train_users={len(train_users_GIAA)}, val_users={len(val_users_GIAA)}. "
+                f"PIAA train_samples={len(train_images_PIAA)} (unique_users={piaa_train_users}), "
+                f"val_samples={len(val_images_PIAA)} (unique_users={piaa_val_users}), "
+                f"test_samples={len(test_images_PIAA)} (unique_users={piaa_test_users}). "
+                f"Output: {out_base}"
+            )
+
+        print(
+            f"[make_data_split_cv piaa] Completed {n_folds}-fold CV. "
+            f"Total users: {len(all_users)}, users per fold: ~{len(all_users)//n_folds}"
+        )
 
 
 if __name__ == "__main__":
@@ -916,51 +906,20 @@ if __name__ == "__main__":
         choices=["mad", "std"],
         help="Outlier detection method: mad (median ± k*MAD) or std (mean ± k*SD) (default: std)")
 
-    # Subcommand: make_data_split_giaa (GIAA-only train/val/test image split)
-    split_giaa_parser = subparsers.add_parser(
-        "make_data_split_giaa",
-        help="Create GIAA-only train/val/test split at image level. Independent of CV and PIAA splits.")
-    split_giaa_parser.add_argument(
-        "ratings_csv",
-        help="Path to ratings CSV (e.g., data/maked/ratings.csv) containing genre, sample_file, etc.")
-    split_giaa_parser.add_argument(
-        "--genre",
-        choices=["art", "fashion", "scenery", "all"],
-        default=None,
-        help="Genre to split. Use 'all' to generate splits for art, fashion, and scenery in one run.")
-    split_giaa_parser.add_argument(
-        "--version",
-        required=True,
-        help="Version name to create under output directory (e.g., v_giaa).")
-    split_giaa_parser.add_argument(
-        "--val-frac",
-        type=float,
-        default=0.15,
-        help="Fraction of images for validation (0-1, default: 0.15).")
-    split_giaa_parser.add_argument(
-        "--test-frac",
-        type=float,
-        default=0.15,
-        help="Fraction of images for test (0-1, default: 0.15).")
-    split_giaa_parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed (default: 42).")
-    split_giaa_parser.add_argument(
-        "--out-dir",
-        default=str(Path.cwd() / "data" / "split"),
-        help="Output directory (default: ./data/split relative to current working directory).")
-
     # Subcommand: make_data_split_cv (cross-validation)
     split_cv_parser = subparsers.add_parser(
         "make_data_split_cv",
-        help="Create cross-validation data splits with user-level folding. Each user appears in exactly one test fold.")
+        help="Create cross-validation data splits. Use --mode piaa (user-level) or --mode giaa (image-level).")
     split_cv_parser.add_argument(
         "ratings_csv",
         nargs="?",
         default="data/maked/ratings.csv",
         help="Path to ratings CSV (default: data/maked/ratings.csv) containing user_id, genre, sample_file, etc.")
+    split_cv_parser.add_argument(
+        "--mode",
+        choices=["piaa", "giaa"],
+        default="piaa",
+        help="CV mode: 'piaa' for user-level folding, 'giaa' for image-level folding (default: piaa).")
     split_cv_parser.add_argument(
         "--genre",
         choices=["art", "fashion", "scenery", "all"],
@@ -979,22 +938,27 @@ if __name__ == "__main__":
         "--val-frac-images-giaa",
         type=float,
         default=0.1,
-        help="Validation fraction for GIAA images (0-1, default: 0.1).")
+        help="[piaa mode] Validation fraction for GIAA images (0-1, default: 0.1).")
     split_cv_parser.add_argument(
         "--val-frac-users-giaa",
         type=float,
         default=0.1,
-        help="Validation fraction for GIAA users (0-1, default: 0.1).")
+        help="[piaa mode] Validation fraction for GIAA users (0-1, default: 0.1).")
     split_cv_parser.add_argument(
         "--n-train-piaa",
         type=int,
         default=100,
-        help="Number of per-user train images for PIAA (default: 100).")
+        help="[piaa mode] Number of per-user train images for PIAA (default: 100).")
     split_cv_parser.add_argument(
         "--n-test-piaa",
         type=int,
         default=50,
-        help="Number of per-user test images for PIAA (default: 50).")
+        help="[piaa mode] Number of per-user test images for PIAA (default: 50).")
+    split_cv_parser.add_argument(
+        "--val-frac-giaa",
+        type=float,
+        default=0.1,
+        help="[giaa mode] Fraction of train images used for validation (default: 0.1).")
     split_cv_parser.add_argument(
         "--seed",
         type=int,
@@ -1021,25 +985,6 @@ if __name__ == "__main__":
             mad_multiplier=args.mad_multiplier,
             outlier_method=args.outlier_method,
         )
-    elif args.command == "make_data_split_giaa":
-        # Load ratings CSV
-        df = pd.read_csv(args.ratings_csv)
-        # Determine target genres
-        target_genres = (
-            ["art", "fashion", "scenery"] if args.genre == "all" else [args.genre]
-            if args.genre is not None else [None]
-        )
-        # Generate GIAA-only train/val/test splits per requested genre
-        for g in target_genres:
-            make_data_split_giaa(
-                annotation_df=df,
-                genre=g,
-                val_frac=args.val_frac,
-                test_frac=args.test_frac,
-                seed=args.seed,
-                out_dir=args.out_dir,
-                version=args.version,
-            )
     elif args.command == "make_data_split_cv":
         # Load ratings CSV
         df = pd.read_csv(args.ratings_csv)
@@ -1052,12 +997,14 @@ if __name__ == "__main__":
         for g in target_genres:
             make_data_split_cv(
                 annotation_df=df,
+                mode=args.mode,
                 n_folds=args.n_folds,
                 genre=g,
                 val_frac_images_giaa=args.val_frac_images_giaa,
                 val_frac_users_giaa=args.val_frac_users_giaa,
                 n_train_PIAA=args.n_train_piaa,
                 n_test_PIAA=args.n_test_piaa,
+                val_frac_giaa=args.val_frac_giaa,
                 seed=args.seed,
                 out_dir=args.out_dir,
                 version=args.version,

@@ -9,8 +9,7 @@ from torch.utils.data import DataLoader
 from .argflags import parse_arguments, model_dir, wandb_tags
 from .data import load_data, load_data_giaa_only, collate_fn
 from .train_common import NIMA, num_bins, parse_da_method
-from .evaluate import evaluate
-from .inference import inference
+from .inference import inference, inference_giaa
 
 # Registry: method name → module path (relative to this package)
 _DA_METHOD_MODULES = {
@@ -30,7 +29,7 @@ def _load_method(method_name):
 
 
 def run_main(args):
-    is_v_giaa = (args.dataset_ver == 'v_giaa')
+    is_v_giaa = args.giaa_mode
     batch_size = args.batch_size
     print(args, flush=True)
 
@@ -44,7 +43,7 @@ def run_main(args):
         tags = ["GIAA"] + wandb_tags(args)
         if use_da:
             tags += [method_name, domain_tag]
-        wandb.init(project="XPASS", notes="NIMA", tags=tags)
+        wandb.init(project=args.wandb_project, notes="NIMA", tags=tags)
         wandb.config = {
             "learning_rate": args.lr,
             "batch_size": batch_size,
@@ -81,10 +80,8 @@ def run_main(args):
         method.trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname,
                        components, tgt_val_loader=tgt_val_loader, tgt_genre=target_genre)
 
-        test_emd, test_srocc, _, test_mse, _, test_mae, test_ccc = evaluate(
-            model, test_loader, device, phase_name="Test")
-        print(f"[{args.genre} GIAA Test] EMD: {test_emd:.4f}  SROCC: {test_srocc:.4f}  "
-              f"CCC: {test_ccc:.4f}  MSE: {test_mse:.4f}")
+        test_emd, test_srocc, test_mse, test_mae, test_ccc = inference_giaa(
+            test_dataset, args, device, model, model_path=best_modelname)
         if args.is_log:
             wandb.log({
                 f"{args.genre}/Test EMD GIAA": test_emd,

@@ -20,6 +20,7 @@ def parse_arguments(parse=True):
     parser.add_argument('--root_dir', type=str, default='/home/hayashi0884/proj-xpass-DA/data')
     parser.add_argument('--piaa_mode', type=str, default='PIAA_pretrain')
     parser.add_argument('--no_log', action='store_false', dest='is_log', help='Disable logging')
+    parser.add_argument('--wandb_project', type=str, default='XPASS', help='wandb project name')
 
     parser.add_argument('--num_epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -30,6 +31,10 @@ def parse_arguments(parse=True):
     parser.add_argument('--lr_patience', type=int, default=5)
     parser.add_argument('--no_save_model', action='store_true', default=False,
                         help='If set, keep best model in memory instead of saving to disk')
+
+    parser.add_argument('--giaa_mode', action='store_true', default=False,
+                        help='Use GIAA-only split files (train/val/test_images_GIAA.txt). '
+                             'No PIAA files required. Evaluates on GIAA test set.')
 
     # Domain Adaptation
     parser.add_argument('--da_method', type=str, default=None,

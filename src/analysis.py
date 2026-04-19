@@ -216,6 +216,227 @@ def _aggregate_model(args, model_name: str):
     print(f"  Average CCC:     {avg_ccc:.6f} (std: {std_ccc:.6f})")
 
 
+def _aggregate_model_giaa(args, model_name: str):
+    """LLMモデルのGIAA評価: test_images_GIAA.txt × 画像単位mean GT で指標を計算する。"""
+    import csv
+
+    version = args.version
+    genre = args.genre
+    data_dir = Path(getattr(args, "data_dir", None) or
+                    Path(__file__).resolve().parent.parent / "data")
+
+    model_dir = Path(__file__).resolve().parent.parent / "reports" / "exp" / model_name
+    matched = list(model_dir.glob(f"{genre}_results*.json"))
+    if not matched:
+        print(f"Error: {model_name} results not found in {model_dir} (pattern: {genre}_results*.json)", file=sys.stderr)
+        sys.exit(1)
+    model_json = matched[0]
+
+    with open(model_json) as f:
+        llm_data = json.load(f)
+
+    pred_score = {}       # {sample_file: expected_score}
+    pred_score_stem = {}  # {stem: expected_score}
+    pred_dist = {}        # {sample_file: [p0..p6]}
+    pred_dist_stem = {}   # {stem: [p0..p6]}
+    for entry in llm_data["per_sample"]:
+        dist = entry["pred_dist"]
+        e = sum(i * p for i, p in enumerate(dist))
+        sf = entry["sample_file"]
+        pred_score[sf] = e
+        pred_score_stem[Path(sf).stem] = e
+        pred_dist[sf] = dist
+        pred_dist_stem[Path(sf).stem] = dist
+
+    print(f"Loaded {len(pred_score)} {model_name} predictions  (genre='{genre}')")
+
+    # 画像単位の平均GTスコアとGTヒストグラムをratings.csvから構築
+    NUM_BINS = 7
+    ratings_path = data_dir / "maked" / "ratings.csv"
+    img_sum: dict = {}
+    img_cnt: dict = {}
+    img_hist: dict = {}   # {sample_file: [count_bin0..count_bin6]}
+    with open(ratings_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["genre"] != genre:
+                continue
+            try:
+                sf = row["sample_file"]
+                score = int(float(row["Aesthetic"]))
+                img_sum[sf] = img_sum.get(sf, 0.0) + float(row["Aesthetic"])
+                img_cnt[sf] = img_cnt.get(sf, 0) + 1
+                hist = img_hist.setdefault(sf, [0] * NUM_BINS)
+                if 0 <= score < NUM_BINS:
+                    hist[score] += 1
+            except (ValueError, KeyError):
+                pass
+    img_mean_gt = {sf: img_sum[sf] / img_cnt[sf] for sf in img_sum}
+    # ヒストグラムを確率分布に正規化
+    img_hist_norm = {sf: [c / img_cnt[sf] for c in hist] for sf, hist in img_hist.items()}
+    print(f"Loaded mean GT for {len(img_mean_gt)} images  (genre='{genre}')")
+
+    split_dir = data_dir / "split"
+    fold_dirs = sorted(split_dir.glob(f"{version}_fold*"))
+    if not fold_dirs:
+        print(f"Error: No fold directories for version '{version}' in {split_dir}", file=sys.stderr)
+        sys.exit(1)
+    if args.folds is not None:
+        fold_set = set(args.folds)
+        fold_dirs = [d for d in fold_dirs if int(d.name.split("fold")[-1]) in fold_set]
+
+    def _emd(p, q):
+        """L2 norm of CDF difference (same formula as EarthMoverDistance in train_common)."""
+        cp, cq = 0.0, 0.0
+        acc = 0.0
+        for a, b in zip(p, q):
+            cp += a;  cq += b
+            acc += (cp - cq) ** 2
+        return acc ** 0.5
+
+    fold_srocc, fold_mae, fold_ccc, fold_emd = [], [], [], []
+
+    for fold_dir in fold_dirs:
+        test_file = fold_dir / genre / "test_images_GIAA.txt"
+        if not test_file.exists():
+            print(f"  Warning: {test_file} not found, skipping")
+            continue
+
+        with open(test_file) as f:
+            test_images = [l.strip() for l in f if l.strip()]
+
+        preds, gts, dists, gt_hists = [], [], [], []
+        for sf in test_images:
+            stem = Path(sf).stem
+            p = pred_score.get(sf) or pred_score_stem.get(stem)
+            d = pred_dist.get(sf) or pred_dist_stem.get(stem)
+            if p is None:
+                continue
+            gt_key = sf if sf in img_mean_gt else next(
+                (k for k in img_mean_gt if Path(k).stem == stem), None)
+            if gt_key is None:
+                continue
+            preds.append(p)
+            gts.append(img_mean_gt[gt_key])
+            if d is not None and gt_key in img_hist_norm:
+                dists.append(d)
+                gt_hists.append(img_hist_norm[gt_key])
+
+        if len(preds) < 2:
+            print(f"  [{fold_dir.name}] Too few matched images ({len(preds)}), skipping")
+            continue
+
+        n = len(preds)
+        srocc = _spearman(preds, gts)
+        mae = sum(abs(preds[i] / 6.0 - gts[i] / 6.0) for i in range(n)) / n
+        mu_p = sum(preds) / n;  mu_t = sum(gts) / n
+        cov = sum((preds[i] - mu_p) * (gts[i] - mu_t) for i in range(n)) / n
+        var_p = sum((preds[i] - mu_p) ** 2 for i in range(n)) / n
+        var_t = sum((gts[i] - mu_t) ** 2 for i in range(n)) / n
+        ccc = float(2 * cov / (var_p + var_t + (mu_p - mu_t) ** 2 + 1e-8))
+        emd = sum(_emd(dists[i], gt_hists[i]) for i in range(len(dists))) / len(dists) if dists else float("nan")
+
+        fold_srocc.append(srocc);  fold_mae.append(mae)
+        fold_ccc.append(ccc);      fold_emd.append(emd)
+        print(f"  [{fold_dir.name}] n={n}  EMD={emd:.4f}  SROCC={srocc:.4f}  MAE={mae:.6f}  CCC={ccc:.4f}")
+
+    if not fold_srocc:
+        print("Error: No fold metrics computed.", file=sys.stderr)
+        sys.exit(1)
+
+    def _stats(vals):
+        avg = sum(vals) / len(vals)
+        std = math.sqrt(sum((x - avg) ** 2 for x in vals) / len(vals))
+        return avg, std
+
+    avg_emd,   std_emd   = _stats(fold_emd)
+    avg_srocc, std_srocc = _stats(fold_srocc)
+    avg_mae,   std_mae   = _stats(fold_mae)
+    avg_ccc,   std_ccc   = _stats(fold_ccc)
+
+    print(f"\n=== {model_name.capitalize()} GIAA Results ({version}, {genre}) ===")
+    print(f"  Folds:           {len(fold_srocc)}")
+    print(f"  Average EMD:     {avg_emd:.6f} (std: {std_emd:.6f})")
+    print(f"  Average SROCC:   {avg_srocc:.6f} (std: {std_srocc:.6f})")
+    print(f"  Average MAE:     {avg_mae:.6f} (std: {std_mae:.6f})")
+    print(f"  Average CCC:     {avg_ccc:.6f} (std: {std_ccc:.6f})")
+
+
+def _aggregate_giaa(args):
+    """GIAAモード: inference_giaa()が出力したJSONのaverage_metricsをfoldにわたって集約する。"""
+    version = args.version
+    genre = args.genre
+    pattern = args.pattern
+    method = args.method
+    reports_dir = Path(args.reports_dir)
+
+    fold_dirs = sorted(reports_dir.glob(f"{version}_fold*"))
+    if not fold_dirs:
+        print(f"Error: No fold directories for version '{version}' in {reports_dir}", file=sys.stderr)
+        sys.exit(1)
+    if args.folds is not None:
+        fold_set = set(args.folds)
+        fold_dirs = [d for d in fold_dirs if int(d.name.split("fold")[-1]) in fold_set]
+
+    fold_emd, fold_srocc, fold_mae, fold_ccc = [], [], [], []
+
+    for fold_dir in fold_dirs:
+        genre_dir = fold_dir / genre
+        if not genre_dir.is_dir():
+            print(f"Error: Genre directory not found: {genre_dir}", file=sys.stderr)
+            sys.exit(1)
+
+        if method and pattern:
+            glob_pattern = f"*{method}*{pattern}*.json"
+        elif method:
+            glob_pattern = f"*{method}*.json"
+        elif pattern:
+            glob_pattern = f"*{pattern}*.json"
+        else:
+            glob_pattern = "*.json"
+
+        matched_jsons = [p for p in genre_dir.glob(glob_pattern)
+                         if json.loads(p.read_text()).get("mode") == "GIAA"]
+        if len(matched_jsons) == 0:
+            print(f"Error: No GIAA JSON matching '{glob_pattern}' in {genre_dir}", file=sys.stderr)
+            sys.exit(1)
+        if len(matched_jsons) > 1:
+            print(f"Error: Multiple GIAA JSONs found in {genre_dir}: {[f.name for f in matched_jsons]}", file=sys.stderr)
+            sys.exit(1)
+
+        data = json.loads(matched_jsons[0].read_text())
+        m = data.get("average_metrics", {}).get(genre, {})
+        if not m:
+            print(f"  Warning: No average_metrics for genre '{genre}' in {matched_jsons[0].name}, skipping")
+            continue
+
+        fold_emd.append(m["emd"]);  fold_srocc.append(m["srocc"])
+        fold_mae.append(m["mae"]);  fold_ccc.append(m["ccc"])
+        print(f"  Loaded: {matched_jsons[0].relative_to(reports_dir)}  "
+              f"EMD={m['emd']:.4f}  SROCC={m['srocc']:.4f}  CCC={m['ccc']:.4f}")
+
+    if not fold_emd:
+        print("Error: No fold metrics found.", file=sys.stderr)
+        sys.exit(1)
+
+    def _stats(vals):
+        avg = sum(vals) / len(vals)
+        std = math.sqrt(sum((x - avg) ** 2 for x in vals) / len(vals))
+        return avg, std
+
+    avg_emd,   std_emd   = _stats(fold_emd)
+    avg_srocc, std_srocc = _stats(fold_srocc)
+    avg_mae,   std_mae   = _stats(fold_mae)
+    avg_ccc,   std_ccc   = _stats(fold_ccc)
+
+    print(f"\n=== Aggregated GIAA Results ({version}, {genre}, pattern='{pattern}') ===")
+    print(f"  Folds:           {len(fold_emd)}")
+    print(f"  Average EMD:     {avg_emd:.6f} (std: {std_emd:.6f})")
+    print(f"  Average SROCC:   {avg_srocc:.6f} (std: {std_srocc:.6f})")
+    print(f"  Average MAE:     {avg_mae:.6f} (std: {std_mae:.6f})")
+    print(f"  Average CCC:     {avg_ccc:.6f} (std: {std_ccc:.6f})")
+
+
 def _aggregate_claude(args):
     _aggregate_model(args, "claude")
 
@@ -226,8 +447,17 @@ def aggregate(args):
     genre = args.genre
     pattern = args.pattern
 
+    giaa_mode = getattr(args, "giaa_mode", False)
+
     if pattern in ("claude", "gemini", "gpt"):
-        _aggregate_model(args, pattern)
+        if giaa_mode:
+            _aggregate_model_giaa(args, pattern)
+        else:
+            _aggregate_model(args, pattern)
+        return
+
+    if giaa_mode:
+        _aggregate_giaa(args)
         return
     method = args.method  # e.g., "ICI" (optional)
     min_id = args.min_id
@@ -1360,6 +1590,15 @@ if __name__ == '__main__':
         dest="data_dir",
         help="Path to data directory containing split/ and maked/ (used with --pattern claude). "
              "Default: <project_root>/data",
+    )
+    agg_parser.add_argument(
+        "--giaa_mode",
+        action="store_true",
+        default=False,
+        dest="giaa_mode",
+        help="Aggregate GIAA results (EMD/SROCC/MSE/MAE/CCC). "
+             "For NN: reads average_metrics from GIAA JSONs. "
+             "For LLM (--pattern claude/gemini/gpt): evaluates image-level predictions against test_images_GIAA.txt.",
     )
 
     # Subcommand: plot_quality

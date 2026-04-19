@@ -138,7 +138,7 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
                 f"{args.genre}/DANN lambda": lambda_,
             }, commit=False)
 
-        val_emd, val_srocc, _, val_mse, _, _, _ = evaluate(
+        val_emd, val_srocc, _, val_mse, _, _, val_ccc = evaluate(
             model, val_loader, device, epoch=epoch, phase_name="Val")
         if args.is_log:
             wandb.log({
@@ -146,10 +146,11 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
                 f"{args.genre}/Val EMD GIAA": val_emd,
                 f"{args.genre}/Val SROCC GIAA": val_srocc,
                 f"{args.genre}/Val MSE GIAA": val_mse,
+                f"{args.genre}/Val CCC GIAA": val_ccc,
             }, commit=tgt_val_loader is None)
 
         if tgt_val_loader is not None:
-            tgt_val_emd, tgt_val_srocc, _, tgt_val_mse, _, _, _ = evaluate(
+            tgt_val_emd, tgt_val_srocc, _, tgt_val_mse, _, _, tgt_val_ccc = evaluate(
                 model, tgt_val_loader, device, epoch=epoch, phase_name=f"Val [{tgt_genre}]")
             if args.is_log:
                 wandb.log({
@@ -157,6 +158,7 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
                     f"{tgt_genre}/Val EMD GIAA": tgt_val_emd,
                     f"{tgt_genre}/Val SROCC GIAA": tgt_val_srocc,
                     f"{tgt_genre}/Val MSE GIAA": tgt_val_mse,
+                    f"{tgt_genre}/Val CCC GIAA": tgt_val_ccc,
                 }, commit=True)
 
         prev_lr = optimizer.param_groups[0]['lr']

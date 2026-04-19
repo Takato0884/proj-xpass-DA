@@ -15,6 +15,58 @@ from .data import collate_fn
 from .train_common import num_bins
 
 
+def inference_giaa(test_dataset, args, device, model, model_path=None):
+    """GIAA-only inference: evaluate on test_images_GIAA.txt and save results to JSON."""
+    from .evaluate import evaluate
+    from .data import collate_fn
+    from .train_common import parse_da_method as _parse_da
+
+    batch_size = args.batch_size
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+
+    test_emd, test_srocc, _, test_mse, _, test_mae, test_ccc = evaluate(
+        model, test_loader, device, phase_name="Test")
+
+    print(f"[{args.genre} GIAA Test] EMD: {test_emd:.4f}  SROCC: {test_srocc:.4f}  "
+          f"CCC: {test_ccc:.4f}  MSE: {test_mse:.4f}  MAE: {test_mae:.4f}")
+
+    _method_name, _tgt_genre = _parse_da(getattr(args, 'da_method', None))
+    _domain_tag = f'{args.genre}2{_tgt_genre}' if _tgt_genre else args.genre
+    save_dir = os.path.join('/home/hayashi0884/proj-xpass-DA/reports/exp', args.dataset_ver, _domain_tag)
+    os.makedirs(save_dir, exist_ok=True)
+
+    if model_path:
+        model_basename = os.path.splitext(os.path.basename(model_path))[0]
+        json_filename = f"{model_basename}.json"
+        display_name = model_basename
+    else:
+        json_filename = f"{args.genre}_giaa_default.json"
+        display_name = f"{args.genre}_giaa_default"
+
+    result_data = {
+        'experiment_name': display_name,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'mode': 'GIAA',
+        'genres': [args.genre],
+        'average_metrics': {
+            args.genre: {
+                'emd': float(test_emd),
+                'srocc': float(test_srocc),
+                'mae': float(test_mae),
+                'ccc': float(test_ccc),
+            }
+        },
+    }
+
+    json_path = os.path.join(save_dir, json_filename)
+    with open(json_path, 'w') as f:
+        json.dump(result_data, f, indent=2)
+    print(f"Test results saved to {json_path}")
+
+    return test_emd, test_srocc, test_mse, test_mae, test_ccc
+
+
 def inference(train_dataset, val_dataset, test_dataset, args, device, model, eval_split, experiment_name='', model_path=None, eval_datasets_dict=None):
     """Per-user inference: load each user's best model and evaluate on a chosen split (val or test).
 

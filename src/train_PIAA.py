@@ -101,7 +101,7 @@ def run_main(args):
             tags.append(method_name)
             tags.append(domain_tag)
         wandb.init(
-                   project=f"XPASS",
+                   project=args.wandb_project,
                    notes=f"{args.model_type}",
                    tags=tags)
         wandb.config = {
