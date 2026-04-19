@@ -37,7 +37,9 @@ def run_main(args):
     method = _load_method(method_name)
     use_da = method_name is not None
     domain_tag = f'{args.genre}2{target_genre}' if use_da else args.genre
-    method_tag = method_name if method_name else 'Only'
+    _backbone_abbr = {'resnet50': 'RN50', 'i3d': 'I3D', 'vit_b_16': 'ViT', 'clip_rn50': 'CLRN50'}
+    backbone_suffix = f'_{_backbone_abbr[args.backbone]}' if args.backbone in _backbone_abbr else ''
+    method_tag = (method_name if method_name else 'Only') + backbone_suffix
 
     if args.is_log:
         tags = ["GIAA"] + wandb_tags(args)
