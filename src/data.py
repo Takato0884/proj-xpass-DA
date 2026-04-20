@@ -489,10 +489,11 @@ def load_data(args, global_trait_encoders=None, global_age_bins=None):
     map_file = os.path.join(pkl_dir, 'trainset_image_dct.pkl')
     # For training datasets enforce a fixed temporal length by default
     enc_kwargs = dict(global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
+    _train_max_frames = None if backbone == 'i3d' else 16
     train_giaa_hist_dataset = Image_GIAA_HistogramDataset(root_dir, transform=train_transform,
         genre=genre, backbone=backbone, data=train_giaa_raw.data, map_file=map_file,
     precompute_file=os.path.join(pkl_dir, 'trainset_GIAA_dct.pkl'),
-        max_frames=16, is_train=True, **enc_kwargs)
+        max_frames=_train_max_frames, is_train=True, **enc_kwargs)
 
     val_mapfile = os.path.join(pkl_dir, 'valset_image_dct.pkl')
     val_precompute_file = os.path.join(pkl_dir, 'valset_GIAA_dct.pkl')
@@ -500,9 +501,9 @@ def load_data(args, global_trait_encoders=None, global_age_bins=None):
         backbone=backbone, data=val_giaa_raw.data, map_file=val_mapfile, precompute_file=val_precompute_file,
         max_frames=None, is_train=False, **enc_kwargs)
 
-    train_giaa_dataset = Image_PIAA_HistogramDataset(root_dir, transform=train_transform, genre=genre, backbone=backbone, data=pretrain_train_data, max_frames=16, is_train=True, **enc_kwargs)
+    train_giaa_dataset = Image_PIAA_HistogramDataset(root_dir, transform=train_transform, genre=genre, backbone=backbone, data=pretrain_train_data, max_frames=_train_max_frames, is_train=True, **enc_kwargs)
     val_giaa_dataset = Image_PIAA_HistogramDataset(root_dir, transform=test_transform, genre=genre, backbone=backbone, data=pretrain_val_data, max_frames=None, is_train=False, **enc_kwargs)
-    train_piaa_dataset = Image_PIAA_HistogramDataset(root_dir, transform=train_transform, genre=genre, backbone=backbone, data=train_piaa_dataset.data, max_frames=16, is_train=True, **enc_kwargs)
+    train_piaa_dataset = Image_PIAA_HistogramDataset(root_dir, transform=train_transform, genre=genre, backbone=backbone, data=train_piaa_dataset.data, max_frames=_train_max_frames, is_train=True, **enc_kwargs)
     val_piaa_dataset = Image_PIAA_HistogramDataset(root_dir, transform=test_transform, genre=genre, backbone=backbone, data=val_piaa_dataset.data, max_frames=None, is_train=False, **enc_kwargs)
     test_piaa_dataset = Image_PIAA_HistogramDataset(root_dir, transform=test_transform, genre=genre, backbone=backbone, data=test_piaa_dataset.data, max_frames=None, is_train=False, **enc_kwargs)
 
@@ -552,12 +553,13 @@ def load_data_giaa_only(args):
     pkl_dir = os.path.join(root_dir, 'cash', version, f'{genre}_dataset_pkl')
     ensure_dir_exists(pkl_dir)
 
+    _train_max_frames = None if backbone == 'i3d' else 16
     train_giaa_dataset = Image_GIAA_HistogramDataset(
         root_dir, transform=train_transform, genre=genre, backbone=backbone,
         data=train_giaa_raw.data,
         map_file=os.path.join(pkl_dir, 'trainset_image_dct.pkl'),
         precompute_file=os.path.join(pkl_dir, 'trainset_GIAA_dct.pkl'),
-        max_frames=16, is_train=True,
+        max_frames=_train_max_frames, is_train=True,
     )
     val_giaa_dataset = Image_GIAA_HistogramDataset(
         root_dir, transform=test_transform, genre=genre, backbone=backbone,
