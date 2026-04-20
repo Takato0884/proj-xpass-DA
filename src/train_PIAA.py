@@ -12,9 +12,10 @@ from .evaluate import evaluate_cross_domain
 from .inference import inference_finetune, evaluate_pretrain_on_val_piaa, inference_pretrain
 
 _DA_METHOD_MODULES_PIAA = {
-    'DANN':  '.methods.dann',
-    'DJDOT': '.methods.djdot',
-    'MCD':   '.methods.mcd',
+    'DANN':     '.methods.dann',
+    'DJDOT':    '.methods.djdot',
+    'MCD':      '.methods.mcd',
+    'DAREGRAM': '.methods.daregram',
 }
 
 num_attr = None  # Determined dynamically from dataset
@@ -89,7 +90,21 @@ def run_main(args):
     use_da = method_name is not None
     domain_tag = f'{genre}2{target_genre}' if use_da else genre
 
-    pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode, getattr(args, 'model_type', None), domain_tag=domain_tag, da_method=method_name)
+    # NIMA discovery: for PIAA_pretrain with DAREGRAM, the NIMA can be sourced
+    # from any other DA method or source_only via --nima_da_method.
+    nima_override = getattr(args, 'nima_da_method', None)
+    if args.piaa_mode == 'PIAA_pretrain' and nima_override:
+        if nima_override == 'source_only':
+            nima_search_tag = genre
+            nima_filter = None
+        else:
+            nima_search_tag = f'{genre}2{target_genre}' if target_genre else genre
+            nima_filter = nima_override
+    else:
+        nima_search_tag = domain_tag
+        nima_filter = method_name
+
+    pretrained_model_dict = discover_pretrained_models(args.dataset_ver, genre, args.piaa_mode, getattr(args, 'model_type', None), domain_tag=nima_search_tag, da_method=nima_filter)
     print(f"Auto-discovered pretrained models: {pretrained_model_dict}")
 
     if args.is_log:
@@ -196,6 +211,11 @@ def run_main(args):
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                     args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                     num_attr, num_pt, mcd_target_genre=target_genre)
+            elif method_name == 'DAREGRAM':
+                mod.trainer_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    num_attr, num_pt, daregram_target_genre=target_genre)
             else:  # DJDOT
                 mod.trainer_finetune(
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,

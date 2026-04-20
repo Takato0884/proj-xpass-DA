@@ -60,6 +60,18 @@ def parse_arguments(parse=True):
                         help='[MCD] Weight for the discrepancy loss in Step B (lambda in L_s - lambda * L_adv).')
     parser.add_argument('--mcd_n_steps', type=int, default=4,
                         help='[MCD] Number of Step C (generator update) repetitions per batch.')
+    # DAREGRAM-specific hyperparameters
+    parser.add_argument('--daregram_alpha_cos', type=float, default=0.1,
+                        help='[DAREGRAM] Weight for angle alignment loss L_cos.')
+    parser.add_argument('--daregram_gamma_scale', type=float, default=0.1,
+                        help='[DAREGRAM] Weight for scale alignment loss L_scale.')
+    parser.add_argument('--daregram_T', type=float, default=0.95,
+                        help='[DAREGRAM] Cumulative eigenvalue threshold for truncated pseudo-inverse.')
+    parser.add_argument('--nima_da_method', type=str, default=None,
+                        help='[DAREGRAM] DA method whose pretrained NIMA to load for PIAA_pretrain. '
+                             'E.g. "source_only" (load NIMA from models_pth/{ver}/{genre}/), '
+                             '"DANN"/"MCD"/"DJDOT" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
+                             'Only meaningful for DAREGRAM since it has no GIAA-trained NIMA of its own.')
 
     if parse:
         args = parser.parse_args()

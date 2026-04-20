@@ -361,7 +361,7 @@ def run_piaa(genre: str, trial: int = 0, resume: bool = False) -> dict:
         with open(save_path, 'w') as fp:
             json.dump(output, fp, indent=2)
 
-    pair_idx = 0
+    pair_idx = len(done_pairs_set)
     for fname in all_images:
         img_path = os.path.join(samples_dir, fname)
         img_b64 = _encode_image(img_path)
@@ -395,6 +395,7 @@ def run_piaa(genre: str, trial: int = 0, resume: bool = False) -> dict:
             )
             score = _parse_piaa_score(response.content[0].text)
             per_sample_results[fname][user_id] = score
+            done_pairs_set.add((fname, user_id))
             pair_idx += 1
             print(f"  [{pair_idx}/{n_pairs}] {fname} / user {user_id} → {score}")
 
