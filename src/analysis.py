@@ -378,6 +378,14 @@ def _aggregate_giaa(args):
         fold_set = set(args.folds)
         fold_dirs = [d for d in fold_dirs if int(d.name.split("fold")[-1]) in fold_set]
 
+    # genre が "art2fashion" のような転移ドメインの場合、フォルダはそのまま使い
+    # メトリクスのキーは source genre (genre1) を使う
+    m2 = re.match(r'^(\w+)2(\w+)$', genre)
+    if m2:
+        metric_key = m2.group(1)
+    else:
+        metric_key = genre
+
     fold_emd, fold_srocc, fold_mae, fold_ccc = [], [], [], []
 
     for fold_dir in fold_dirs:
@@ -405,9 +413,9 @@ def _aggregate_giaa(args):
             sys.exit(1)
 
         data = json.loads(matched_jsons[0].read_text())
-        m = data.get("average_metrics", {}).get(genre, {})
+        m = data.get("average_metrics", {}).get(metric_key, {})
         if not m:
-            print(f"  Warning: No average_metrics for genre '{genre}' in {matched_jsons[0].name}, skipping")
+            print(f"  Warning: No average_metrics for genre '{metric_key}' in {matched_jsons[0].name}, skipping")
             continue
 
         fold_emd.append(m["emd"]);  fold_srocc.append(m["srocc"])

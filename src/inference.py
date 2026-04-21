@@ -15,8 +15,12 @@ from .data import collate_fn
 from .train_common import num_bins
 
 
-def inference_giaa(test_dataset, args, device, model, model_path=None):
-    """GIAA-only inference: evaluate on test_images_GIAA.txt and save results to JSON."""
+def inference_giaa(test_dataset, args, device, model, model_path=None, eval_datasets_dict=None):
+    """GIAA-only inference: evaluate on test_images_GIAA.txt and save results to JSON.
+
+    eval_datasets_dict: optional dict of {target_genre: {'test': giaa_test_dataset}}
+        for cross-domain evaluation using the GIAA head.
+    """
     from .evaluate import evaluate
     from .data import collate_fn
     from .train_common import parse_da_method as _parse_da
@@ -30,6 +34,29 @@ def inference_giaa(test_dataset, args, device, model, model_path=None):
 
     print(f"[{args.genre} GIAA Test] EMD: {test_emd:.4f}  SROCC: {test_srocc:.4f}  "
           f"CCC: {test_ccc:.4f}  MSE: {test_mse:.4f}  MAE: {test_mae:.4f}")
+
+    # Cross-domain evaluation on GIAA test sets from other genres
+    cross_domain_results = {}
+    if eval_datasets_dict is not None:
+        for target_genre, ds_dict in eval_datasets_dict.items():
+            print(f"\n[Cross-Domain] Evaluating {args.genre} GIAA model on {target_genre} GIAA test set...")
+            target_test_ds = ds_dict['test']
+            target_loader = DataLoader(target_test_ds, batch_size=batch_size, shuffle=False,
+                                       num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+            cd_emd, cd_srocc, _, cd_mse, _, cd_mae, cd_ccc = evaluate(
+                model, target_loader, device, phase_name="Test")
+            cross_domain_results[target_genre] = {
+                'source_head': args.genre,
+                'average': {
+                    'emd': float(cd_emd),
+                    'srocc': float(cd_srocc),
+                    'mae': float(cd_mae),
+                    'ccc': float(cd_ccc),
+                },
+            }
+            print(f"[Cross-Domain] {args.genre} -> {target_genre}: "
+                  f"EMD={cd_emd:.4f}  SROCC={cd_srocc:.4f}  "
+                  f"CCC={cd_ccc:.4f}  MSE={cd_mse:.4f}  MAE={cd_mae:.4f}")
 
     _method_name, _tgt_genre = _parse_da(getattr(args, 'da_method', None))
     _domain_tag = f'{args.genre}2{_tgt_genre}' if _tgt_genre else args.genre
@@ -58,6 +85,8 @@ def inference_giaa(test_dataset, args, device, model, model_path=None):
             }
         },
     }
+    if cross_domain_results:
+        result_data['cross_domain_metrics'] = cross_domain_results
 
     json_path = os.path.join(save_dir, json_filename)
     with open(json_path, 'w') as f:

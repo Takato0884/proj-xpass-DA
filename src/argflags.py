@@ -36,6 +36,16 @@ def parse_arguments(parse=True):
                         help='Use GIAA-only split files (train/val/test_images_GIAA.txt). '
                              'No PIAA files required. Evaluates on GIAA test set.')
 
+    # Inference-only mode (skip training, load existing .pth and run inference)
+    parser.add_argument('--inference_only', action='store_true', default=False,
+                        help='Skip training and only run inference (save JSON). '
+                             'Auto-discovers a .pth matching {domain_tag}_{method_tag}_NIMA_*.pth '
+                             'under models_pth/{dataset_ver}/{domain_tag}/. '
+                             'Use --inference_pattern to narrow down if multiple matches exist.')
+    parser.add_argument('--inference_pattern', type=str, default=None,
+                        help='Additional substring pattern used with --inference_only to filter '
+                             'candidate .pth files (e.g. run name like "easy-plasma-7").')
+
     # Domain Adaptation
     parser.add_argument('--da_method', type=str, default=None,
                         help='Domain adaptation method and target domain. '

@@ -1,5 +1,6 @@
 import os
 import copy
+from pathlib import Path
 
 import wandb
 import torch
@@ -28,6 +29,37 @@ def _load_method(method_name):
     return source_only
 
 
+def _resolve_inference_model_path(args, domain_tag, method_tag, dirname):
+    """Find the single .pth for --inference_only mode (aggregate-style auto-discovery).
+
+    Base pattern: {domain_tag}_{method_tag}_NIMA_*.pth
+    If --inference_pattern is set, further filter by substring match on the filename
+    (anywhere in the name — not appended to the end).
+    """
+    genre_dir = Path(dirname)
+    if not genre_dir.is_dir():
+        raise FileNotFoundError(f"Model directory does not exist: {genre_dir}")
+
+    base_pattern = f"{domain_tag}_{method_tag}_NIMA_*.pth"
+    candidates = sorted(genre_dir.glob(base_pattern))
+
+    if args.inference_pattern:
+        needle = args.inference_pattern
+        candidates = [p for p in candidates if needle in p.name]
+        desc = f"'{base_pattern}' containing '{needle}'"
+    else:
+        desc = f"'{base_pattern}'"
+
+    if not candidates:
+        raise FileNotFoundError(f"No .pth matching {desc} in {genre_dir}")
+    if len(candidates) > 1:
+        names = [m.name for m in candidates]
+        raise RuntimeError(
+            f"Multiple .pth matching {desc} in {genre_dir}: {names}. "
+            f"Use --inference_pattern to narrow down.")
+    return str(candidates[0])
+
+
 def run_main(args):
     is_v_giaa = args.giaa_mode
     batch_size = args.batch_size
@@ -37,7 +69,8 @@ def run_main(args):
     method = _load_method(method_name)
     use_da = method_name is not None
     domain_tag = f'{args.genre}2{target_genre}' if use_da else args.genre
-    _backbone_abbr = {'resnet50': 'RN50', 'i3d': 'I3D', 'vit_b_16': 'ViT', 'clip_rn50': 'CLRN50'}
+    _backbone_abbr = {'resnet50': 'RN50', 'i3d': 'I3D', 'vit_b_16': 'ViT',
+                      'clip_rn50': 'CLRN50', 'clip_vit_b16': 'CLViT'}
     backbone_suffix = f'_{_backbone_abbr[args.backbone]}' if args.backbone in _backbone_abbr else ''
     method_tag = (method_name if method_name else 'Only') + backbone_suffix
 
@@ -66,6 +99,12 @@ def run_main(args):
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     components = method.setup(model, args, device)
 
+    if args.inference_only:
+        best_modelname = _resolve_inference_model_path(args, domain_tag, method_tag, dirname)
+        print(f"[inference_only] Loading model from: {best_modelname}")
+        model.load_state_dict(torch.load(best_modelname, map_location=device))
+        model.eval()
+
     if is_v_giaa:
         train_dataset, val_dataset, test_dataset = load_data_giaa_only(args)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
@@ -79,11 +118,25 @@ def run_main(args):
         tgt_loader, tgt_val_loader = _build_target_loaders_giaa_only(
             args, target_genre, batch_size, use_da)
 
-        method.trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname,
-                       components, tgt_val_loader=tgt_val_loader, tgt_genre=target_genre)
+        # Cross-domain evaluation targets (GIAA test sets from other genres)
+        ALL_GENRES = ['art', 'fashion', 'scenery']
+        eval_genres = [g for g in ALL_GENRES if g != args.genre]
+        eval_datasets_dict = {}
+        print(f"Cross-domain evaluation targets: {eval_genres}")
+        for eval_genre in eval_genres:
+            args_copy = copy.deepcopy(args)
+            args_copy.genre = eval_genre
+            _, _, eval_test_giaa = load_data_giaa_only(args_copy)
+            eval_datasets_dict[eval_genre] = {'test': eval_test_giaa}
+            print(f"Loaded {len(eval_test_giaa)} GIAA test samples for cross-domain eval genre '{eval_genre}'")
+
+        if not args.inference_only:
+            method.trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname,
+                           components, tgt_val_loader=tgt_val_loader, tgt_genre=target_genre)
 
         test_emd, test_srocc, test_mse, test_mae, test_ccc = inference_giaa(
-            test_dataset, args, device, model, model_path=best_modelname)
+            test_dataset, args, device, model, model_path=best_modelname,
+            eval_datasets_dict=eval_datasets_dict)
         if args.is_log:
             wandb.log({
                 f"{args.genre}/Test EMD GIAA": test_emd,
@@ -124,8 +177,9 @@ def run_main(args):
             eval_datasets_dict[eval_genre] = {'test': eval_test_piaa}
             print(f"Loaded {len(eval_test_piaa)} test samples for cross-domain eval genre '{eval_genre}'")
 
-        method.trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname,
-                       components, tgt_val_loader=tgt_val_loader, tgt_genre=target_genre)
+        if not args.inference_only:
+            method.trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname,
+                           components, tgt_val_loader=tgt_val_loader, tgt_genre=target_genre)
 
         inference(train_piaa_dataset, val_piaa_dataset, test_piaa_dataset,
                   args, device, model, eval_split="Val",
