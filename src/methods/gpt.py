@@ -29,6 +29,8 @@ _SAMPLES_DIR_MAP = {
     'scenery': '/home/hayashi0884/proj-xpass/data/samples/scenery_image',
 }
 
+_GENRE_IMG_EXT = {'scenery': '.jpg'}
+
 _MODEL      = "gpt-5.4"
 _MAX_TOKENS = 5000
 
@@ -336,9 +338,11 @@ def run_piaa(genre: str, trial: int = 0, resume: bool = False):
         with open(save_path, 'w') as fp:
             json.dump(output, fp, indent=2)
 
+    img_ext = _GENRE_IMG_EXT.get(genre)
     pair_idx = len(done_pairs_set)
     for fname in all_images:
-        img_path = os.path.join(samples_dir, fname)
+        img_fname = os.path.splitext(fname)[0] + img_ext if img_ext else fname
+        img_path = os.path.join(samples_dir, img_fname)
         mime = _media_type(img_path)
         b64 = _encode_image(img_path)
 

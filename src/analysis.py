@@ -54,39 +54,104 @@ def _ndcg_at_k(true_scores, pred_scores, k=10):
 
 
 def _aggregate_model(args, model_name: str):
-    """LLMモデル（Claude/Gemini等）の予測分布（期待値）を使い，全ユーザーの平均指標を出力する。"""
+    """LLMモデル（Claude/Gemini/GPT）のPIAA評価。
+
+    {genre}_piaa_results*.json の per-user 予測（ratings: [{user_id, pred_score}, ...]）を
+    用いて，他のPIAA手法（NIMA/ICI/MIR 等）と同じプロトコルで指標を計算する:
+
+      1. 各 fold の test_PIAA.txt で (user_id, sample_file) 対ごとに予測/GT を取得
+      2. ユーザー単位で SROCC / NDCG@10 / MAE / CCC を計算
+      3. ユーザーごとに fold 平均 → 全ユーザー平均と標準偏差を出力
+
+    JSON に per-user の ratings が無く pred_dist のみある場合は，従来の
+    zero-shot (期待値) フォールバックを使う。
+    """
     import csv
 
     version = args.version
     genre = args.genre
 
-    # split / ratings の場所
     data_dir = Path(getattr(args, "data_dir", None) or
                     Path(__file__).resolve().parent.parent / "data")
 
     model_dir = Path(__file__).resolve().parent.parent / "reports" / "exp" / model_name
-    matched = list(model_dir.glob(f"{genre}_results*.json"))
+    # PIAA JSON (per-user ratings)が第一候補. 無ければ GIAA JSON (pred_distのみ) を
+    # zero-shotフォールバックとして使う (後で警告を出す).
+    matched = list(model_dir.glob(f"{genre}_piaa_results*.json"))
     if not matched:
-        print(f"Error: {model_name} results not found in {model_dir} (pattern: {genre}_results*.json)", file=sys.stderr)
+        matched = list(model_dir.glob(f"{genre}_results*.json"))
+    if not matched:
+        matched = list(model_dir.glob(f"{genre}_giaa_results*.json"))
+    if not matched:
+        print(
+            f"Error: {model_name} results not found in {model_dir} "
+            f"(pattern: {genre}_piaa_results*.json / {genre}_giaa_results*.json)",
+            file=sys.stderr,
+        )
         sys.exit(1)
     model_json = matched[0]
 
-    # ── 1. モデル予測の読み込み (期待値: 0-indexed bins → 0–6) ──────────────
     with open(model_json) as f:
-        claude_data = json.load(f)
+        llm_data = json.load(f)
 
-    pred_score = {}       # {sample_file (as stored in JSON): expected_score}
-    pred_score_stem = {}  # {stem (no ext): expected_score}  for cross-ext matching
-    for entry in claude_data["per_sample"]:
-        dist = entry["pred_dist"]
-        e = sum(i * p for i, p in enumerate(dist))  # bins 0-6
+    # per-user 予測があれば PIAA モード，無ければ pred_dist 期待値で zero-shot
+    per_user_pred = {}       # {(uid_str, sample_file): pred_score}
+    per_user_pred_stem = {}  # {(uid_str, stem): pred_score}  cross-ext マッチ用
+    fallback_pred = {}       # {sample_file: expected_score}
+    fallback_pred_stem = {}  # {stem: expected_score}
+    n_user_preds = 0
+    for entry in llm_data["per_sample"]:
         sf = entry["sample_file"]
-        pred_score[sf] = e
-        pred_score_stem[Path(sf).stem] = e
+        stem = Path(sf).stem
+        ratings = entry.get("ratings")
+        if ratings:
+            for r in ratings:
+                uid = str(r["user_id"])
+                p = float(r["pred_score"])
+                per_user_pred[(uid, sf)] = p
+                per_user_pred_stem[(uid, stem)] = p
+                n_user_preds += 1
+        dist = entry.get("pred_dist")
+        if dist:
+            e = sum(i * p for i, p in enumerate(dist))
+            fallback_pred[sf] = e
+            fallback_pred_stem[stem] = e
 
-    print(f"Loaded {len(pred_score)} {model_name} predictions  (genre='{genre}')")
+    piaa_mode = n_user_preds > 0
+    if piaa_mode:
+        print(
+            f"Loaded {n_user_preds} per-user {model_name} predictions "
+            f"over {len(llm_data['per_sample'])} samples  (genre='{genre}')"
+        )
+    else:
+        if not fallback_pred:
+            print(
+                f"Error: {model_json.name} has neither per-user ratings nor pred_dist",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(
+            f"[WARN] No per-user ratings in {model_json.name}; "
+            f"falling back to zero-shot (pred_dist expected value). "
+            f"Note: this is NOT a fair PIAA comparison — "
+            f"generate {genre}_piaa_results.json for per-user predictions.",
+            file=sys.stderr,
+        )
+        print(
+            f"Loaded {len(fallback_pred)} {model_name} pred_dist predictions "
+            f"(zero-shot fallback)  (genre='{genre}')"
+        )
 
-    # ── 2. Ground truth ratings の読み込み ───────────────────────────────────
+    def _lookup_pred(uid, sf):
+        if piaa_mode:
+            if (uid, sf) in per_user_pred:
+                return per_user_pred[(uid, sf)]
+            stem = Path(sf).stem
+            return per_user_pred_stem.get((uid, stem))
+        if sf in fallback_pred:
+            return fallback_pred[sf]
+        return fallback_pred_stem.get(Path(sf).stem)
+
     ratings_path = data_dir / "maked" / "ratings.csv"
     if not ratings_path.exists():
         print(f"Error: ratings.csv not found: {ratings_path}", file=sys.stderr)
@@ -105,7 +170,6 @@ def _aggregate_model(args, model_name: str):
 
     print(f"Loaded {len(gt_scores)} ground-truth ratings  (genre='{genre}')")
 
-    # ── 3. fold ディレクトリの検索 ────────────────────────────────────────────
     split_dir = data_dir / "split"
     fold_dirs = sorted(split_dir.glob(f"{version}_fold*"))
     if not fold_dirs:
@@ -125,11 +189,12 @@ def _aggregate_model(args, model_name: str):
             print(f"Error: No matching fold directories for folds {args.folds}", file=sys.stderr)
             sys.exit(1)
 
-    # ── 4. fold ごとにユーザー指標を計算 ─────────────────────────────────────
     all_user_mae   = {}  # {user_id: [mae per fold]}
     all_user_ndcg  = {}
     all_user_srocc = {}
     all_user_ccc   = {}
+
+    skipped_missing_pred = 0
 
     for fold_dir in fold_dirs:
         test_file = fold_dir / genre / "test_PIAA.txt"
@@ -137,7 +202,6 @@ def _aggregate_model(args, model_name: str):
             print(f"  Warning: {test_file} not found, skipping")
             continue
 
-        # test_PIAA.txt: user_id<TAB>sample_file
         user_test: dict = {}
         with open(test_file) as f:
             for line in f:
@@ -151,14 +215,10 @@ def _aggregate_model(args, model_name: str):
         for uid, sample_files in user_test.items():
             preds, gts = [], []
             for sf in sample_files:
-                # exact match まず試み，なければ stem で検索（scenery: .mp4 vs .jpg）
-                if sf in pred_score:
-                    p = pred_score[sf]
-                else:
-                    stem = Path(sf).stem
-                    if stem not in pred_score_stem:
-                        continue
-                    p = pred_score_stem[stem]
+                p = _lookup_pred(uid, sf)
+                if p is None:
+                    skipped_missing_pred += 1
+                    continue
                 key = (uid, sf)
                 if key not in gt_scores:
                     continue
@@ -189,7 +249,6 @@ def _aggregate_model(args, model_name: str):
         print("Error: No user metrics computed.", file=sys.stderr)
         sys.exit(1)
 
-    # ── 5. ユーザーごとの fold 平均 → 全体平均 ───────────────────────────────
     user_avg_mae   = [sum(v) / len(v) for v in all_user_mae.values()]
     user_avg_ndcg  = [sum(v) / len(v) for v in all_user_ndcg.values()]
     user_avg_srocc = [sum(v) / len(v) for v in all_user_srocc.values()]
@@ -207,9 +266,13 @@ def _aggregate_model(args, model_name: str):
     std_srocc = math.sqrt(sum((x - avg_srocc) ** 2 for x in user_avg_srocc) / n_users)
     std_ccc   = math.sqrt(sum((x - avg_ccc)   ** 2 for x in user_avg_ccc)   / n_users)
 
-    print(f"\n=== {model_name.capitalize()} Zero-Shot Results ({version}, {genre}) ===")
+    mode_tag = "PIAA" if piaa_mode else "Zero-Shot"
+    print(f"\n=== {model_name.capitalize()} {mode_tag} Results ({version}, {genre}) ===")
+    print(f"  Source:          {model_json.name}")
     print(f"  Folds:           {len(fold_dirs)}")
     print(f"  Total users:     {n_users}")
+    if skipped_missing_pred:
+        print(f"  Pairs skipped (no LLM prediction): {skipped_missing_pred}")
     print(f"  Average MAE:     {avg_mae:.6f} (std: {std_mae:.6f})")
     print(f"  Average NDCG@10: {avg_ndcg:.6f} (std: {std_ndcg:.6f})")
     print(f"  Average SROCC:   {avg_srocc:.6f} (std: {std_srocc:.6f})")
@@ -226,9 +289,15 @@ def _aggregate_model_giaa(args, model_name: str):
                     Path(__file__).resolve().parent.parent / "data")
 
     model_dir = Path(__file__).resolve().parent.parent / "reports" / "exp" / model_name
-    matched = list(model_dir.glob(f"{genre}_results*.json"))
+    matched = list(model_dir.glob(f"{genre}_giaa_results*.json"))
     if not matched:
-        print(f"Error: {model_name} results not found in {model_dir} (pattern: {genre}_results*.json)", file=sys.stderr)
+        matched = list(model_dir.glob(f"{genre}_results*.json"))
+    if not matched:
+        print(
+            f"Error: {model_name} GIAA results not found in {model_dir} "
+            f"(pattern: {genre}_giaa_results*.json)",
+            file=sys.stderr,
+        )
         sys.exit(1)
     model_json = matched[0]
 
@@ -387,6 +456,11 @@ def _aggregate_giaa(args):
         metric_key = genre
 
     fold_emd, fold_srocc, fold_mae, fold_ccc = [], [], [], []
+    cd_emd: dict = {}
+    cd_srocc: dict = {}
+    cd_mae: dict = {}
+    cd_ccc: dict = {}
+    cd_source_head: dict = {}
 
     for fold_dir in fold_dirs:
         genre_dir = fold_dir / genre
@@ -423,6 +497,19 @@ def _aggregate_giaa(args):
         print(f"  Loaded: {matched_jsons[0].relative_to(reports_dir)}  "
               f"EMD={m['emd']:.4f}  SROCC={m['srocc']:.4f}  CCC={m['ccc']:.4f}")
 
+        # クロスドメイン結果の収集
+        cross_domain = data.get("cross_domain_metrics", {})
+        for target_genre, cd_data in cross_domain.items():
+            avg = cd_data.get("average", {})
+            if not avg:
+                continue
+            cd_emd.setdefault(target_genre, []).append(avg["emd"])
+            cd_srocc.setdefault(target_genre, []).append(avg["srocc"])
+            cd_mae.setdefault(target_genre, []).append(avg["mae"])
+            cd_ccc.setdefault(target_genre, []).append(avg["ccc"])
+            if "source_head" in cd_data:
+                cd_source_head[target_genre] = cd_data["source_head"]
+
     if not fold_emd:
         print("Error: No fold metrics found.", file=sys.stderr)
         sys.exit(1)
@@ -443,6 +530,24 @@ def _aggregate_giaa(args):
     print(f"  Average SROCC:   {avg_srocc:.6f} (std: {std_srocc:.6f})")
     print(f"  Average MAE:     {avg_mae:.6f} (std: {std_mae:.6f})")
     print(f"  Average CCC:     {avg_ccc:.6f} (std: {std_ccc:.6f})")
+
+    # クロスドメイン結果の出力
+    if cd_emd:
+        print(f"\n  --- Cross-Domain (GIAA) ---")
+        for target_genre in sorted(cd_emd.keys()):
+            if not cd_emd[target_genre]:
+                continue
+            cavg_emd,   cstd_emd   = _stats(cd_emd[target_genre])
+            cavg_srocc, cstd_srocc = _stats(cd_srocc[target_genre])
+            cavg_mae,   cstd_mae   = _stats(cd_mae[target_genre])
+            cavg_ccc,   cstd_ccc   = _stats(cd_ccc[target_genre])
+            src = cd_source_head.get(target_genre, metric_key)
+            print(f"  [{src} -> {target_genre}]")
+            print(f"    Folds:           {len(cd_emd[target_genre])}")
+            print(f"    Average EMD:     {cavg_emd:.6f} (std: {cstd_emd:.6f})")
+            print(f"    Average SROCC:   {cavg_srocc:.6f} (std: {cstd_srocc:.6f})")
+            print(f"    Average MAE:     {cavg_mae:.6f} (std: {cstd_mae:.6f})")
+            print(f"    Average CCC:     {cavg_ccc:.6f} (std: {cstd_ccc:.6f})")
 
 
 def _aggregate_claude(args):

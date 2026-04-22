@@ -131,6 +131,9 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=args.lr_decay_factor, patience=args.lr_patience)
 
+    alpha = getattr(args, 'djdot_alpha', 0.001)
+    lambda_t = getattr(args, 'djdot_lambda_t', 0.0001)
+
     best_val_emd = float('inf')
     patience     = 0
     global_step  = 0
@@ -142,12 +145,16 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
             epoch=epoch, global_step=global_step)
         global_step = metrics['global_step']
 
+        total_loss = metrics['train_emd'] + alpha * metrics['feat_loss'] + lambda_t * metrics['label_loss']
+        L_s_ratio = metrics['train_emd'] / total_loss if total_loss > 0 else 0.0
+
         if args.is_log:
             wandb.log({
                 "epoch": epoch,
                 f"{args.genre}/Train EMD GIAA":        metrics['train_emd'],
                 f"{args.genre}/Train Feature Loss":    metrics['feat_loss'],
                 f"{args.genre}/Train Label Loss":      metrics['label_loss'],
+                f"{args.genre}/Train L_s Ratio":       L_s_ratio,
             }, commit=False)
 
         val_emd, val_srocc, _, val_mse, _, _, val_ccc = evaluate(
@@ -333,10 +340,16 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     best_state_dict = None
     scaler = GradScaler('cuda')
 
+    alpha = getattr(args, 'djdot_alpha', 0.001)
+    lambda_t = getattr(args, 'djdot_lambda_t', 0.0001)
+
     for epoch in range(args.num_epochs):
         L_y, L_feat, L_label, global_step = _train_one_epoch_piaa(
             model, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
             epoch=epoch, global_step=global_step, desc_suffix=" pretrain")
+
+        total_loss = L_y + alpha * L_feat + lambda_t * L_label
+        L_y_ratio = L_y / total_loss if total_loss > 0 else 0.0
 
         if args.is_log:
             wandb.log({
@@ -344,6 +357,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train Loss": L_y,
                 f"{genre}/Train Feature Loss": L_feat,
                 f"{genre}/Train Label Loss": L_label,
+                f"{genre}/Train L_y Ratio": L_y_ratio,
             }, commit=False)
 
         genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
@@ -484,6 +498,9 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model_user.parameters()), lr=args.lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
+        alpha = getattr(args, 'djdot_alpha', 0.001)
+        lambda_t = getattr(args, 'djdot_lambda_t', 0.0001)
+
         best_val_ccc = -float('inf')
         patience = 0
         global_step = 0
@@ -495,6 +512,9 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 model_user, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
                 epoch=epoch, global_step=global_step, desc_suffix=" finetune")
 
+            total_loss = L_y + alpha * L_feat + lambda_t * L_label
+            L_y_ratio = L_y / total_loss if total_loss > 0 else 0.0
+
             genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
 
@@ -505,6 +525,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 log_dict[f"{genre}/Train Loss user_{uid}"] = L_y
                 log_dict[f"{genre}/Train Feature Loss user_{uid}"] = L_feat
                 log_dict[f"{genre}/Train Label Loss user_{uid}"] = L_label
+                log_dict[f"{genre}/Train L_y Ratio user_{uid}"] = L_y_ratio
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
                     log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']

@@ -516,10 +516,21 @@ python -m src.inference --genre art --pattern "*NIMA*" --force
 
 ### fold結果の集約（aggregate）
 
-クロスバリデーション実験において、各foldのJSONファイルを集約し全ユーザーの平均SROCC/NDCGを出力します。
+クロスバリデーション実験において、各foldのJSONファイルを集約し、指標（PIAA: SROCC / NDCG@10 / MAE / CCC, GIAA: EMD / SROCC / MAE / CCC）をfold平均・全ユーザー平均で出力します。`--genre` 以外のターゲットドメインに対する **クロスドメイン評価結果** が推論JSONに含まれていれば、そちらも自動的に集約・表示されます。
+
+以下の4モードに対応しています（`--pattern` と `--giaa_mode` で切り替え）:
+
+| モード | 切り替え方 | 入力JSON | 出力指標 |
+|--------|-----------|----------|----------|
+| **PIAA / NN** (デフォルト) | `--pattern finetune` 等 | `reports/exp/{version}_fold*/{genre}/*.json` の `per_user_metrics` / `cross_domain_metrics` | SROCC / NDCG@10 / MAE / CCC |
+| **GIAA / NN** | `--giaa_mode` | 同上の `average_metrics` / `cross_domain_metrics` (`mode: "GIAA"` のJSONのみ) | EMD / SROCC / MAE / CCC |
+| **PIAA / LLM** | `--pattern claude \| gemini \| gpt` | `reports/exp/{model}/{genre}_piaa_results*.json`（per-user `ratings`）。無ければ `{genre}_results*.json` の `pred_dist` に zero-shot フォールバック | SROCC / NDCG@10 / MAE / CCC |
+| **GIAA / LLM** | `--pattern claude\|gemini\|gpt --giaa_mode` | `reports/exp/{model}/{genre}_giaa_results*.json`（または `{genre}_results*.json`）を `test_images_GIAA.txt` と画像単位平均GTで評価 | EMD / SROCC / MAE / CCC |
+
+`--genre` には `art2fashion`（転移ドメインfold）や `art-scenery`（複数サブジャンル）形式も指定できます。
 
 ```bash
-# v3の全foldからICI結果を集約
+# PIAA/NN: v3の全foldからICI finetune結果を集約
 python src/analysis.py aggregate \
   --version v3 \
   --genre art \
@@ -533,12 +544,46 @@ python src/analysis.py aggregate \
   --pattern finetune \
   --folds 0 2 4
 
-# run ID 61以降のファイルのみ集約
+# run ID 61〜80のファイルのみ集約
 python src/analysis.py aggregate \
   --version v3 \
   --genre art \
   --pattern finetune \
-  --min-id 61
+  --min-id 61 --max-id 80
+
+# 特定のrun IDだけ集約
+python src/analysis.py aggregate \
+  --version v3 \
+  --genre art \
+  --pattern finetune \
+  --ids 61 65 70
+
+# GIAA/NN: GIAA JSONのaverage_metricsを集約（クロスドメインも自動出力）
+python src/analysis.py aggregate \
+  --version v_giaa \
+  --genre art \
+  --pattern NIMA \
+  --giaa_mode
+
+# 転移ドメインfold（art→fashionのGIAA）
+python src/analysis.py aggregate \
+  --version v_giaa \
+  --genre art2fashion \
+  --pattern DANN \
+  --giaa_mode
+
+# PIAA/LLM: Claudeの per-user ratings を他のPIAA手法と同一プロトコルで評価
+python src/analysis.py aggregate \
+  --version v3 \
+  --genre art \
+  --pattern claude
+
+# GIAA/LLM: GPTのGIAA (pred_dist) を test_images_GIAA.txt で評価
+python src/analysis.py aggregate \
+  --version v_giaa \
+  --genre art \
+  --pattern gpt \
+  --giaa_mode
 ```
 
 #### オプション引数一覧
@@ -546,12 +591,16 @@ python src/analysis.py aggregate \
 | 引数 | 型 | デフォルト | 説明 |
 |------|------|------|------|
 | `--version` | str | (必須) | データセットバージョン（例: `v3`）— `v3_fold*` ディレクトリを検索 |
-| `--genre` | str | (必須) | 分析対象のジャンル（例: `art`, `scenery`） |
-| `--pattern` | str | `""` | JSONファイルを絞り込むglobパターン（例: `pretrain`, `finetune`） |
-| `--method` | str | なし | JSONファイルをさらに絞り込むメソッド名（例: `ICI`） |
+| `--genre` | str | (必須) | 分析対象のジャンル。`art` / `scenery` / `art2fashion`（転移fold）/ `art-scenery`（複数サブジャンル）も可 |
+| `--pattern` | str | `""` | JSONファイルを絞り込むglobパターン（例: `pretrain`, `finetune`）。`claude` / `gemini` / `gpt` を指定するとLLMモードに切り替わる |
+| `--method` | str | なし | JSONファイルをさらに絞り込むメソッド名（例: `ICI`, `MIR`, `NIMA`） |
 | `--folds` | list | なし | 集約対象のfoldインデックス（例: `--folds 0 2 4`）。省略時は全fold |
+| `--ids` | list | なし | 集約対象のrun IDを明示指定（例: `--ids 61 65 70`）。指定したIDのファイルのみ対象 |
 | `--min-id` | int | なし | 集約対象のrun IDの下限（例: `61` → `name-61_*.json` 以降のみ対象） |
+| `--max-id` | int | なし | 集約対象のrun IDの上限（例: `80` → `name-80_*.json` 以前のみ対象） |
+| `--giaa_mode` | flag | `False` | GIAA JSON（`mode: "GIAA"`）の `average_metrics` を集約する。LLMの場合は `{genre}_giaa_results.json` を `test_images_GIAA.txt` で評価 |
 | `--reports_dir` | str | `reports/exp` | JSONファイルの検索ディレクトリ |
+| `--data_dir` | str | `<project_root>/data` | `split/` と `maked/` を含むデータディレクトリ（LLMモードで使用） |
 
 ### 特徴量の2D可視化（visualize_features）
 
