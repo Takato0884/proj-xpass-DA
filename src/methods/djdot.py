@@ -147,6 +147,8 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
 
         total_loss = metrics['train_emd'] + alpha * metrics['feat_loss'] + lambda_t * metrics['label_loss']
         L_s_ratio = metrics['train_emd'] / total_loss if total_loss > 0 else 0.0
+        align_total = alpha * metrics['feat_loss'] + lambda_t * metrics['label_loss']
+        L_feat_ratio = (alpha * metrics['feat_loss']) / align_total if align_total > 0 else 0.0
 
         if args.is_log:
             wandb.log({
@@ -155,6 +157,7 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
                 f"{args.genre}/Train Feature Loss":    metrics['feat_loss'],
                 f"{args.genre}/Train Label Loss":      metrics['label_loss'],
                 f"{args.genre}/Train L_s Ratio":       L_s_ratio,
+                f"{args.genre}/Train L_feat Ratio":    L_feat_ratio,
             }, commit=False)
 
         val_emd, val_srocc, _, val_mse, _, _, val_ccc = evaluate(
@@ -350,6 +353,8 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
 
         total_loss = L_y + alpha * L_feat + lambda_t * L_label
         L_y_ratio = L_y / total_loss if total_loss > 0 else 0.0
+        align_total = alpha * L_feat + lambda_t * L_label
+        L_feat_ratio = (alpha * L_feat) / align_total if align_total > 0 else 0.0
 
         if args.is_log:
             wandb.log({
@@ -358,6 +363,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train Feature Loss": L_feat,
                 f"{genre}/Train Label Loss": L_label,
                 f"{genre}/Train L_y Ratio": L_y_ratio,
+                f"{genre}/Train L_feat Ratio": L_feat_ratio,
             }, commit=False)
 
         genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
@@ -514,6 +520,8 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
 
             total_loss = L_y + alpha * L_feat + lambda_t * L_label
             L_y_ratio = L_y / total_loss if total_loss > 0 else 0.0
+            align_total = alpha * L_feat + lambda_t * L_label
+            L_feat_ratio = (alpha * L_feat) / align_total if align_total > 0 else 0.0
 
             genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
@@ -526,6 +534,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 log_dict[f"{genre}/Train Feature Loss user_{uid}"] = L_feat
                 log_dict[f"{genre}/Train Label Loss user_{uid}"] = L_label
                 log_dict[f"{genre}/Train L_y Ratio user_{uid}"] = L_y_ratio
+                log_dict[f"{genre}/Train L_feat Ratio user_{uid}"] = L_feat_ratio
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
                     log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
