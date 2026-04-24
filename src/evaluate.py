@@ -157,7 +157,7 @@ def evaluate_piaa(model, dataloaders_dict, device, epoch: int = None, phase_name
         model._eval_component_stats[genre] = {
             'interaction_mean': i_mean,
             'direct_mean': d_mean,
-            'ratio': i_mean / d_mean if d_mean > 0 else 0.0,
+            'ratio': i_mean / (i_mean + d_mean) if (i_mean + d_mean) > 0 else 0.0,
         }
 
     progress_bar.close()

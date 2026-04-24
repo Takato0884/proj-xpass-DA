@@ -244,8 +244,6 @@ class PIAA_ICI_CrossDomain(nn.Module):
         self.node_attr_img = MLP(num_attr + input_dim, hidden_size, num_attr * input_dim, dropout=_dropout)
 
         self.attr_corr = nn.Linear(input_dim, 1)
-        nn.init.zeros_(self.attr_corr.weight)
-        nn.init.zeros_(self.attr_corr.bias)
 
         self.backbone_image_proj = nn.ModuleDict()
         for genre in genres:
@@ -339,9 +337,6 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.interaction_fc_dict = nn.ModuleDict()
         for genre in genres:
             self.interaction_fc_dict[genre] = nn.Linear(interaction_input_dim, 1)
-        for genre in genres:
-            nn.init.zeros_(self.interaction_fc_dict[genre].weight)
-            nn.init.zeros_(self.interaction_fc_dict[genre].bias)
 
     def freeze_backbone(self):
         for genre, nima in self.nima_dict.items():
