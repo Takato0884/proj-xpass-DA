@@ -332,10 +332,12 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
                 log_dict = {"epoch": epoch}
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
+                    log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
                     log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
                 if tgt_genre_metrics is not None and genre in tgt_genre_metrics:
                     tgt_m = tgt_genre_metrics[genre]
                     log_dict[f"{tgt_genre}/Val MAE user_{uid}"] = tgt_m['mae']
+                    log_dict[f"{tgt_genre}/Val SROCC user_{uid}"] = tgt_m['srocc']
                     log_dict[f"{tgt_genre}/Val CCC user_{uid}"] = tgt_m['ccc']
                 wandb.log(log_dict, commit=True)
 
@@ -354,5 +356,3 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
                 if patience >= args.max_patience_epochs:
                     print(f"User {uid}: early stopping at epoch {epoch}")
                     break
-
-    model.load_state_dict(torch.load(best_modelname))

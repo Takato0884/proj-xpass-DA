@@ -670,10 +670,12 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 log_dict[f"{genre}/Train adv_ratio user_{uid}"]  = adv_ratio
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
+                    log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
                     log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
                 if genre in tgt_genre_metrics:
                     tgt_m = tgt_genre_metrics[genre]
                     log_dict[f"{mcd_target_genre}/Val MAE user_{uid}"] = tgt_m['mae']
+                    log_dict[f"{mcd_target_genre}/Val SROCC user_{uid}"] = tgt_m['srocc']
                     log_dict[f"{mcd_target_genre}/Val CCC user_{uid}"] = tgt_m['ccc']
                 wandb.log(log_dict, commit=True)
 
