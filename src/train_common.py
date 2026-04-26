@@ -244,6 +244,7 @@ class PIAA_ICI_CrossDomain(nn.Module):
         self.node_attr_img = MLP(num_attr + input_dim, hidden_size, num_attr * input_dim, dropout=_dropout)
 
         self.attr_corr = nn.Linear(input_dim, 1)
+        self.direct_fc = nn.Linear(num_bins, 1)
 
         self.backbone_image_proj = nn.ModuleDict()
         for genre in genres:
@@ -301,8 +302,9 @@ class PIAA_ICI_CrossDomain(nn.Module):
 
         I_ij = torch.sum(fused_features_img, dim=1, keepdim=False) + torch.sum(fused_features_user, dim=1, keepdim=False)
         interaction_outputs = self.attr_corr(I_ij)
-        bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
-        direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
+        # bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
+        # direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
+        direct_outputs = self.direct_fc(prob)
         self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
         self._last_direct_mean = direct_outputs.detach().abs().mean().item()
         if return_feat:
@@ -337,6 +339,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.interaction_fc_dict = nn.ModuleDict()
         for genre in genres:
             self.interaction_fc_dict[genre] = nn.Linear(interaction_input_dim, 1)
+        self.direct_fc = nn.Linear(num_bins, 1)
 
     def freeze_backbone(self):
         for genre, nima in self.nima_dict.items():
@@ -376,8 +379,9 @@ class PIAA_MIR_CrossDomain(nn.Module):
         I_ij = A_ij.view(images.size(0), -1)
 
         interaction_outputs = self.interaction_fc_dict[genre](I_ij)
-        bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
-        direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
+        # bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
+        # direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
+        direct_outputs = self.direct_fc(prob)
         self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
         self._last_direct_mean = direct_outputs.detach().abs().mean().item()
         return interaction_outputs + direct_outputs
