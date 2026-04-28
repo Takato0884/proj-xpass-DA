@@ -317,7 +317,7 @@ class PIAA_ICI_CrossDomain(nn.Module):
 
 
 class PIAA_MIR_CrossDomain(nn.Module):
-    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=1024, dropout=None, use_da=False):
+    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=256, dropout=None, use_da=False):
         super(PIAA_MIR_CrossDomain, self).__init__()
         self.num_bins = num_bins
         self.num_attr = num_attr
@@ -330,20 +330,19 @@ class PIAA_MIR_CrossDomain(nn.Module):
             backbone_type = backbone_dict.get(genre, 'resnet50')
             self.nima_dict[genre] = NIMA(num_bins, backbone_type)
 
-        self.backbone_image_proj = nn.ModuleDict()
-        for genre in genres:
-            backbone_type = backbone_dict.get(genre, 'resnet50')
-            in_dim = _BACKBONE_OUT_DIM[backbone_type]
-            self.backbone_image_proj[genre] = nn.Sequential(
-                nn.Linear(in_dim, hidden_size),
-                nn.ReLU(),
-                nn.Linear(hidden_size, input_dim),
-            )
+        primary_backbone = backbone_dict.get(genres[0], 'resnet50')
+        in_dim = _BACKBONE_OUT_DIM[primary_backbone]
+        self.backbone_image_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, input_dim),
+        )
 
         interaction_input_dim = (num_attr + input_dim) * num_pt
-        self.interaction_fc_dict = nn.ModuleDict()
-        for genre in genres:
-            self.interaction_fc_dict[genre] = nn.Linear(interaction_input_dim, 1)
+        _dropout = dropout if dropout else 0.0
+        self.interaction_mlp = MLP(
+            interaction_input_dim, 512, input_dim, dropout=_dropout)
+        self.attr_corr = nn.Linear(input_dim, 1)
         if not use_da:
             self.direct_fc = nn.Linear(num_bins, 1)
 
@@ -378,13 +377,14 @@ class PIAA_MIR_CrossDomain(nn.Module):
         logit, _, raw_feat = self.nima_dict[genre](images, return_feat=True)
         prob = F.softmax(logit, dim=1)
 
-        img_feat = self.backbone_image_proj[genre](raw_feat)
+        img_feat = self.backbone_image_proj(raw_feat)
         img_input = torch.cat([image_attributes, img_feat], dim=1)
 
         A_ij = img_input.unsqueeze(2) * personal_traits.unsqueeze(1)
-        I_ij = A_ij.view(images.size(0), -1)
+        A_flat = A_ij.view(images.size(0), -1)
 
-        interaction_outputs = self.interaction_fc_dict[genre](I_ij)
+        I_ij = self.interaction_mlp(A_flat)
+        interaction_outputs = self.attr_corr(I_ij)
         if self.use_da:
             bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
             direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
