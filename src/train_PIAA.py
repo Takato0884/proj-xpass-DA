@@ -260,40 +260,66 @@ if __name__ == '__main__':
         if not any(a.startswith('--batch_size') for a in sys.argv[1:]):
             args.batch_size = 8
 
-    if args.dataset_ver.endswith('_all'):
-        version_prefix = args.dataset_ver[:-4]
-        folds = discover_folds(args.root_dir, version_prefix)
-        if not folds:
-            raise ValueError(f"No fold directories found for version '{version_prefix}' in {os.path.join(args.root_dir, 'split')}")
-        print(f"Running all {len(folds)} folds sequentially: {folds}")
-        for i, fold in enumerate(folds):
-            if i + 1 < args.start_fold:
-                print(f"Skipping fold {i+1}/{len(folds)}: {fold} (start_fold={args.start_fold})")
-                continue
-            print(f"\n{'='*60}")
-            print(f"  Fold {i+1}/{len(folds)}: {fold}")
-            print(f"{'='*60}\n")
-            args_fold = copy.deepcopy(args)
-            args_fold.dataset_ver = fold
-            run_main(args_fold)
+    ALL_GENRES = ['art', 'fashion', 'scenery']
+    if args.genre == 'all':
+        source_genres = list(ALL_GENRES)
+        print(f"--genre all: running sources sequentially: {source_genres}")
     else:
-        models_base = 'models_pth'
-        fold_dirs = sorted([
-            d for d in os.listdir(models_base)
-            if d.startswith(f'{args.dataset_ver}_fold') and os.path.isdir(os.path.join(models_base, d))
-        ]) if os.path.exists(models_base) else []
+        source_genres = [args.genre]
+    base_da_method = args.da_method
 
-        if fold_dirs:
-            print(f"models_pth/{args.dataset_ver}/ not found. Running fold structure: {fold_dirs}")
-            for i, fold in enumerate(fold_dirs):
-                if i + 1 < args.start_fold:
-                    print(f"Skipping fold {i+1}/{len(fold_dirs)}: {fold} (start_fold={args.start_fold})")
-                    continue
-                print(f"\n{'='*60}")
-                print(f"  Fold {i+1}/{len(fold_dirs)}: {fold}")
-                print(f"{'='*60}\n")
-                args_fold = copy.deepcopy(args)
-                args_fold.dataset_ver = fold
-                run_main(args_fold)
+    for source in source_genres:
+        args_src = copy.deepcopy(args)
+        args_src.genre = source
+        if len(source_genres) > 1:
+            print(f"\n{'@'*60}\n  Source genre: {source}\n{'@'*60}\n")
+
+        if base_da_method and '-' not in base_da_method:
+            target_genres = [g for g in ALL_GENRES if g != source]
+            print(f"Bare --da_method '{base_da_method}': running targets sequentially: {target_genres}")
         else:
-            run_main(args)
+            target_genres = [None]
+
+        for target in target_genres:
+            args_outer = copy.deepcopy(args_src)
+            if target is not None:
+                args_outer.da_method = f'{base_da_method}-{target}'
+                print(f"\n{'#'*60}\n  Target genre: {target}  (da_method={args_outer.da_method})\n{'#'*60}\n")
+
+            if args_outer.dataset_ver.endswith('_all'):
+                version_prefix = args_outer.dataset_ver[:-4]
+                folds = discover_folds(args_outer.root_dir, version_prefix)
+                if not folds:
+                    raise ValueError(f"No fold directories found for version '{version_prefix}' in {os.path.join(args_outer.root_dir, 'split')}")
+                print(f"Running all {len(folds)} folds sequentially: {folds}")
+                for i, fold in enumerate(folds):
+                    if i + 1 < args_outer.start_fold:
+                        print(f"Skipping fold {i+1}/{len(folds)}: {fold} (start_fold={args_outer.start_fold})")
+                        continue
+                    print(f"\n{'='*60}")
+                    print(f"  Fold {i+1}/{len(folds)}: {fold}")
+                    print(f"{'='*60}\n")
+                    args_fold = copy.deepcopy(args_outer)
+                    args_fold.dataset_ver = fold
+                    run_main(args_fold)
+            else:
+                models_base = 'models_pth'
+                fold_dirs = sorted([
+                    d for d in os.listdir(models_base)
+                    if d.startswith(f'{args_outer.dataset_ver}_fold') and os.path.isdir(os.path.join(models_base, d))
+                ]) if os.path.exists(models_base) else []
+
+                if fold_dirs:
+                    print(f"models_pth/{args_outer.dataset_ver}/ not found. Running fold structure: {fold_dirs}")
+                    for i, fold in enumerate(fold_dirs):
+                        if i + 1 < args_outer.start_fold:
+                            print(f"Skipping fold {i+1}/{len(fold_dirs)}: {fold} (start_fold={args_outer.start_fold})")
+                            continue
+                        print(f"\n{'='*60}")
+                        print(f"  Fold {i+1}/{len(fold_dirs)}: {fold}")
+                        print(f"{'='*60}\n")
+                        args_fold = copy.deepcopy(args_outer)
+                        args_fold.dataset_ver = fold
+                        run_main(args_fold)
+                else:
+                    run_main(args_outer)
