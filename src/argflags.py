@@ -71,9 +71,9 @@ def parse_arguments(parse=True):
     parser.add_argument('--mcd_n_steps', type=int, default=4,
                         help='[MCD] Number of Step C (generator update) repetitions per batch.')
     # DAREGRAM-specific hyperparameters
-    parser.add_argument('--daregram_alpha_cos', type=float, default=0.1,
+    parser.add_argument('--daregram_alpha_cos', type=float, default=0.01,
                         help='[DAREGRAM] Weight for angle alignment loss L_cos.')
-    parser.add_argument('--daregram_gamma_scale', type=float, default=0.1,
+    parser.add_argument('--daregram_gamma_scale', type=float, default=0.01,
                         help='[DAREGRAM] Weight for scale alignment loss L_scale.')
     parser.add_argument('--daregram_T', type=float, default=0.95,
                         help='[DAREGRAM] Cumulative eigenvalue threshold for truncated pseudo-inverse.')
