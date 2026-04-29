@@ -210,7 +210,7 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
                            epoch=None, global_step=0, desc_suffix=""):
     """DeepJDOT 1エポック学習（pretrain / finetune 共通）。
     ラベルコスト: (score_s_i - score_t_j)^2（スカラー回帰）
-    特徴量: I_ij（model.forward return_feat=True で取得、ICI専用）
+    特徴量: I_ij（model.forward return_feat=True で取得、ICI/MIR 共通）
     """
     from torch.amp import autocast
     model.train()
@@ -289,7 +289,7 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
 def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
                      experiment_name, backbone_dict, pretrained_model_dict, num_attr, num_pt,
                      domain_tag=None):
-    """DeepJDOT pretrain trainer for PIAA（ICI のみ）。
+    """DeepJDOT pretrain trainer for PIAA（ICI / MIR 対応）。
     ソース: train_giaa_dataset でタスク学習 + I_ij レベルの OT 整合。
     ターゲット: tgt_train_dataset（ターゲットジャンルの GIAA data、ラベル不使用）。
     早期停止: ソース val CCC。
@@ -297,8 +297,6 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
         best_model_path, best_state_dict
     """
     import wandb
-    if args.model_type != 'ICI':
-        raise NotImplementedError("DJDOT pretrain は ICI モデルのみサポートしています")
 
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
@@ -416,7 +414,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
 def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                      args, device, dirname, experiment_name, backbone_dict,
                      pretrained_model_dict, num_attr, num_pt, djdot_target_genre=None):
-    """DeepJDOT finetune trainer for PIAA（ICI のみ）。
+    """DeepJDOT finetune trainer for PIAA（ICI / MIR 対応）。
     ユーザーごとに：
       - ソース: 該当ユーザーの train_piaa_dataset でタスク学習 + I_ij レベルの OT 整合
       - ターゲット: 同ユーザーの target genre train_piaa_dataset（ラベル不使用）
@@ -425,8 +423,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
     同ユーザーがターゲットに存在しない場合はエラー。
     """
     import wandb
-    if args.model_type != 'ICI':
-        raise NotImplementedError("DJDOT finetune は ICI モデルのみサポートしています")
 
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())

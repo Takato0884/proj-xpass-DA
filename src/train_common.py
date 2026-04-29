@@ -373,7 +373,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
             self._set_frozen_modules_eval()
         return self
 
-    def forward(self, images, personal_traits, image_attributes, genre):
+    def forward(self, images, personal_traits, image_attributes, genre, return_feat=False):
         logit, _, raw_feat = self.nima_dict[genre](images, return_feat=True)
         prob = F.softmax(logit, dim=1)
 
@@ -392,6 +392,8 @@ class PIAA_MIR_CrossDomain(nn.Module):
             direct_outputs = self.direct_fc(prob)
         self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
         self._last_direct_mean = direct_outputs.detach().abs().mean().item()
+        if return_feat:
+            return interaction_outputs + direct_outputs, I_ij
         return interaction_outputs + direct_outputs
 
 
