@@ -256,9 +256,9 @@ if __name__ == '__main__':
             args.mcd_lambda = 0.1
     elif args.piaa_mode == 'PIAA_finetune':
         if not any(a.startswith('--lr') for a in sys.argv[1:]):
-            args.lr = 1e-6
+            args.lr = 1e-5
         if not any(a.startswith('--batch_size') for a in sys.argv[1:]):
-            args.batch_size = 8
+            args.batch_size = 16
 
     ALL_GENRES = ['art', 'fashion', 'scenery']
     if args.genre == 'all':
