@@ -1630,6 +1630,582 @@ def visualize_domain_gap(args):
         _plot_and_save(m)
 
 
+# ---------------------------------------------------------------------------
+# analyze_da_factors: Step 1 (descriptive + univariate exploration)
+# ---------------------------------------------------------------------------
+
+def _find_finetune_jsons(reports_dir: Path, version: str, subdir: str,
+                         model_type: str, da_method: str | None,
+                         folds: list[int] | None) -> dict[int, Path]:
+    """Find one finetune JSON per fold under {reports_dir}/{version}_fold*/{subdir}/.
+
+    Filters by:
+      - filename contains "finetune"
+      - filename contains model_type (ICI / MIR)
+      - if da_method is None: filename contains "Only"  (no-DA)
+        else: filename contains da_method
+    Returns: {fold_num: path}.
+    """
+    fold_dirs = sorted(reports_dir.glob(f"{version}_fold*"))
+    out = {}
+    for fold_dir in fold_dirs:
+        m = re.search(r"fold(\d+)$", fold_dir.name)
+        if not m:
+            continue
+        fold_num = int(m.group(1))
+        if folds is not None and fold_num not in folds:
+            continue
+        target_dir = fold_dir / subdir
+        if not target_dir.is_dir():
+            continue
+        cands = []
+        for p in sorted(target_dir.glob("*finetune*.json")):
+            name = p.name
+            if model_type not in name:
+                continue
+            if da_method is None:
+                if "Only" not in name:
+                    continue
+            else:
+                if da_method not in name:
+                    continue
+            cands.append(p)
+        if not cands:
+            continue
+        if len(cands) > 1:
+            print(f"  [warn] {target_dir.name}/: {len(cands)} matches, using {cands[0].name}",
+                  file=sys.stderr)
+        out[fold_num] = cands[0]
+    return out
+
+
+def _load_per_user_target(json_path: Path, target_genre: str, metric: str):
+    """Return dict {uid_str: metric_value} for cross-domain target evaluation."""
+    with open(json_path) as f:
+        d = json.load(f)
+    cdm = d.get("cross_domain_metrics", {}).get(target_genre, {})
+    pu = cdm.get("per_user", {})
+    return {uid: float(v[metric]) for uid, v in pu.items() if metric in v}
+
+
+def _load_per_user_source(json_path: Path, source_genre: str, metric: str):
+    """Return dict {uid_str: metric_value} for source-domain evaluation."""
+    with open(json_path) as f:
+        d = json.load(f)
+    pum = d.get("per_user_metrics", {})
+    out = {}
+    for uid, by_genre in pum.items():
+        if source_genre in by_genre and metric in by_genre[source_genre]:
+            out[uid] = float(by_genre[source_genre][metric])
+    return out
+
+
+def _build_user_features(users_csv: Path, ratings_csv: Path,
+                          source_genre: str, target_genre: str,
+                          score_col: str = "Aesthetic"):
+    """Build per-user feature matrix.
+
+    Returns DataFrame indexed by user_id (int), columns = features.
+    """
+    import pandas as pd
+    import numpy as np
+
+    users = pd.read_csv(users_csv)
+    ratings = pd.read_csv(ratings_csv)
+
+    # --- attribute features (from users.csv) ---
+    attr_cols = ["age", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9", "Q10",
+                 "art_interest", "fashion_interest", "photoVideo_interest",
+                 "art_learn", "fashion_learn", "photoVideo_learn"]
+    cat_cols = ["gender", "edu", "nationality"]
+    feat = users.set_index("user_id")[attr_cols].copy()
+    cats = pd.get_dummies(users.set_index("user_id")[cat_cols],
+                          prefix=cat_cols, dummy_na=False, dtype=int)
+    feat = feat.join(cats)
+
+    # --- per-domain rating-style features ---
+    def _style(df_g, prefix):
+        agg = df_g.groupby("user_id")[score_col].agg(
+            ["mean", "std", "count",
+             lambda x: float(pd.Series(x).skew()),
+             lambda x: float(pd.Series(x).kurt())]
+        )
+        agg.columns = [f"{prefix}_mean", f"{prefix}_std", f"{prefix}_n",
+                       f"{prefix}_skew", f"{prefix}_kurt"]
+        return agg
+
+    src_df = ratings[ratings["genre"] == source_genre]
+    tgt_df = ratings[ratings["genre"] == target_genre]
+    feat = feat.join(_style(src_df, f"src_{source_genre}"), how="left")
+    feat = feat.join(_style(tgt_df, f"tgt_{target_genre}"), how="left")
+
+    # mean / std shift between source and target (target - source)
+    feat[f"shift_mean_{source_genre}_to_{target_genre}"] = (
+        feat[f"tgt_{target_genre}_mean"] - feat[f"src_{source_genre}_mean"]
+    )
+    feat[f"shift_std_{source_genre}_to_{target_genre}"] = (
+        feat[f"tgt_{target_genre}_std"] - feat[f"src_{source_genre}_std"]
+    )
+
+    # --- test-retest reliability per user (within domain) ---
+    def _retest_mae(df_g):
+        # average over (user, sample_file) pairs that appear >=2 times
+        out = {}
+        grp = df_g.groupby(["user_id", "sample_file"])[score_col]
+        for (uid, _), s in grp:
+            if len(s) >= 2:
+                out.setdefault(uid, []).append(abs(s.iloc[0] - s.iloc[1]))
+        return pd.Series({uid: float(np.mean(v)) for uid, v in out.items()})
+
+    feat[f"retest_mae_{source_genre}"] = _retest_mae(src_df)
+    feat[f"retest_mae_{target_genre}"] = _retest_mae(tgt_df)
+
+    # --- generality: corr(user's ratings, mean of others) on shared images ---
+    def _generality(df_g):
+        # image-level mean of all OTHER users (leave-one-out via global mean trick)
+        img_sum = df_g.groupby("sample_file")[score_col].sum()
+        img_cnt = df_g.groupby("sample_file")[score_col].count()
+        out = {}
+        for uid, sub in df_g.groupby("user_id"):
+            if len(sub) < 5:
+                continue
+            sums = img_sum.loc[sub["sample_file"].values].values
+            cnts = img_cnt.loc[sub["sample_file"].values].values
+            others = (sums - sub[score_col].values) / np.maximum(cnts - 1, 1)
+            x = sub[score_col].values.astype(float)
+            if np.std(x) == 0 or np.std(others) == 0:
+                continue
+            r = float(np.corrcoef(x, others)[0, 1])
+            out[uid] = r
+        return pd.Series(out)
+
+    feat[f"generality_{source_genre}"] = _generality(src_df)
+    feat[f"generality_{target_genre}"] = _generality(tgt_df)
+
+    return feat
+
+
+def _benjamini_hochberg(pvals):
+    """Return BH-FDR adjusted p-values (same length as input)."""
+    import numpy as np
+    p = np.asarray(pvals, dtype=float)
+    n = len(p)
+    order = np.argsort(p)
+    ranked = p[order]
+    adj = ranked * n / (np.arange(n) + 1)
+    # enforce monotonicity (right-to-left cumulative min)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    out = np.empty(n)
+    out[order] = np.clip(adj, 0, 1)
+    return out
+
+
+def analyze_da_factors(args):
+    """Step 1: descriptive + univariate exploration of DA-success factors.
+
+    For each PIAA test user (across folds), compute:
+      Δ = metric(DA finetune, target) - metric(no-DA finetune, target)
+    Then correlate Δ with per-user features (attributes, rating style,
+    test-retest reliability, generality).
+    """
+    import pandas as pd
+    import numpy as np
+    from scipy.stats import spearmanr
+    import matplotlib.pyplot as plt
+
+    reports_dir = Path(args.reports_dir)
+    data_dir = Path(args.data_dir)
+    out_dir = Path(args.output_dir) / (
+        f"{args.source_genre}2{args.target_genre}_{args.model_type}_{args.da_method}"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    metric = args.metric
+    higher_is_better = metric in ("ccc", "srocc", "ndcg@10")
+
+    # 1. discover JSONs
+    nodA_jsons = _find_finetune_jsons(
+        reports_dir, args.version, args.source_genre,
+        args.model_type, da_method=None, folds=args.folds,
+    )
+    da_jsons = _find_finetune_jsons(
+        reports_dir, args.version, f"{args.source_genre}2{args.target_genre}",
+        args.model_type, da_method=args.da_method, folds=args.folds,
+    )
+    common_folds = sorted(set(nodA_jsons) & set(da_jsons))
+    if not common_folds:
+        print(f"Error: no folds with both no-DA and DA finetune JSONs found.\n"
+              f"  no-DA folds: {sorted(nodA_jsons)}\n"
+              f"  DA folds:    {sorted(da_jsons)}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[discover] folds with both no-DA and DA: {common_folds}")
+    for f in common_folds:
+        print(f"  fold{f}: noDA={nodA_jsons[f].name} | DA={da_jsons[f].name}")
+
+    # 2. per-user metrics on TARGET (primary) and SOURCE (secondary)
+    rows = []
+    for f in common_folds:
+        no_tgt = _load_per_user_target(nodA_jsons[f], args.target_genre, metric)
+        da_tgt = _load_per_user_target(da_jsons[f], args.target_genre, metric)
+        no_src = _load_per_user_source(nodA_jsons[f], args.source_genre, metric)
+        da_src = _load_per_user_source(da_jsons[f], args.source_genre, metric)
+        for uid in sorted(set(no_tgt) & set(da_tgt)):
+            sign = 1.0 if higher_is_better else -1.0
+            d_tgt = sign * (da_tgt[uid] - no_tgt[uid])
+            d_src = (sign * (da_src.get(uid, np.nan) - no_src.get(uid, np.nan))
+                     if uid in no_src and uid in da_src else np.nan)
+            rows.append({
+                "user_id": int(uid), "fold": f,
+                f"baseline_{metric}_target": no_tgt[uid],
+                f"baseline_{metric}_source": no_src.get(uid, np.nan),
+                f"da_{metric}_target": da_tgt[uid],
+                f"da_{metric}_source": da_src.get(uid, np.nan),
+                "delta_target": d_tgt,
+                "delta_source": d_src,
+            })
+    delta_df = pd.DataFrame(rows)
+    print(f"[delta] N users (target Δ): {len(delta_df)} "
+          f"across {delta_df['fold'].nunique()} folds")
+
+    # 3. user features
+    users_csv = data_dir / "maked" / "users.csv"
+    ratings_csv = data_dir / "maked" / "ratings.csv"
+    feat_df = _build_user_features(
+        users_csv, ratings_csv,
+        source_genre=args.source_genre, target_genre=args.target_genre,
+        score_col=args.score_col,
+    )
+    merged = delta_df.merge(feat_df, left_on="user_id", right_index=True, how="left")
+    merged.to_csv(out_dir / "per_user_features.csv", index=False)
+    print(f"[save] per_user_features.csv ({len(merged)} rows × {merged.shape[1]} cols)")
+
+    # 4. descriptive stats on Δ
+    def _summary(s):
+        s = s.dropna()
+        if len(s) == 0:
+            return {}
+        return {
+            "n": int(len(s)),
+            "mean": float(s.mean()),
+            "median": float(s.median()),
+            "std": float(s.std()),
+            "p_positive": float((s > 0).mean()),
+            "min": float(s.min()),
+            "max": float(s.max()),
+        }
+
+    desc = {
+        "metric": metric,
+        "higher_is_better": higher_is_better,
+        "source": args.source_genre,
+        "target": args.target_genre,
+        "model_type": args.model_type,
+        "da_method": args.da_method,
+        "delta_target": _summary(merged["delta_target"]),
+        "delta_source": _summary(merged["delta_source"]),
+    }
+    with open(out_dir / "delta_summary.json", "w") as f:
+        json.dump(desc, f, indent=2)
+    print(f"[summary] Δ target: mean={desc['delta_target'].get('mean', float('nan')):.4f}, "
+          f"median={desc['delta_target'].get('median', float('nan')):.4f}, "
+          f"P(Δ>0)={desc['delta_target'].get('p_positive', float('nan')):.3f}, "
+          f"n={desc['delta_target'].get('n', 0)}")
+
+    # 5. univariate Spearman corr (Δ_target vs each feature)
+    skip_cols = {"user_id", "fold",
+                 f"baseline_{metric}_target", f"baseline_{metric}_source",
+                 f"da_{metric}_target", f"da_{metric}_source",
+                 "delta_target", "delta_source"}
+    feat_cols = [c for c in merged.columns if c not in skip_cols]
+    # include baseline_target as a control (regression to the mean)
+    feat_cols = [f"baseline_{metric}_target"] + feat_cols
+
+    corr_rows = []
+    y = merged["delta_target"].values
+    for c in feat_cols:
+        x = merged[c]
+        # skip non-numeric / constant
+        try:
+            x = pd.to_numeric(x, errors="coerce")
+        except Exception:
+            continue
+        mask = (~pd.isna(x)) & (~pd.isna(y))
+        if mask.sum() < 10 or x[mask].nunique() < 2:
+            continue
+        rho, p = spearmanr(x[mask], y[mask])
+        corr_rows.append({
+            "feature": c, "n": int(mask.sum()),
+            "spearman_rho": float(rho), "p_value": float(p),
+        })
+    corr_df = pd.DataFrame(corr_rows)
+    if len(corr_df):
+        corr_df["p_fdr_bh"] = _benjamini_hochberg(corr_df["p_value"].values)
+        corr_df["abs_rho"] = corr_df["spearman_rho"].abs()
+        corr_df = corr_df.sort_values("abs_rho", ascending=False).drop(columns="abs_rho")
+        corr_df.to_csv(out_dir / "univariate_correlations.csv", index=False)
+        print(f"[save] univariate_correlations.csv ({len(corr_df)} features)")
+        print("[top-10 |Spearman ρ| with Δ target]")
+        for _, r in corr_df.head(10).iterrows():
+            sig = "*" if r["p_fdr_bh"] < 0.05 else " "
+            print(f"  {sig} {r['feature']:40s} ρ={r['spearman_rho']:+.3f} "
+                  f"p={r['p_value']:.4f} p_fdr={r['p_fdr_bh']:.4f}  n={r['n']}")
+    else:
+        print("[warn] no usable features for correlation")
+
+    # 6. plots
+    if not args.no_plots:
+        title_tag = (f"{args.source_genre}→{args.target_genre} | "
+                     f"{args.model_type} | {args.da_method} | metric={metric}")
+        # 6a. histogram of Δ
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+        for ax, col, lbl in zip(
+            axes, ["delta_target", "delta_source"], ["target", "source"]
+        ):
+            s = merged[col].dropna()
+            if len(s) == 0:
+                ax.set_title(f"Δ {lbl} (no data)")
+                continue
+            ax.hist(s, bins=30, edgecolor="black", alpha=0.75)
+            ax.axvline(0, color="red", lw=1, label="Δ=0")
+            ax.axvline(s.mean(), color="green", lw=1, ls="--",
+                       label=f"mean={s.mean():.3f}")
+            ax.set_xlabel(f"Δ {metric} ({lbl})")
+            ax.set_ylabel("# users")
+            ax.set_title(f"Δ {lbl}  (n={len(s)}, P(Δ>0)={(s>0).mean():.2f})")
+            ax.legend(fontsize=8)
+        fig.suptitle(title_tag, fontsize=11)
+        fig.tight_layout()
+        out_path = out_dir / "delta_histogram.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[save] {out_path}")
+
+        # 6b. scatter of top-K continuous features vs Δ_target
+        if len(corr_df):
+            top = corr_df.head(min(args.top_k, len(corr_df)))
+            n = len(top)
+            ncol = min(3, n)
+            nrow = (n + ncol - 1) // ncol
+            fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 3.5 * nrow),
+                                     squeeze=False)
+            for i, (_, r) in enumerate(top.iterrows()):
+                ax = axes[i // ncol][i % ncol]
+                c = r["feature"]
+                x = pd.to_numeric(merged[c], errors="coerce")
+                mask = (~pd.isna(x)) & (~pd.isna(merged["delta_target"]))
+                ax.scatter(x[mask], merged["delta_target"][mask], s=14, alpha=0.6)
+                ax.axhline(0, color="red", lw=0.8)
+                ax.set_xlabel(c, fontsize=8)
+                ax.set_ylabel("Δ target", fontsize=8)
+                ax.set_title(
+                    f"ρ={r['spearman_rho']:+.3f} (p_fdr={r['p_fdr_bh']:.3f})",
+                    fontsize=9,
+                )
+                ax.tick_params(labelsize=7)
+            for j in range(n, nrow * ncol):
+                axes[j // ncol][j % ncol].axis("off")
+            fig.suptitle(title_tag, fontsize=11)
+            fig.tight_layout()
+            out_path = out_dir / "top_scatters.png"
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"[save] {out_path}")
+
+    print(f"[done] outputs in: {out_dir}")
+
+
+# ---------------------------------------------------------------------------
+# aggregate_da_factors: average univariate ρ across multiple (src→tgt) pairs
+# using canonical src/tgt feature names. Drops features with no src/tgt analog.
+# ---------------------------------------------------------------------------
+
+# Canonical features kept across pairs (after renaming).
+# Order = display order in the output table.
+_CANONICAL_FEATURES = [
+    "generality_tgt", "generality_src",
+    "retest_mae_tgt", "retest_mae_src",
+    "style_tgt_mean", "style_tgt_std", "style_tgt_skew", "style_tgt_kurt", "style_tgt_n",
+    "style_src_mean", "style_src_std", "style_src_skew", "style_src_kurt", "style_src_n",
+    "shift_mean_src_to_tgt", "shift_std_src_to_tgt",
+    "learn_tgt", "learn_src",
+    "interest_tgt", "interest_src",
+    "baseline_tgt", "baseline_src",
+]
+
+
+def _canonicalize_per_user_features(df, src: str, tgt: str, metric: str):
+    """Rename pair-specific columns to canonical src/tgt names.
+
+    Drops user attributes (age, Big5, gender/edu/nationality)
+    and any column without a src/tgt analog. Returns a new DataFrame
+    containing only canonical feature columns plus delta_target / delta_source
+    / user_id / fold.
+
+    For learn/interest columns, the scenery domain maps to the photoVideo
+    columns in users.csv (since scenery videos are the photo/video domain).
+    """
+    # Domain → users.csv prefix for learn/interest columns
+    # art/fashion are direct; scenery aligns with photo/video experience.
+    learn_prefix = {"art": "art", "fashion": "fashion", "scenery": "photoVideo"}
+    src_lp = learn_prefix.get(src, src)
+    tgt_lp = learn_prefix.get(tgt, tgt)
+
+    rename_map = {
+        f"generality_{src}": "generality_src",
+        f"generality_{tgt}": "generality_tgt",
+        f"retest_mae_{src}": "retest_mae_src",
+        f"retest_mae_{tgt}": "retest_mae_tgt",
+        f"shift_mean_{src}_to_{tgt}": "shift_mean_src_to_tgt",
+        f"shift_std_{src}_to_{tgt}": "shift_std_src_to_tgt",
+        f"{src_lp}_learn": "learn_src",
+        f"{tgt_lp}_learn": "learn_tgt",
+        f"{src_lp}_interest": "interest_src",
+        f"{tgt_lp}_interest": "interest_tgt",
+        f"baseline_{metric}_target": "baseline_tgt",
+        f"baseline_{metric}_source": "baseline_src",
+    }
+    # Guard: when src == tgt (shouldn't happen, but safe), or when src and tgt
+    # map to the same learn_prefix (e.g., synonym), don't double-rename.
+    if src_lp == tgt_lp:
+        rename_map.pop(f"{tgt_lp}_learn", None)
+        rename_map.pop(f"{tgt_lp}_interest", None)
+    for stat in ("mean", "std", "skew", "kurt", "n"):
+        rename_map[f"src_{src}_{stat}"] = f"style_src_{stat}"
+        rename_map[f"tgt_{tgt}_{stat}"] = f"style_tgt_{stat}"
+
+    out = df.rename(columns=rename_map).copy()
+    keep = [c for c in _CANONICAL_FEATURES if c in out.columns]
+    keep += [c for c in ("delta_target", "delta_source", "user_id", "fold")
+             if c in out.columns]
+    return out[keep]
+
+
+def aggregate_da_factors(args):
+    """Average per-user Spearman ρ across (src→tgt) pairs using canonical
+    src/tgt feature names. Features without a src/tgt analog are dropped.
+
+    Reads each pair's per_user_features.csv (produced by analyze_da_factors)
+    from {input_dir}/{src}2{tgt}_{model}_{da}/per_user_features.csv.
+    """
+    import pandas as pd
+    import numpy as np
+    from scipy.stats import spearmanr
+
+    input_dir = Path(args.input_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    metric = args.metric
+
+    # 1. discover or accept pair list
+    pairs = args.pairs
+    if not pairs:
+        suffix = f"_{args.model_type}_{args.da_method}"
+        pairs = sorted(
+            d.name[: -len(suffix)]
+            for d in input_dir.iterdir()
+            if d.is_dir() and d.name.endswith(suffix) and "2" in d.name
+        )
+        if not pairs:
+            print(f"Error: no pair dirs *{suffix} found under {input_dir}",
+                  file=sys.stderr)
+            sys.exit(1)
+    print(f"[discover] pairs: {pairs}")
+
+    # 2. for each pair, load CSV → canonicalize → compute ρ
+    per_pair_rho = {}     # {pair: {feature: rho}}
+    per_pair_p = {}       # {pair: {feature: p}}
+    per_pair_n = {}       # {pair: {feature: n}}
+    used_pairs = []
+    for pair in pairs:
+        try:
+            src, tgt = pair.split("2", 1)
+        except ValueError:
+            print(f"  [skip] bad pair format: {pair} (expected src2tgt)",
+                  file=sys.stderr)
+            continue
+        csv_path = input_dir / f"{pair}_{args.model_type}_{args.da_method}" / "per_user_features.csv"
+        if not csv_path.exists():
+            print(f"  [skip] {csv_path} not found "
+                  f"(run `analyze_da_factors` for this pair first)",
+                  file=sys.stderr)
+            continue
+        df = pd.read_csv(csv_path)
+        canon = _canonicalize_per_user_features(df, src, tgt, metric)
+        y = canon["delta_target"].values
+        rho_d, p_d, n_d = {}, {}, {}
+        for feat in _CANONICAL_FEATURES:
+            if feat not in canon.columns:
+                continue
+            x = pd.to_numeric(canon[feat], errors="coerce")
+            mask = (~pd.isna(x)) & (~pd.isna(y))
+            if mask.sum() < 10 or x[mask].nunique() < 2:
+                continue
+            rho, p = spearmanr(x[mask], y[mask])
+            rho_d[feat] = float(rho)
+            p_d[feat] = float(p)
+            n_d[feat] = int(mask.sum())
+        per_pair_rho[pair] = rho_d
+        per_pair_p[pair] = p_d
+        per_pair_n[pair] = n_d
+        used_pairs.append(pair)
+        print(f"  [load] {pair}: {len(rho_d)} canonical features, "
+              f"N={list(n_d.values())[0] if n_d else 0}")
+
+    if not used_pairs:
+        print("Error: no pair CSVs loaded.", file=sys.stderr)
+        sys.exit(1)
+
+    # 3. assemble wide table: rows=feature, cols=ρ per pair + mean/std/n
+    rows = []
+    for feat in _CANONICAL_FEATURES:
+        rhos = [per_pair_rho[p][feat] for p in used_pairs if feat in per_pair_rho[p]]
+        if not rhos:
+            continue
+        ns = [per_pair_n[p][feat] for p in used_pairs if feat in per_pair_n[p]]
+        row = {"feature": feat}
+        for p in used_pairs:
+            row[f"rho_{p}"] = per_pair_rho[p].get(feat, np.nan)
+        row["rho_mean"] = float(np.mean(rhos))
+        row["rho_std"] = float(np.std(rhos, ddof=1)) if len(rhos) > 1 else 0.0
+        row["abs_rho_mean"] = float(np.mean(np.abs(rhos)))
+        row["n_pairs"] = len(rhos)
+        row["n_users_mean"] = float(np.mean(ns)) if ns else float("nan")
+        rows.append(row)
+
+    wide = pd.DataFrame(rows)
+    # sort by absolute mean ρ (largest signal first)
+    wide = wide.sort_values("abs_rho_mean", ascending=False).drop(columns="abs_rho_mean")
+
+    out_csv = out_dir / f"aggregated_correlations_{args.model_type}_{args.da_method}_{metric}.csv"
+    wide.to_csv(out_csv, index=False)
+    print(f"[save] {out_csv}  ({len(wide)} canonical features × {len(used_pairs)} pairs)")
+
+    # 4. also save long format (one row per (pair, feature))
+    long_rows = []
+    for p in used_pairs:
+        for feat in _CANONICAL_FEATURES:
+            if feat in per_pair_rho[p]:
+                long_rows.append({
+                    "pair": p, "feature": feat,
+                    "spearman_rho": per_pair_rho[p][feat],
+                    "p_value": per_pair_p[p][feat],
+                    "n": per_pair_n[p][feat],
+                })
+    long_csv = out_dir / f"per_pair_correlations_{args.model_type}_{args.da_method}_{metric}.csv"
+    pd.DataFrame(long_rows).to_csv(long_csv, index=False)
+    print(f"[save] {long_csv}")
+
+    # 5. console summary
+    print(f"\n[mean ρ across {len(used_pairs)} pairs, |ρ| descending]")
+    print(f"  {'feature':25s}  {'mean ρ':>8s}  {'± std':>7s}  " +
+          "  ".join(f"{p:>14s}" for p in used_pairs))
+    for _, r in wide.iterrows():
+        line = f"  {r['feature']:25s}  {r['rho_mean']:+8.3f}  {r['rho_std']:7.3f}  "
+        line += "  ".join(f"{r[f'rho_{p}']:+14.3f}" for p in used_pairs)
+        print(line)
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -1924,6 +2500,83 @@ if __name__ == '__main__':
              "{source}2{target}_{methods}_domain_gap_{dim_method}.png (default: reports/feature_viz)",
     )
 
+    # Subcommand: analyze_da_factors
+    adf_parser = subparsers.add_parser(
+        "analyze_da_factors",
+        help="Step 1: descriptive + univariate exploration of DA-success factors "
+             "(Δ = DA finetune − no-DA finetune, per user, on target domain)",
+    )
+    adf_parser.add_argument("--version", type=str, required=True,
+                            help="Dataset version (e.g., v3) → searches v3_fold*/")
+    adf_parser.add_argument("--source-genre", type=str, required=True,
+                            dest="source_genre",
+                            help="Source domain (e.g., art)")
+    adf_parser.add_argument("--target-genre", type=str, required=True,
+                            dest="target_genre",
+                            help="Target domain (e.g., fashion)")
+    adf_parser.add_argument("--model-type", type=str, default="ICI",
+                            dest="model_type", choices=["ICI", "MIR"],
+                            help="PIAA model type (default: ICI)")
+    adf_parser.add_argument("--da-method", type=str, required=True,
+                            dest="da_method",
+                            help="DA method tag in DA filename (e.g., DJDOT, DANN, "
+                                 "DAREGRAM, MCD)")
+    adf_parser.add_argument("--metric", type=str, default="ccc",
+                            choices=["ccc", "srocc", "ndcg@10", "mae"],
+                            help="Per-user metric to use for Δ (default: ccc). "
+                                 "For mae, sign is flipped so Δ>0 always = improvement.")
+    adf_parser.add_argument("--folds", type=int, nargs="+", default=None,
+                            help="Restrict to specific fold numbers (default: all common)")
+    adf_parser.add_argument("--score-col", type=str, default="Aesthetic",
+                            dest="score_col",
+                            help="Rating column for style/consistency (default: Aesthetic)")
+    adf_parser.add_argument("--reports-dir", type=str,
+                            default=str(REPORTS_DIR),
+                            dest="reports_dir",
+                            help="Reports directory (default: reports/exp)")
+    adf_parser.add_argument("--data-dir", type=str,
+                            default=str(Path(__file__).resolve().parent.parent / "data"),
+                            dest="data_dir",
+                            help="Data directory containing maked/users.csv, ratings.csv")
+    adf_parser.add_argument("-o", "--output-dir", type=str,
+                            default="reports/da_factors",
+                            dest="output_dir",
+                            help="Output directory (default: reports/da_factors)")
+    adf_parser.add_argument("--top-k", type=int, default=9, dest="top_k",
+                            help="# of top-correlated features to scatter-plot (default: 9)")
+    adf_parser.add_argument("--no-plots", action="store_true", dest="no_plots",
+                            help="Skip plot generation")
+
+    # Subcommand: aggregate_da_factors
+    agf_parser = subparsers.add_parser(
+        "aggregate_da_factors",
+        help="Average per-user Spearman ρ across (src→tgt) pairs using canonical "
+             "src/tgt feature names. Drops features with no src/tgt analog "
+             "(Big5, demographics, photoVideo_*).",
+    )
+    agf_parser.add_argument("--pairs", type=str, nargs="+", default=None,
+                            help="Pairs in 'src2tgt' form (e.g., art2fashion fashion2scenery). "
+                                 "If omitted, all matching dirs under --input-dir are used.")
+    agf_parser.add_argument("--model-type", type=str, default="ICI",
+                            dest="model_type", choices=["ICI", "MIR"],
+                            help="PIAA model type tag (default: ICI)")
+    agf_parser.add_argument("--da-method", type=str, required=True,
+                            dest="da_method",
+                            help="DA method tag (e.g., DJDOT, DANN)")
+    agf_parser.add_argument("--metric", type=str, default="ccc",
+                            choices=["ccc", "srocc", "ndcg@10", "mae"],
+                            help="Per-user metric used to compute Δ (default: ccc). "
+                                 "Must match what was passed to analyze_da_factors.")
+    agf_parser.add_argument("--input-dir", type=str,
+                            default="reports/da_factors",
+                            dest="input_dir",
+                            help="Directory containing {pair}_{model}_{da}/per_user_features.csv "
+                                 "(default: reports/da_factors)")
+    agf_parser.add_argument("-o", "--output-dir", type=str,
+                            default="reports/da_factors/_aggregated",
+                            dest="output_dir",
+                            help="Output directory (default: reports/da_factors/_aggregated)")
+
     args = parser.parse_args()
 
     if args.command == 'aggregate':
@@ -1934,5 +2587,9 @@ if __name__ == '__main__':
         visualize_features(args)
     elif args.command == 'visualize_domain_gap':
         visualize_domain_gap(args)
+    elif args.command == 'analyze_da_factors':
+        analyze_da_factors(args)
+    elif args.command == 'aggregate_da_factors':
+        aggregate_da_factors(args)
     else:
         parser.print_help()

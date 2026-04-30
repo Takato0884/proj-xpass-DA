@@ -295,11 +295,12 @@ python -m src.train_GIAA --genre scenery --use_video
 
 GIAA学習（`train_GIAA`）では `--da_method METHOD-target` を指定することでドメイン適応を有効化できます。現在サポートされている手法は以下のとおりです。
 
-| 手法 | `--da_method` 指定例 | 説明 |
-|------|---------------------|------|
-| **DANN** | `DANN-fashion` | Gradient Reversal Layerによるドメイン識別器の敵対的学習 |
-| **DeepJDOT** | `DJDOT-fashion` | 最適輸送（OT）によるジョイント分布整合。特徴距離とEMDラベルコストをコスト行列に使用 |
-| **MCD** | `MCD-fashion` | 2つの独立した分類ヘッド（F1/F2）の予測Discrepancyを最大化・最小化することでターゲット特徴をソースのサポート内に引き込む |
+| 手法 | `--da_method` 指定例 | 説明 | 対応 |
+|------|---------------------|------|------|
+| **DANN** | `DANN-fashion` | Gradient Reversal Layerによるドメイン識別器の敵対的学習 | GIAA / PIAA |
+| **DeepJDOT** | `DJDOT-fashion` | 最適輸送（OT）によるジョイント分布整合。特徴距離とEMDラベルコストをコスト行列に使用 | GIAA / PIAA |
+| **MCD** | `MCD-fashion` | 2つの独立した分類ヘッド（F1/F2）の予測Discrepancyを最大化・最小化することでターゲット特徴をソースのサポート内に引き込む | GIAA / PIAA (ICI のみ) |
+| **DARE-GRAM** | `DAREGRAM-fashion` | グラム行列の角度（cos類似度）とスケール（特異値）の整合により、ソース・ターゲットの特徴空間を線形回帰の幾何構造レベルで揃える | PIAA (ICI のみ) |
 
 ### DeepJDOT（Deep Joint Distribution Optimal Transport）
 
@@ -408,6 +409,53 @@ python -m src.train_PIAA --genre art --dataset_ver v2_all \
   --piaa_mode PIAA_pretrain --da_method MCD-scenery
 ```
 
+### DARE-GRAM（Domain Alignment via Regression Gram-matrix）{#daregram}
+
+DARE-GRAM はソース・ターゲットの特徴行列 $Z_s, Z_t$ を「線形回帰問題における設計行列」とみなし、その擬似逆行列の角度（cos類似度）と特異値（スケール）を整合させる回帰向けUDA手法です。PIAA では `I_ij`（インタラクション特徴）を $Z$ として使用するため、**ICI モデル専用**となります。
+
+$$\mathcal{L}_{\text{DAREGRAM}} = \alpha_{\cos} \cdot \mathcal{L}_{\cos}(Z_s, Z_t) + \gamma_{\text{scale}} \cdot \mathcal{L}_{\text{scale}}(Z_s, Z_t)$$
+
+各バッチで以下を計算します：
+
+1. **特徴行列の構築**：ソース／ターゲットそれぞれの I_ij をスタックしてバイアス列を追加し、$\tilde{Z}_s, \tilde{Z}_t \in \mathbb{R}^{B \times (d+1)}$ を作る
+2. **SVD（float32）**：$\tilde{Z}_s = U_s S_s V_s^\top$, $\tilde{Z}_t = U_t S_t V_t^\top$
+3. **truncation**：累積寄与率が閾値 $T$ を超える最小の $k$ を採用し、上位 $k$ 個の特異ベクトル／特異値を使う
+4. **L_cos**：擬似逆方向の列ベクトル間の余弦類似度を1に近づける
+5. **L_scale**：上位 $k$ 個の特異値の L2 距離を最小化
+
+実装上の詳細：
+- $Z = $ `I_ij`（ICI の interaction 特徴; `model.forward(..., return_feat=True)` で取得）
+- SVD は数値安定性のため AMP の外側で float32 計算
+- ソース損失は `MSE(interaction_score + direct_score, y_s)`
+- 早期停止はソース val CCC（pretrain）／ユーザーごとのソース val CCC（finetune）
+
+#### NIMA の事前学習重みについて
+
+DARE-GRAM は GIAA モードを持たないため、PIAA pretrain で利用する NIMA バックボーンを他の手法（`source_only` / `DANN` / `MCD` / `DJDOT`）から **`--nima_da_method` で借りる**設計になっています。
+
+- `--nima_da_method source_only`：`models_pth/{ver}/{genre}/` から NIMA をロード
+- `--nima_da_method DANN` 等：`models_pth/{ver}/{src2tgt}/` から該当手法の NIMA をロード
+
+#### ペアワイズ適応の例
+
+```bash
+# Pretrain: art → fashion（NIMA は source_only から借用）
+python -m src.train_PIAA --genre art --dataset_ver v2_all \
+  --piaa_mode PIAA_pretrain --da_method DAREGRAM-fashion \
+  --nima_da_method source_only \
+  --daregram_alpha_cos 0.01 --daregram_gamma_scale 0.01 --daregram_T 0.95
+
+# Pretrain: art → fashion（NIMA は DANN から借用）
+python -m src.train_PIAA --genre art --dataset_ver v2_all \
+  --piaa_mode PIAA_pretrain --da_method DAREGRAM-fashion \
+  --nima_da_method DANN
+
+# Finetune: art → fashion
+python -m src.train_PIAA --genre art --dataset_ver v2_all \
+  --piaa_mode PIAA_finetune --da_method DAREGRAM-fashion \
+  --daregram_alpha_cos 0.01 --daregram_gamma_scale 0.01
+```
+
 ---
 
 ### PIAA事前学習 & ファインチューニング（ICI / MIR）
@@ -443,6 +491,10 @@ python -m src.train_PIAA --genre art --dataset_ver v2_all \
 | `--djdot_lambda_t` | float | `1` | `[DJDOT]` ラベル整合項の重み（EMDラベルコスト） |
 | `--mcd_lambda` | float | `10.0` | `[MCD]` Step B における Discrepancy損失の重み（`L_s - lambda * L_adv` の lambda） |
 | `--mcd_n_steps` | int | `4` | `[MCD]` Step C（ジェネレータ更新）の1バッチあたり繰り返し回数 |
+| `--daregram_alpha_cos` | float | `0.01` | `[DAREGRAM]` 角度整合損失 L_cos の重み |
+| `--daregram_gamma_scale` | float | `0.01` | `[DAREGRAM]` スケール整合損失 L_scale の重み |
+| `--daregram_T` | float | `0.95` | `[DAREGRAM]` 切断擬似逆行列の累積特異値閾値 |
+| `--nima_da_method` | str | `None` | `[DAREGRAM]` PIAA_pretrain で読み込む NIMA バックボーンの DA 手法（`source_only` / `DANN` / `MCD` / `DJDOT`）。DAREGRAM は GIAA 学習を持たないため必須 |
 
 > **注:** クロスドメイン評価（`--genre` 以外の全ジャンルに対する評価）は常に実行されます。損失関数はMSEで固定です。
 

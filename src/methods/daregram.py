@@ -200,15 +200,15 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
             epoch=epoch, desc_suffix=" pretrain")
 
         if args.is_log:
-            ratio_y_cos = L_y / (L_y + L_cos) if (L_y + L_cos) > 0 else 0.0
+            ratio_y_da = L_y / (L_y + L_scale + L_cos) if (L_y + L_scale + L_cos) > 0 else 0.0
             ratio_cos_scale = L_cos / (L_scale + L_cos) if (L_scale + L_cos) > 0 else 0.0
             wandb.log({
                 "epoch": epoch,
                 f"{genre}/Train Loss":    L_y,
                 f"{genre}/Train L_cos":   L_cos,
                 f"{genre}/Train L_scale": L_scale,
-                f"{genre}/Train ratio L_y/(L_y+L_cos)":      ratio_y_cos,
-                f"{genre}/Train ratio L_cos/(L_scale+L_cos)": ratio_cos_scale,
+                f"{genre}/Train ratio L_y/(L_y+L_scale+L_cos)": ratio_y_da,
+                f"{genre}/Train ratio L_cos/(L_scale+L_cos)":   ratio_cos_scale,
             }, commit=False)
 
         genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
@@ -360,14 +360,14 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             tgt_genre_metrics, _ = evaluate_piaa(model_user, val_tgt_loaders, device, epoch=epoch, phase_name="Val (tgt)")
 
             if args.is_log:
-                ratio_y_cos = L_y / (L_y + L_cos) if (L_y + L_cos) > 0 else 0.0
+                ratio_y_da = L_y / (L_y + L_scale + L_cos) if (L_y + L_scale + L_cos) > 0 else 0.0
                 ratio_cos_scale = L_cos / (L_scale + L_cos) if (L_scale + L_cos) > 0 else 0.0
                 log_dict = {"epoch": epoch}
                 log_dict[f"{genre}/Train Loss user_{uid}"]    = L_y
                 log_dict[f"{genre}/Train L_cos user_{uid}"]   = L_cos
                 log_dict[f"{genre}/Train L_scale user_{uid}"] = L_scale
-                log_dict[f"{genre}/Train ratio L_y/(L_y+L_cos) user_{uid}"]      = ratio_y_cos
-                log_dict[f"{genre}/Train ratio L_cos/(L_scale+L_cos) user_{uid}"] = ratio_cos_scale
+                log_dict[f"{genre}/Train ratio L_y/(L_y+L_scale+L_cos) user_{uid}"] = ratio_y_da
+                log_dict[f"{genre}/Train ratio L_cos/(L_scale+L_cos) user_{uid}"]   = ratio_cos_scale
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
                     log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
