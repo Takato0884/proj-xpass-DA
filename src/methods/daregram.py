@@ -73,7 +73,7 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
     """DARE-GRAM 1エポック学習（pretrain / finetune 共通）。
 
     ソース損失: MSE(interaction_score + direct_score, y_s)
-    ドメイン整合損失: L_cos + L_scale, z = I_ij（ICI専用）
+    ドメイン整合損失: L_cos + L_scale, z = I_ij（ICI / MIR 共通）
     """
     model.train()
     alpha_cos = getattr(args, 'daregram_alpha_cos', 0.1)
@@ -142,16 +142,13 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
 def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
                      experiment_name, backbone_dict, pretrained_model_dict, num_attr, num_pt,
                      domain_tag=None):
-    """DARE-GRAM pretrain trainer for PIAA（ICI のみ）。
+    """DARE-GRAM pretrain trainer for PIAA（ICI / MIR 対応）。
     ソース: train_giaa_dataset でタスク学習 + I_ij レベルの DARE-GRAM 整合。
     ターゲット: tgt_train_dataset（ターゲットジャンルの GIAA data、ラベル不使用）。
     早期停止: ソース val CCC。
     Returns:
         best_model_path, best_state_dict
     """
-    if args.model_type != 'ICI':
-        raise NotImplementedError("DAREGRAM pretrain は ICI モデルのみサポートしています")
-
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
     genre = genres[0]
@@ -262,7 +259,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
 def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                      args, device, dirname, experiment_name, backbone_dict,
                      pretrained_model_dict, num_attr, num_pt, daregram_target_genre=None):
-    """DARE-GRAM finetune trainer for PIAA（ICI のみ）。
+    """DARE-GRAM finetune trainer for PIAA（ICI / MIR 対応）。
     ユーザーごとに：
       - ソース: 該当ユーザーの train_piaa_dataset でタスク学習 + I_ij レベルの DARE-GRAM 整合
       - ターゲット: 同ユーザーの target genre train_piaa_dataset（ラベル不使用）
@@ -270,9 +267,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
       - ターゲット val: 同ユーザーの val_piaa_dataset で観察のみ
     同ユーザーがターゲットに存在しない場合はエラー。
     """
-    if args.model_type != 'ICI':
-        raise NotImplementedError("DAREGRAM finetune は ICI モデルのみサポートしています")
-
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
     genre = genres[0]

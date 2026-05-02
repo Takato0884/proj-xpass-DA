@@ -92,7 +92,10 @@ def run_main(args):
 
     # NIMA discovery: for PIAA_pretrain with DAREGRAM, the NIMA can be sourced
     # from any other DA method or source_only via --nima_da_method.
+    # DAREGRAM defaults to 'source_only' (ICI / MIR 共通) when not specified.
     nima_override = getattr(args, 'nima_da_method', None)
+    if args.piaa_mode == 'PIAA_pretrain' and method_name == 'DAREGRAM' and nima_override is None:
+        nima_override = 'source_only'
     if args.piaa_mode == 'PIAA_pretrain' and nima_override:
         if nima_override == 'source_only':
             nima_search_tag = genre
