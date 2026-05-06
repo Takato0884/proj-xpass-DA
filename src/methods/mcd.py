@@ -112,7 +112,8 @@ def _train_one_epoch(mcd_model, model, src_loader, tgt_loader,
     lambda_ = getattr(args, 'mcd_lambda', 1.0)
     n_steps  = getattr(args, 'mcd_n_steps', 4)
 
-    running_L_s = running_L_adv_B = running_L_adv_C = 0.0
+    running_L_s = running_L_s_B = running_L_adv_B = running_L_adv_C = 0.0
+    running_D0 = running_D1 = running_D2 = running_D3 = 0.0
     total_batches = 0
     tgt_iter = iter(tgt_loader)
 
@@ -162,42 +163,69 @@ def _train_one_epoch(mcd_model, model, src_loader, tgt_loader,
             prob2_tgt_b = F.softmax(mcd_model.forward_f2(feat_tgt_b), dim=1)
             L_adv_B = _emd_l1(prob1_tgt_b, prob2_tgt_b).mean()
             loss_B  = L_s_B - lambda_ * L_adv_B
+        D0 = L_adv_B.item()
         scaler.scale(loss_B).backward()
         scaler.step(optimizer_F)
         scaler.update()
+
+        # D1: discrepancy after F update (G unchanged → reuse feat_tgt_b)
+        with torch.no_grad(), autocast('cuda'):
+            p1_d1 = F.softmax(mcd_model.forward_f1(feat_tgt_b), dim=1)
+            p2_d1 = F.softmax(mcd_model.forward_f2(feat_tgt_b), dim=1)
+            D1 = _emd_l1(p1_d1, p2_d1).mean().item()
 
         # ── Step C: min_{G} L_adv  (F1, F2 fixed), repeated n_steps times ─────
         # Minimize discrepancy by pulling target features toward source support.
         # optimizer_F is never stepped here, so F1/F2 remain unchanged.
         L_adv_C_val = 0.0
-        for _ in range(n_steps):
+        D2 = 0.0
+        for i in range(n_steps):
             optimizer_G.zero_grad()
             with autocast('cuda'):
                 feat_tgt_c  = mcd_model.forward_feat(images_tgt)
                 prob1_tgt_c = F.softmax(mcd_model.forward_f1(feat_tgt_c), dim=1)
                 prob2_tgt_c = F.softmax(mcd_model.forward_f2(feat_tgt_c), dim=1)
                 L_adv_C = _emd_l1(prob1_tgt_c, prob2_tgt_c).mean()
+            if i == 0:
+                D2 = L_adv_C.item()
             scaler.scale(L_adv_C).backward()
             scaler.step(optimizer_G)
             scaler.update()
             L_adv_C_val = L_adv_C.item()
 
+        # D3: discrepancy after all G updates (fresh forward through updated G)
+        with torch.no_grad(), autocast('cuda'):
+            feat_tgt_d3 = mcd_model.forward_feat(images_tgt)
+            p1_d3 = F.softmax(mcd_model.forward_f1(feat_tgt_d3), dim=1)
+            p2_d3 = F.softmax(mcd_model.forward_f2(feat_tgt_d3), dim=1)
+            D3 = _emd_l1(p1_d3, p2_d3).mean().item()
+
         running_L_s     += L_s_A.item()
+        running_L_s_B   += L_s_B.item()
         running_L_adv_B += L_adv_B.item()
         running_L_adv_C += L_adv_C_val
+        running_D0 += D0
+        running_D1 += D1
+        running_D2 += D2
+        running_D3 += D3
         total_batches   += 1
 
         progress_bar.set_postfix({
-            'L_s':     f'{L_s_A.item():.4f}',
-            'L_adv_B': f'{L_adv_B.item():.4f}',
-            'L_adv_C': f'{L_adv_C_val:.4f}',
+            'L_s':   f'{L_s_A.item():.4f}',
+            'D0/D1': f'{D0:.3f}/{D1:.3f}',
+            'D2/D3': f'{D2:.3f}/{D3:.3f}',
         })
 
     n = max(total_batches, 1)
     return {
         'train_emd': running_L_s     / n,
+        'L_s_B':     running_L_s_B   / n,
         'L_adv_B':   running_L_adv_B / n,
         'L_adv_C':   running_L_adv_C / n,
+        'D0': running_D0 / n,
+        'D1': running_D1 / n,
+        'D2': running_D2 / n,
+        'D3': running_D3 / n,
     }
 
 
@@ -231,11 +259,21 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
             epoch=epoch)
 
         if args.is_log:
+            lambda_ = getattr(args, 'mcd_lambda', 1.0)
+            adv_ratio = lambda_ * metrics['L_adv_B'] / metrics['L_s_B'] if metrics['L_s_B'] > 0 else 0.0
             wandb.log({
                 "epoch": epoch,
                 f"{args.genre}/Train EMD GIAA":  metrics['train_emd'],
+                f"{args.genre}/Train L_s_B":     metrics['L_s_B'],
                 f"{args.genre}/Train L_adv_B":   metrics['L_adv_B'],
                 f"{args.genre}/Train L_adv_C":   metrics['L_adv_C'],
+                f"{args.genre}/Train adv_ratio": adv_ratio,
+                f"{args.genre}/Train D0":        metrics['D0'],
+                f"{args.genre}/Train D1":        metrics['D1'],
+                f"{args.genre}/Train D2":        metrics['D2'],
+                f"{args.genre}/Train D3":        metrics['D3'],
+                f"{args.genre}/Train F_widen":   metrics['D1'] - metrics['D0'],
+                f"{args.genre}/Train G_shrink":  metrics['D2'] - metrics['D3'],
             }, commit=False)
 
         # ── Source validation (early-stopping criterion) ──────────────────────
@@ -338,7 +376,8 @@ def _train_one_epoch_piaa(mcd_model, src_loader, tgt_loader,
     lambda_ = getattr(args, 'mcd_lambda', 1.0)
     n_steps  = getattr(args, 'mcd_n_steps', 4)
 
-    running_L_s = running_L_adv_B = running_L_adv_C = 0.0
+    running_L_s = running_L_s_B = running_L_adv_B = running_L_adv_C = 0.0
+    running_D0 = running_D1 = running_D2 = running_D3 = 0.0
     total_batches = 0
     tgt_iter = iter(tgt_loader)
 
@@ -401,37 +440,68 @@ def _train_one_epoch_piaa(mcd_model, src_loader, tgt_loader,
             f2_tgt_b = mcd_model.forward_f2(I_ij_tgt_b)
             L_adv_B = (f1_tgt_b - f2_tgt_b).abs().mean()
             loss_B  = L_s_B - lambda_ * L_adv_B
+        D0 = L_adv_B.item()
         scaler.scale(loss_B).backward()
         scaler.step(optimizer_F)
         scaler.update()
 
+        # D1: discrepancy after F update (G unchanged → reuse I_ij_tgt_b)
+        with torch.no_grad(), autocast('cuda'):
+            f1_d1 = mcd_model.forward_f1(I_ij_tgt_b)
+            f2_d1 = mcd_model.forward_f2(I_ij_tgt_b)
+            D1 = (f1_d1 - f2_d1).abs().mean().item()
+
         # ── Step C: min_{G} L_adv  (F1, F2 fixed), repeated n_steps times ─────
         L_adv_C_val = 0.0
-        for _ in range(n_steps):
+        D2 = 0.0
+        for i in range(n_steps):
             optimizer_G.zero_grad()
             with autocast('cuda'):
                 I_ij_tgt_c = mcd_model.forward_feat(images_tgt, pt_tgt, attr_tgt, genre)
                 f1_tgt_c = mcd_model.forward_f1(I_ij_tgt_c)
                 f2_tgt_c = mcd_model.forward_f2(I_ij_tgt_c)
                 L_adv_C = (f1_tgt_c - f2_tgt_c).abs().mean()
+            if i == 0:
+                D2 = L_adv_C.item()
             scaler.scale(L_adv_C).backward()
             scaler.step(optimizer_G)
             scaler.update()
             L_adv_C_val = L_adv_C.item()
 
+        # D3: discrepancy after all G updates (fresh forward through updated G)
+        with torch.no_grad(), autocast('cuda'):
+            I_ij_tgt_d3 = mcd_model.forward_feat(images_tgt, pt_tgt, attr_tgt, genre)
+            f1_d3 = mcd_model.forward_f1(I_ij_tgt_d3)
+            f2_d3 = mcd_model.forward_f2(I_ij_tgt_d3)
+            D3 = (f1_d3 - f2_d3).abs().mean().item()
+
         running_L_s     += L_s_A.item()
+        running_L_s_B   += L_s_B.item()
         running_L_adv_B += L_adv_B.item()
         running_L_adv_C += L_adv_C_val
+        running_D0 += D0
+        running_D1 += D1
+        running_D2 += D2
+        running_D3 += D3
         total_batches   += 1
 
         progress_bar.set_postfix({
-            'L_s':     f'{L_s_A.item():.4f}',
-            'L_adv_B': f'{L_adv_B.item():.4f}',
-            'L_adv_C': f'{L_adv_C_val:.4f}',
+            'L_s':   f'{L_s_A.item():.4f}',
+            'D0/D1': f'{D0:.3f}/{D1:.3f}',
+            'D2/D3': f'{D2:.3f}/{D3:.3f}',
         })
 
     n = max(total_batches, 1)
-    return running_L_s / n, running_L_adv_B / n, running_L_adv_C / n
+    return {
+        'L_s':     running_L_s     / n,
+        'L_s_B':   running_L_s_B   / n,
+        'L_adv_B': running_L_adv_B / n,
+        'L_adv_C': running_L_adv_C / n,
+        'D0': running_D0 / n,
+        'D1': running_D1 / n,
+        'D2': running_D2 / n,
+        'D3': running_D3 / n,
+    }
 
 
 def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
@@ -492,20 +562,28 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     scaler = GradScaler('cuda')
 
     for epoch in range(args.num_epochs):
-        L_s, L_adv_B, L_adv_C = _train_one_epoch_piaa(
+        m = _train_one_epoch_piaa(
             mcd_model, src_loader, tgt_loader,
             optimizer_G, optimizer_F, scaler, device, args, genre,
             epoch=epoch, phase='pretrain')
+        L_s, L_adv_B, L_adv_C = m['L_s'], m['L_adv_B'], m['L_adv_C']
 
         if args.is_log:
             lambda_ = getattr(args, 'mcd_lambda', 1.0)
-            adv_ratio = lambda_ * L_adv_B / L_s if L_s > 0 else 0.0
+            adv_ratio = lambda_ * L_adv_B / m['L_s_B'] if m['L_s_B'] > 0 else 0.0
             wandb.log({
                 "epoch": epoch,
                 f"{genre}/Train Loss":           L_s,
+                f"{genre}/Train L_s_B":          m['L_s_B'],
                 f"{genre}/Train L_adv_B":        L_adv_B,
                 f"{genre}/Train L_adv_C":        L_adv_C,
                 f"{genre}/Train adv_ratio":      adv_ratio,
+                f"{genre}/Train D0":             m['D0'],
+                f"{genre}/Train D1":             m['D1'],
+                f"{genre}/Train D2":             m['D2'],
+                f"{genre}/Train D3":             m['D3'],
+                f"{genre}/Train F_widen":        m['D1'] - m['D0'],
+                f"{genre}/Train G_shrink":       m['D2'] - m['D3'],
             }, commit=False)
 
         genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
@@ -650,10 +728,11 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         scaler = GradScaler('cuda')
 
         for epoch in range(args.num_epochs):
-            L_s, L_adv_B, L_adv_C = _train_one_epoch_piaa(
+            m = _train_one_epoch_piaa(
                 mcd_model, src_loader, tgt_loader,
                 optimizer_G, optimizer_F, scaler, device, args, genre,
                 epoch=epoch, phase='finetune')
+            L_s, L_adv_B, L_adv_C = m['L_s'], m['L_adv_B'], m['L_adv_C']
 
             genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
@@ -663,11 +742,18 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             if args.is_log:
                 log_dict = {"epoch": epoch}
                 lambda_ = getattr(args, 'mcd_lambda', 1.0)
-                adv_ratio = lambda_ * L_adv_B / L_s if L_s > 0 else 0.0
+                adv_ratio = lambda_ * L_adv_B / m['L_s_B'] if m['L_s_B'] > 0 else 0.0
                 log_dict[f"{genre}/Train Loss user_{uid}"]       = L_s
+                log_dict[f"{genre}/Train L_s_B user_{uid}"]      = m['L_s_B']
                 log_dict[f"{genre}/Train L_adv_B user_{uid}"]    = L_adv_B
                 log_dict[f"{genre}/Train L_adv_C user_{uid}"]    = L_adv_C
                 log_dict[f"{genre}/Train adv_ratio user_{uid}"]  = adv_ratio
+                log_dict[f"{genre}/Train D0 user_{uid}"]         = m['D0']
+                log_dict[f"{genre}/Train D1 user_{uid}"]         = m['D1']
+                log_dict[f"{genre}/Train D2 user_{uid}"]         = m['D2']
+                log_dict[f"{genre}/Train D3 user_{uid}"]         = m['D3']
+                log_dict[f"{genre}/Train F_widen user_{uid}"]    = m['D1'] - m['D0']
+                log_dict[f"{genre}/Train G_shrink user_{uid}"]   = m['D2'] - m['D3']
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
                     log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
