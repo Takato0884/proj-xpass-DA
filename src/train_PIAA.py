@@ -16,6 +16,7 @@ _DA_METHOD_MODULES_PIAA = {
     'DJDOT':    '.methods.djdot',
     'MCD':      '.methods.mcd',
     'DAREGRAM': '.methods.daregram',
+    'UGAFEAT':  '.methods.ugafeat',
 }
 
 num_attr = None  # Determined dynamically from dataset
@@ -90,11 +91,11 @@ def run_main(args):
     use_da = method_name is not None
     domain_tag = f'{genre}2{target_genre}' if use_da else genre
 
-    # NIMA discovery: for PIAA_pretrain with DAREGRAM, the NIMA can be sourced
+    # NIMA discovery: for PIAA_pretrain with DAREGRAM/UGAFEAT, the NIMA can be sourced
     # from any other DA method or source_only via --nima_da_method.
-    # DAREGRAM defaults to 'source_only' (ICI / MIR 共通) when not specified.
+    # DAREGRAM/UGAFEAT default to 'source_only' (ICI / MIR 共通) when not specified.
     nima_override = getattr(args, 'nima_da_method', None)
-    if args.piaa_mode == 'PIAA_pretrain' and method_name == 'DAREGRAM' and nima_override is None:
+    if args.piaa_mode == 'PIAA_pretrain' and method_name in ('DAREGRAM', 'UGAFEAT') and nima_override is None:
         nima_override = 'source_only'
     if args.piaa_mode == 'PIAA_pretrain' and nima_override:
         if nima_override == 'source_only':
@@ -219,6 +220,11 @@ def run_main(args):
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                     args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                     num_attr, num_pt, daregram_target_genre=target_genre)
+            elif method_name == 'UGAFEAT':
+                mod.trainer_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    num_attr, num_pt, ugafeat_target_genre=target_genre)
             else:  # DJDOT
                 mod.trainer_finetune(
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,

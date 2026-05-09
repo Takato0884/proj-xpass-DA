@@ -78,10 +78,25 @@ def parse_arguments(parse=True):
     parser.add_argument('--daregram_T', type=float, default=0.95,
                         help='[DAREGRAM] Cumulative eigenvalue threshold for truncated pseudo-inverse.')
     parser.add_argument('--nima_da_method', type=str, default=None,
-                        help='[DAREGRAM] DA method whose pretrained NIMA to load for PIAA_pretrain. '
+                        help='[DAREGRAM/UGAFEAT] DA method whose pretrained NIMA to load for PIAA_pretrain. '
                              'E.g. "source_only" (load NIMA from models_pth/{ver}/{genre}/), '
                              '"DANN"/"MCD"/"DJDOT" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
-                             'Only meaningful for DAREGRAM since it has no GIAA-trained NIMA of its own.')
+                             'Only meaningful for methods that have no GIAA-trained NIMA of their own.')
+    # UGAFEAT-specific hyperparameters
+    parser.add_argument('--ugafeat_mmd_num', type=int, default=5,
+                        help='[UGAFEAT] Number of bandwidths in the multi-bandwidth RBF MMD kernel.')
+    parser.add_argument('--ugafeat_mmd_mul', type=float, default=2.0,
+                        help='[UGAFEAT] Geometric multiplier between MMD bandwidths.')
+    parser.add_argument('--ugafeat_lambda_evi', type=float, default=1.0,
+                        help='[UGAFEAT] Weight of the DER regularization term (λ_EVI).')
+    parser.add_argument('--ugafeat_lambda_align', type=float, default=1.0,
+                        help='[UGAFEAT] Fixed weight for the MMD alignment loss (no schedule, per design 8.7).')
+    parser.add_argument('--ugafeat_use_cmixup', action='store_true', default=True,
+                        help='[UGAFEAT] Enable C-Mixup feature mixing (KDE-based label-aware).')
+    parser.add_argument('--ugafeat_no_cmixup', action='store_false', dest='ugafeat_use_cmixup',
+                        help='[UGAFEAT] Disable C-Mixup feature mixing.')
+    parser.add_argument('--ugafeat_kde_bandwidth', type=float, default=0.2,
+                        help='[UGAFEAT] Gaussian KDE bandwidth used for C-Mixup index sampling.')
 
     if parse:
         args = parser.parse_args()

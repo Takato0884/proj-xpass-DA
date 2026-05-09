@@ -12,7 +12,23 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast
 
 from .data import collate_fn
-from .train_common import num_bins
+from .train_common import num_bins, parse_da_method
+
+
+def _build_eval_model(num_bins_, num_attr, num_pt, genres, backbone_dict, args, device):
+    """Build a PIAA model for evaluation/inference.
+
+    For UGAFEAT, wraps the base PIAA model with PIAA_UGAFeat so the saved
+    state_dict (containing both base PIAA params and the DER head) loads cleanly
+    and forward() returns the final score (μ·(K-1)+1 + direct_score).
+    """
+    from .train_common import build_piaa_model
+    base = build_piaa_model(num_bins_, num_attr, num_pt, genres, backbone_dict, args).to(device)
+    method_name, _ = parse_da_method(getattr(args, 'da_method', None))
+    if method_name == 'UGAFEAT':
+        from .methods.ugafeat import PIAA_UGAFeat
+        return PIAA_UGAFeat(base).to(device)
+    return base
 
 
 def inference_giaa(test_dataset, args, device, model, model_path=None, eval_datasets_dict=None):
@@ -312,7 +328,6 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
     """
     from . import train_PIAA as _tp
     from .evaluate import evaluate_piaa as evaluate, evaluate_cross_domain
-    from .train_common import build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
@@ -346,7 +361,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
     for uid in sorted(list(all_user_ids)):
         print(f"Running inference for user {uid} using saved best model...")
         best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{model_name_base}_finetune.pth')
-        model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
+        model_user = _build_eval_model(num_bins, num_attr, num_pt, genres, backbone_dict, args, device)
         try:
             model_user.load_state_dict(torch.load(best_model_path))
         except Exception as e:
@@ -515,7 +530,6 @@ def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dic
     """
     from . import train_PIAA as _tp
     from .evaluate import evaluate_piaa as evaluate
-    from .train_common import build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
@@ -530,7 +544,7 @@ def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dic
         _tp.num_attr = num_attr
         _tp.num_pt = num_pt
 
-    model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
+    model = _build_eval_model(num_bins, num_attr, num_pt, genres, backbone_dict, args, device)
     if model_state_dict is not None:
         model.load_state_dict(model_state_dict)
     else:
@@ -562,7 +576,6 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
     """
     from . import train_PIAA as _tp
     from .evaluate import evaluate_piaa as evaluate, evaluate_cross_domain
-    from .train_common import build_piaa_model
     num_attr = _tp.num_attr
     num_pt = _tp.num_pt
 
@@ -578,7 +591,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         _tp.num_attr = num_attr
         _tp.num_pt = num_pt
 
-    model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
+    model = _build_eval_model(num_bins, num_attr, num_pt, genres, backbone_dict, args, device)
     if model_state_dict is not None:
         model.load_state_dict(model_state_dict)
     else:
