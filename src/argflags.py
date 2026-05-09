@@ -78,10 +78,13 @@ def parse_arguments(parse=True):
     parser.add_argument('--daregram_T', type=float, default=0.95,
                         help='[DAREGRAM] Cumulative eigenvalue threshold for truncated pseudo-inverse.')
     parser.add_argument('--nima_da_method', type=str, default=None,
-                        help='[DAREGRAM/UGAFEAT] DA method whose pretrained NIMA to load for PIAA_pretrain. '
+                        help='[DAREGRAM/UGAFEAT/DEEPCORAL] DA method whose pretrained NIMA to load for PIAA_pretrain. '
                              'E.g. "source_only" (load NIMA from models_pth/{ver}/{genre}/), '
-                             '"DANN"/"MCD"/"DJDOT" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
+                             '"DANN"/"MCD"/"DJDOT"/"DEEPCORAL" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
                              'Only meaningful for methods that have no GIAA-trained NIMA of their own.')
+    # DeepCORAL-specific hyperparameters
+    parser.add_argument('--coral_lambda', type=float, default=1.0,
+                        help='[DEEPCORAL] Fixed weight for the CORAL alignment loss (no schedule, per design 4.5).')
     # UGAFEAT-specific hyperparameters
     parser.add_argument('--ugafeat_mmd_num', type=int, default=5,
                         help='[UGAFEAT] Number of bandwidths in the multi-bandwidth RBF MMD kernel.')

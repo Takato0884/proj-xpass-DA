@@ -14,9 +14,10 @@ from .inference import inference, inference_giaa
 
 # Registry: method name → module path (relative to this package)
 _DA_METHOD_MODULES = {
-    'DANN':  '.methods.dann',
-    'DJDOT': '.methods.djdot',
-    'MCD':   '.methods.mcd',
+    'DANN':      '.methods.dann',
+    'DJDOT':     '.methods.djdot',
+    'MCD':       '.methods.mcd',
+    'DEEPCORAL': '.methods.deepcoral',
 }
 
 
