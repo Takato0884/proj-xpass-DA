@@ -210,14 +210,16 @@ class PIAA_UGAFeat(nn.Module):
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(self, images, personal_traits, image_attributes, genre, return_feat=False):
+        # Labels are already normalized to [0, 1] by the dataloader (data.py:752),
+        # and the DER NLL is computed on `mu` (sigmoid → [0, 1]) against that target,
+        # so `mu` itself is the prediction on the eval scale.
         m = self._model
         I_ij, direct_outputs = self.forward_feat(images, personal_traits, image_attributes, genre)
         mu, v, alpha, beta = self.head_from_feat(I_ij)
 
-        interaction_outputs = mu * (m.num_bins - 1) + 1.0
-        score = interaction_outputs + direct_outputs
+        score = mu
 
-        m._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
+        m._last_interaction_mean = mu.detach().abs().mean().item()
         m._last_direct_mean = direct_outputs.detach().abs().mean().item()
 
         if return_feat:
