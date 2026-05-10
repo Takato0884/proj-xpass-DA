@@ -34,7 +34,7 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
     total_batches = 0
     tgt_iter = iter(tgt_loader)
 
-    lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+    lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
     desc = f"Epoch {epoch} [DANN λ={lambda_:.3f}]" if epoch is not None else "Train DANN"
     progress_bar = tqdm(src_loader, leave=True, desc=desc, position=0, ncols=120, colour="#00ff00", ascii="-=")
 
@@ -45,7 +45,7 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
             tgt_iter = iter(tgt_loader)
             sample_tgt = next(tgt_iter)
 
-        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
 
         images_src = sample_src['image'].to(device)
         hist_src   = sample_src['Aesthetic'].to(device)
@@ -113,7 +113,7 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
         optimizer, mode='min', factor=args.lr_decay_factor, patience=args.lr_patience)
 
     steps_per_epoch = len(src_train_loader)
-    dann_total_steps = getattr(args, 'dann_epochs', 50) * steps_per_epoch
+    dann_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
     best_val_emd = float('inf')
     patience = 0
@@ -126,7 +126,7 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
             discriminator=discriminator, grl=grl, optimizer_disc=optimizer_disc,
             epoch=epoch, global_step=global_step, dann_total_steps=dann_total_steps)
         global_step = metrics['global_step']
-        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
 
         if args.is_log:
             wandb.log({
@@ -200,7 +200,7 @@ def _train_one_epoch_pretrain_piaa(model, src_loader, tgt_loader, discriminator,
     total_batches = 0
     tgt_iter = iter(tgt_loader)
 
-    lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+    lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
     desc = f"Epoch {epoch} [DANN λ={lambda_:.3f}]" if epoch is not None else "Train DANN"
     progress_bar = tqdm(src_loader, leave=True, desc=desc, position=0, ncols=120, colour="#00ff00", ascii="-=")
 
@@ -211,7 +211,7 @@ def _train_one_epoch_pretrain_piaa(model, src_loader, tgt_loader, discriminator,
             tgt_iter = iter(tgt_loader)
             sample_tgt = next(tgt_iter)
 
-        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
 
         images_src = sample_src['image'].to(device)
         aesthetic_src = sample_src['Aesthetic'].to(device).view(-1, 1)
@@ -284,7 +284,7 @@ def _train_one_epoch_finetune_piaa(model, src_loader, tgt_loader, discriminator,
     total_batches = 0
     tgt_iter = iter(tgt_loader)
 
-    lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+    lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
     desc = f"Epoch {epoch} [DANN finetune λ={lambda_:.3f}]" if epoch is not None else "Train DANN finetune"
     progress_bar = tqdm(src_loader, leave=True, desc=desc, position=0, ncols=120, colour="#00ff00", ascii="-=")
 
@@ -295,7 +295,7 @@ def _train_one_epoch_finetune_piaa(model, src_loader, tgt_loader, discriminator,
             tgt_iter = iter(tgt_loader)
             sample_tgt = next(tgt_iter)
 
-        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
 
         images_src = sample_src['image'].to(device)
         aesthetic_src = sample_src['Aesthetic'].to(device).view(-1, 1)
@@ -401,7 +401,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
     steps_per_epoch = len(src_loader)
-    dann_total_steps = getattr(args, 'dann_epochs', 50) * steps_per_epoch
+    dann_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
     best_val_ccc = -float('inf')
     patience = 0
@@ -416,7 +416,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
         L_y, L_d, L_d_tgt, disc_acc_tgt, global_step = _train_one_epoch_pretrain_piaa(
             model, src_loader, tgt_loader, discriminator, grl, optimizer, optimizer_disc, scaler,
             device, args, genre, epoch=epoch, global_step=global_step, dann_total_steps=dann_total_steps)
-        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+        lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
 
         if args.is_log:
             wandb.log({
@@ -568,7 +568,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
         steps_per_epoch = len(src_loader)
-        dann_total_steps = getattr(args, 'dann_epochs', 50) * steps_per_epoch
+        dann_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
         best_val_ccc = -float('inf')
         patience = 0
@@ -581,7 +581,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 model_user, src_loader, tgt_loader, discriminator, grl,
                 optimizer, optimizer_disc, scaler, device, args, genre,
                 epoch=epoch, global_step=global_step, dann_total_steps=dann_total_steps)
-            lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'dann_gamma', 10.0))
+            lambda_ = get_da_lambda(global_step, dann_total_steps, getattr(args, 'da_gamma', 10.0))
 
             genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')

@@ -104,8 +104,8 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
 
     n = max(total_batches, 1)
     return {
-        'train_emd':    running_L_y / n,
-        'train_coral':  running_L_coral / n,
+        'train_emd':   running_L_y / n,
+        'train_coral': running_L_coral / n,
     }
 
 

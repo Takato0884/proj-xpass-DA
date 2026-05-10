@@ -54,12 +54,12 @@ def parse_arguments(parse=True):
     parser.add_argument('--eval_target', type=str, default=None,
                         help='Target genre to monitor during source-only training (e.g., fashion). '
                              'Records target val EMD without doing domain adaptation.')
-    # DANN-specific hyperparameters
-    parser.add_argument('--dann_epochs', type=int, default=50,
-                        help='[DANN] λ schedule: number of epochs over which λ reaches ~1.0. '
-                             'Converted internally to total_steps = dann_epochs × (data_size / batch_size).')
-    parser.add_argument('--dann_gamma', type=float, default=10.0,
-                        help='[DANN] λ schedule: sharpness of the sigmoid (Ganin et al.)')
+    # DA λ schedule hyperparameters (shared by DANN, DeepCORAL, ...)
+    parser.add_argument('--da_schedule_epochs', type=int, default=50,
+                        help='[DA] λ schedule: number of epochs over which λ reaches ~1.0. '
+                             'Converted internally to total_steps = da_schedule_epochs × (data_size / batch_size).')
+    parser.add_argument('--da_gamma', type=float, default=10.0,
+                        help='[DA] λ schedule: sharpness of the sigmoid (Ganin et al.)')
     # DeepJDOT-specific hyperparameters
     parser.add_argument('--djdot_alpha', type=float, default=0.001,
                         help='[DJDOT] Weight for feature alignment term (L2 feature distance).')
