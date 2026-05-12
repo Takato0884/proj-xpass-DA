@@ -8,8 +8,12 @@ Implementation scope (per documents/design/UGAFeat_設計書.md):
   - PIAA pretrain / finetune only (GIAA not implemented).
   - ICI model only (MIR raises NotImplementedError).
   - DER head replaces attr_corr (Linear(64, 4) → (μ, log_v, log_α, log_β)).
+    μ ∈ [-1, 1] is the *residual correction* added to the normalized direct_score
+    (from the frozen NIMA). Final prediction is `score = direct_norm + μ` on the
+    [0, 1] eval scale. DER NLL is computed against the residual target
+    `y_norm − direct_norm` so the uncertainty terms (ν, α, β) describe confidence
+    in the correction, not the absolute score.
   - MMD aligns I_ij (64-dim) features (multi-bandwidth RBF).
-  - C-Mixup is enabled by default (toggle via --ugafeat_use_cmixup).
   - λ for alignment loss is fixed (no schedule).
 """
 
@@ -17,7 +21,6 @@ import os
 import copy
 import math
 
-import numpy as np
 import wandb
 import torch
 import torch.nn as nn
@@ -97,50 +100,16 @@ def der_loss_components(y, gamma, v, alpha, beta):
     return nll.mean(), reg.mean()
 
 
-# ── C-Mixup utilities (KDE-based label-aware mixing) ──────────────────────────
-
-def _gaussian_kde_weights(query, pool, bandwidth):
-    """Return row-normalized Gaussian weights of `pool` w.r.t. each `query`.
-
-    query: (n_q, 1) numpy
-    pool:  (n_p, 1) numpy
-    Returns (n_q, n_p) row-normalized weight matrix.
-    """
-    diff = (query - pool.T) / max(float(bandwidth), 1e-8)
-    w = np.exp(-0.5 * diff * diff)
-    s = w.sum(axis=1, keepdims=True)
-    s = np.where(s > 0, s, 1.0)
-    return w / s
-
-
-def get_batch_kde_mixup_idx(Y_query, Y_pool, bandwidth=0.2):
-    """For each entry in Y_query, sample one index in Y_pool weighted by KDE proximity."""
-    q = np.asarray(Y_query).reshape(-1, 1)
-    p = np.asarray(Y_pool).reshape(-1, 1)
-    weights = _gaussian_kde_weights(q, p, bandwidth)
-    n_p = p.shape[0]
-    n_q = q.shape[0]
-    idx = np.empty(n_q, dtype=np.int64)
-    for i in range(n_q):
-        idx[i] = np.random.choice(n_p, p=weights[i])
-    return idx
-
-
-def get_batch_kde_mixup_batch(Y1, Y2, bandwidth=0.2):
-    """Concatenate Y1 and Y2 to form Y; sample idx2 (one per Y1 entry) from Y."""
-    y1 = Y1.detach().cpu().numpy().reshape(-1) if isinstance(Y1, torch.Tensor) else np.asarray(Y1).reshape(-1)
-    y2 = Y2.detach().cpu().numpy().reshape(-1) if isinstance(Y2, torch.Tensor) else np.asarray(Y2).reshape(-1)
-    pool = np.concatenate([y1, y2], axis=0)
-    return get_batch_kde_mixup_idx(y1, pool, bandwidth=bandwidth)
-
-
 # ── PIAA UGAFeat wrapper (ICI only) ───────────────────────────────────────────
 
 class PIAA_UGAFeat(nn.Module):
     """Wraps a PIAA_ICI_CrossDomain instance, replacing attr_corr with a DER head.
 
-    forward() default returns the final score: μ·(K-1) + 1 + direct_score
-    (compatible with evaluate_piaa).
+    forward() returns the final score on the [0, 1] eval scale:
+        score = direct_norm + μ
+    where direct_norm = (direct_outputs − 1) / (num_bins − 1) is the normalized
+    NIMA expectation and μ ∈ [-1, 1] is the residual correction predicted by the
+    DER head from the interaction feature I_ij.
 
     forward(..., return_feat=True) returns (score, I_ij, (μ, ν, α, β)).
     """
@@ -172,7 +141,8 @@ class PIAA_UGAFeat(nn.Module):
         v_raw = raw[:, 1:2]
         a_raw = raw[:, 2:3]
         b_raw = raw[:, 3:4]
-        mu = torch.sigmoid(mu_logit)
+        # μ ∈ [-1, 1] is a residual correction on top of normalized direct_score.
+        mu = 2.0 * torch.sigmoid(mu_logit) - 1.0
         v = F.softplus(v_raw) + 1e-5
         alpha = F.softplus(a_raw) + 1.0 + 1e-5
         beta = F.softplus(b_raw) + 1e-5
@@ -210,17 +180,18 @@ class PIAA_UGAFeat(nn.Module):
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(self, images, personal_traits, image_attributes, genre, return_feat=False):
-        # Labels are already normalized to [0, 1] by the dataloader (data.py:752),
-        # and the DER NLL is computed on `mu` (sigmoid → [0, 1]) against that target,
-        # so `mu` itself is the prediction on the eval scale.
+        # Labels are normalized to [0, 1] by the dataloader (data.py:752). The DER head
+        # learns a residual correction μ ∈ [-1, 1] on top of the normalized direct_score
+        # (from the frozen NIMA), so the final prediction stays on the [0, 1] eval scale.
         m = self._model
         I_ij, direct_outputs = self.forward_feat(images, personal_traits, image_attributes, genre)
         mu, v, alpha, beta = self.head_from_feat(I_ij)
 
-        score = mu
+        direct_norm = (direct_outputs - 1.0) / float(m.num_bins - 1)
+        score = direct_norm + mu
 
         m._last_interaction_mean = mu.detach().abs().mean().item()
-        m._last_direct_mean = direct_outputs.detach().abs().mean().item()
+        m._last_direct_mean = direct_norm.detach().abs().mean().item()
 
         if return_feat:
             return score, I_ij, (mu, v, alpha, beta)
@@ -247,13 +218,11 @@ def _train_one_epoch_piaa(uga_model, src_loader, tgt_loader, optimizer, scaler, 
     uga_model.train()
 
     coef_evi = float(getattr(args, 'ugafeat_lambda_evi', 1.0))
-    use_cmixup = bool(getattr(args, 'ugafeat_use_cmixup', True))
-    bandwidth = float(getattr(args, 'ugafeat_kde_bandwidth', 0.2))
     lam_align = float(getattr(args, 'ugafeat_lambda_align', 1.0))
 
     running = {
         'L_evi': 0.0, 'L_nll': 0.0, 'L_reg': 0.0,
-        'L_mmd_st': 0.0, 'L_mmd_smix': 0.0,
+        'L_mmd_st': 0.0,
         'mu': 0.0, 'v': 0.0, 'alpha': 0.0, 'beta': 0.0,
     }
     n_batches = 0
@@ -282,11 +251,13 @@ def _train_one_epoch_piaa(uga_model, src_loader, tgt_loader, optimizer, scaler, 
         optimizer.zero_grad()
 
         with autocast('cuda'):
-            I_ij_src, _direct_src = uga_model.forward_feat(images_src, pt_src, attr_src, genre)
+            I_ij_src, direct_src = uga_model.forward_feat(images_src, pt_src, attr_src, genre)
             I_ij_tgt, _direct_tgt = uga_model.forward_feat(images_tgt, pt_tgt, attr_tgt, genre)
             mu_s, v_s, a_s, b_s = uga_model.head_from_feat(I_ij_src)
-            mu_t, _v_t, _a_t, _b_t = uga_model.head_from_feat(I_ij_tgt)
-            L_nll, L_reg = der_loss_components(y_src_norm, mu_s, v_s, a_s, b_s)
+            # DER NLL on the residual target so μ learns to correct direct_score.
+            direct_norm_src = (direct_src - 1.0) / float(uga_model._model.num_bins - 1)
+            y_residual = y_src_norm - direct_norm_src
+            L_nll, L_reg = der_loss_components(y_residual, mu_s, v_s, a_s, b_s)
             L_evi = L_nll + coef_evi * L_reg
 
         # Compute MMD in FP32 (outside autocast) for numerical stability.
@@ -294,23 +265,7 @@ def _train_one_epoch_piaa(uga_model, src_loader, tgt_loader, optimizer, scaler, 
         I_ij_tgt_fp = I_ij_tgt.float()
         L_mmd_st = mmd_fn(I_ij_src_fp, I_ij_tgt_fp)
 
-        L_mmd_smix = torch.zeros((), device=device)
-        if use_cmixup:
-            with torch.no_grad():
-                Y1 = mu_t.detach().view(-1)
-                Y2 = y_src_norm.detach().view(-1)
-            idx2_np = get_batch_kde_mixup_batch(Y1, Y2, bandwidth=bandwidth)
-            idx2 = torch.as_tensor(idx2_np, dtype=torch.long, device=device)
-            lam_mix = float(np.random.beta(2.0, 2.0))
-            feat_concat = torch.cat([I_ij_tgt_fp, I_ij_src_fp], dim=0)
-            feat_mix = I_ij_tgt_fp * lam_mix + feat_concat[idx2] * (1.0 - lam_mix)
-            # Pass feat_mix through head per design 5.2 step 6 (kept for parity, not used in loss).
-            with autocast('cuda'):
-                _ = uga_model.head_from_feat(feat_mix.to(I_ij_src.dtype))
-            L_mmd_smix = mmd_fn(I_ij_src_fp, feat_mix)
-
-        L_align = L_mmd_st + L_mmd_smix
-        loss = L_evi + lam_align * L_align
+        loss = L_evi + lam_align * L_mmd_st
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -320,7 +275,6 @@ def _train_one_epoch_piaa(uga_model, src_loader, tgt_loader, optimizer, scaler, 
         running['L_nll'] += float(L_nll.item())
         running['L_reg'] += float(L_reg.item())
         running['L_mmd_st'] += float(L_mmd_st.item())
-        running['L_mmd_smix'] += float(L_mmd_smix.item())
         running['mu'] += float(mu_s.detach().mean().item())
         running['v'] += float(v_s.detach().mean().item())
         running['alpha'] += float(a_s.detach().mean().item())
@@ -330,7 +284,6 @@ def _train_one_epoch_piaa(uga_model, src_loader, tgt_loader, optimizer, scaler, 
         progress.set_postfix({
             'L_evi':  f"{L_evi.item():.4f}",
             'MMD':    f"{L_mmd_st.item():.4f}",
-            'MMDmix': f"{float(L_mmd_smix.item()):.4f}",
         })
 
     n = max(n_batches, 1)
@@ -411,7 +364,6 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train L_nll":      m['L_nll'],
                 f"{genre}/Train L_reg":      m['L_reg'],
                 f"{genre}/Train L_mmd_st":   m['L_mmd_st'],
-                f"{genre}/Train L_mmd_smix": m['L_mmd_smix'],
                 f"{genre}/Train mu_mean":    m['mu'],
                 f"{genre}/Train v_mean":     m['v'],
                 f"{genre}/Train alpha_mean": m['alpha'],
@@ -575,7 +527,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 log_dict[f"{genre}/Train L_nll user_{uid}"]      = m['L_nll']
                 log_dict[f"{genre}/Train L_reg user_{uid}"]      = m['L_reg']
                 log_dict[f"{genre}/Train L_mmd_st user_{uid}"]   = m['L_mmd_st']
-                log_dict[f"{genre}/Train L_mmd_smix user_{uid}"] = m['L_mmd_smix']
                 log_dict[f"{genre}/Train mu_mean user_{uid}"]    = m['mu']
                 log_dict[f"{genre}/Train v_mean user_{uid}"]     = m['v']
                 log_dict[f"{genre}/Train alpha_mean user_{uid}"] = m['alpha']

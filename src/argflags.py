@@ -94,12 +94,6 @@ def parse_arguments(parse=True):
                         help='[UGAFEAT] Weight of the DER regularization term (λ_EVI).')
     parser.add_argument('--ugafeat_lambda_align', type=float, default=1.0,
                         help='[UGAFEAT] Fixed weight for the MMD alignment loss (no schedule, per design 8.7).')
-    parser.add_argument('--ugafeat_use_cmixup', action='store_true', default=True,
-                        help='[UGAFEAT] Enable C-Mixup feature mixing (KDE-based label-aware).')
-    parser.add_argument('--ugafeat_no_cmixup', action='store_false', dest='ugafeat_use_cmixup',
-                        help='[UGAFEAT] Disable C-Mixup feature mixing.')
-    parser.add_argument('--ugafeat_kde_bandwidth', type=float, default=0.2,
-                        help='[UGAFEAT] Gaussian KDE bandwidth used for C-Mixup index sampling.')
 
     if parse:
         args = parser.parse_args()
