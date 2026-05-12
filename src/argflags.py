@@ -80,11 +80,15 @@ def parse_arguments(parse=True):
     parser.add_argument('--nima_da_method', type=str, default=None,
                         help='[DAREGRAM/UGAFEAT/DEEPCORAL] DA method whose pretrained NIMA to load for PIAA_pretrain. '
                              'E.g. "source_only" (load NIMA from models_pth/{ver}/{genre}/), '
-                             '"DANN"/"MCD"/"DJDOT"/"DEEPCORAL" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
+                             '"DANN"/"MCD"/"DJDOT"/"DEEPCORAL"/"CDAN" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
                              'Only meaningful for methods that have no GIAA-trained NIMA of their own.')
     # DeepCORAL-specific hyperparameters
     parser.add_argument('--coral_lambda', type=float, default=1.0,
                         help='[DEEPCORAL] Fixed weight for the CORAL alignment loss (no schedule, per design 4.5).')
+    # CDAN-specific hyperparameters
+    parser.add_argument('--cdan_sigma', type=float, default=1.0,
+                        help='[CDAN] Width of the Gaussian Soft Ordinal Distribution used as conditioning '
+                             'vector g in PIAA pretrain/finetune (per design 7.9). Fixed (not scheduled).')
     # UGAFEAT-specific hyperparameters
     parser.add_argument('--ugafeat_mmd_num', type=int, default=5,
                         help='[UGAFEAT] Number of bandwidths in the multi-bandwidth RBF MMD kernel.')

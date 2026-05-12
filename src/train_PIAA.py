@@ -18,6 +18,7 @@ _DA_METHOD_MODULES_PIAA = {
     'DAREGRAM':  '.methods.daregram',
     'UGAFEAT':   '.methods.ugafeat',
     'DEEPCORAL': '.methods.deepcoral',
+    'CDAN':      '.methods.cdan',
 }
 
 num_attr = None  # Determined dynamically from dataset
@@ -231,6 +232,11 @@ def run_main(args):
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                     args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                     num_attr, num_pt, deepcoral_target_genre=target_genre)
+            elif method_name == 'CDAN':
+                mod.trainer_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    num_attr, num_pt, cdan_target_genre=target_genre)
             else:  # DJDOT
                 mod.trainer_finetune(
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,

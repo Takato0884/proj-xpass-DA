@@ -188,7 +188,7 @@ _PIAA_SYSTEM_PROMPT = (
 
 _NATIONALITY_MAP = {'JPN': 'Japan', 'KOR': 'Korea', 'CHN': 'China'}
 
-_PIAA_MAX_TOKENS = 8
+_PIAA_MAX_TOKENS = 5000
 
 
 def _make_piaa_user_prompt(user: dict) -> str:

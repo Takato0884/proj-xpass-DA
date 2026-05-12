@@ -18,6 +18,7 @@ _DA_METHOD_MODULES = {
     'DJDOT':     '.methods.djdot',
     'MCD':       '.methods.mcd',
     'DEEPCORAL': '.methods.deepcoral',
+    'CDAN':      '.methods.cdan',
 }
 
 
