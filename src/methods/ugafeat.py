@@ -511,6 +511,11 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             dirname, f'{genre_str}_{args.model_type}_user_{uid}_{experiment_name}_finetune.pth')
         scaler = GradScaler('cuda')
 
+        # epoch 0 前に pretrain 重みを保存しておく:
+        # val_ccc が一度も改善しない (NaN 等) ユーザーでも .pth が必ず存在し、
+        # inference 時の "best model not found" によるユーザー欠損を防ぐ。
+        torch.save(uga_user.state_dict(), best_model_path)
+
         for epoch in range(args.num_epochs):
             m = _train_one_epoch_piaa(
                 uga_user, src_loader, tgt_loader, optimizer, scaler, device, args, genre,

@@ -318,6 +318,12 @@ def trainer_finetune(datasets_dict, args, device, dirname, experiment_name, back
         best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{experiment_name}_finetune.pth')
 
         scaler = GradScaler('cuda')
+
+        # epoch 0 前に pretrain 重みを保存しておく:
+        # val_ccc が一度も改善しない (NaN 等) ユーザーでも .pth が必ず存在し、
+        # inference 時の "best model not found" によるユーザー欠損を防ぐ。
+        torch.save(model_user.state_dict(), best_model_path)
+
         for epoch in range(args.num_epochs):
             train_loss, _, _ = _train_one_epoch_piaa(model_user, train_loader, optimizer_user, scaler, device, args, genre, epoch=epoch)
             genre_metrics, val_mae = evaluate_piaa(model_user, val_loaders_dict, device, epoch=epoch, phase_name="Val")

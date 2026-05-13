@@ -2376,6 +2376,176 @@ def analyze_da_factors(args):
     print(f"[done] outputs in: {out_dir}")
 
 
+def basic_stats(args):
+    """ratings.csv と users.csv から基礎的な統計量を算出して表示する.
+
+    出力内容:
+      - データ全体のサイズ (users / ratings / 一意な sample 数)
+      - ジャンル(ドメイン)別: rating 数, 一意 sample 数, 参加ユーザー数
+      - set / fold 別: rating 数, ユーザー数
+      - ユーザー属性 (gender / edu / nationality / age) の分布
+      - ジャンル別の主要評定列 (Aesthetic / Like / Beautiful) と応答時間 Time の要約
+    """
+    import pandas as pd
+
+    data_dir = Path(args.data_dir)
+    ratings_csv = data_dir / "ratings.csv"
+    users_csv = data_dir / "users.csv"
+
+    if not ratings_csv.exists():
+        print(f"Error: not found: {ratings_csv}", file=sys.stderr)
+        sys.exit(1)
+    if not users_csv.exists():
+        print(f"Error: not found: {users_csv}", file=sys.stderr)
+        sys.exit(1)
+
+    ratings = pd.read_csv(ratings_csv)
+    users = pd.read_csv(users_csv)
+
+    def _hr(title):
+        print()
+        print(f"=== {title} ===")
+
+    _hr("Files")
+    print(f"  ratings_csv: {ratings_csv}  ({len(ratings):,} rows)")
+    print(f"  users_csv  : {users_csv}  ({len(users):,} rows)")
+
+    _hr("Overall")
+    print(f"  # users (users.csv)        : {len(users):,}")
+    print(f"  # users in ratings         : {ratings['user_id'].nunique():,}")
+    print(f"  # ratings (rows)           : {len(ratings):,}")
+    print(f"  # unique samples           : {ratings['sample_file'].nunique():,}")
+    print(f"  # genres (domains)         : {ratings['genre'].nunique()}  "
+          f"({sorted(ratings['genre'].dropna().unique().tolist())})")
+
+    _hr("By genre (domain)")
+    by_g = ratings.groupby("genre", dropna=False).agg(
+        n_ratings=("user_id", "size"),
+        n_users=("user_id", "nunique"),
+        n_samples=("sample_file", "nunique"),
+    ).sort_values("n_ratings", ascending=False)
+    print(f"  {'genre':<12}{'n_ratings':>12}{'n_users':>10}{'n_samples':>12}"
+          f"{'ratings/user':>14}{'ratings/sample':>16}")
+    for g, row in by_g.iterrows():
+        rpu = row["n_ratings"] / row["n_users"] if row["n_users"] else 0
+        rps = row["n_ratings"] / row["n_samples"] if row["n_samples"] else 0
+        print(f"  {str(g):<12}{int(row['n_ratings']):>12,}"
+              f"{int(row['n_users']):>10,}{int(row['n_samples']):>12,}"
+              f"{rpu:>14.2f}{rps:>16.2f}")
+
+    if "set" in ratings.columns:
+        _hr("By set")
+        by_s = ratings.groupby("set", dropna=False).agg(
+            n_ratings=("user_id", "size"),
+            n_users=("user_id", "nunique"),
+            n_samples=("sample_file", "nunique"),
+        ).sort_index()
+        print(f"  {'set':<6}{'n_ratings':>12}{'n_users':>10}{'n_samples':>12}")
+        for s, row in by_s.iterrows():
+            print(f"  {str(s):<6}{int(row['n_ratings']):>12,}"
+                  f"{int(row['n_users']):>10,}{int(row['n_samples']):>12,}")
+
+    if "fold" in ratings.columns:
+        _hr("By fold")
+        by_f = ratings.groupby("fold", dropna=False).agg(
+            n_ratings=("user_id", "size"),
+            n_users=("user_id", "nunique"),
+        ).sort_index()
+        print(f"  {'fold':<6}{'n_ratings':>12}{'n_users':>10}")
+        for f_, row in by_f.iterrows():
+            print(f"  {str(f_):<6}{int(row['n_ratings']):>12,}"
+                  f"{int(row['n_users']):>10,}")
+
+    _hr("Genre × fold (n_users)")
+    if {"genre", "fold"}.issubset(ratings.columns):
+        gf = ratings.groupby(["genre", "fold"])["user_id"].nunique().unstack(fill_value=0)
+        print(gf.to_string())
+
+    _hr("User demographics (users.csv)")
+    if "age" in users.columns:
+        age = pd.to_numeric(users["age"], errors="coerce").dropna()
+        print(f"  age: n={len(age)}  mean={age.mean():.2f}  std={age.std():.2f}  "
+              f"median={age.median():.1f}  min={int(age.min())}  max={int(age.max())}")
+    for col in ("gender", "edu", "nationality"):
+        if col in users.columns:
+            vc = users[col].value_counts(dropna=False)
+            total = vc.sum()
+            print(f"  {col}:")
+            for v, c in vc.items():
+                pct = 100.0 * c / total if total else 0
+                print(f"    {str(v):<20}{int(c):>6,}  ({pct:5.1f}%)")
+
+    _hr("Domain experience (binary)")
+    # ドメイン経験を 2 値化:
+    #   learn_bin    = (*_learn   == 1)   ← もとから 0/1
+    #   interest_bin = (*_interest >  0)   ← 0-6 Likert を >0 で 2 値化
+    #   any_exp      = learn_bin OR interest_bin
+    # scenery は photoVideo_* 列にマップ (analyze_da_factors と同じ規約).
+    learn_prefix = {"art": "art", "fashion": "fashion", "scenery": "photoVideo"}
+    n_users_total = len(users)
+    print(f"  {'domain':<10}{'learn=1':>14}{'interest>0':>16}"
+          f"{'any_exp':>14}   (n_users={n_users_total})")
+    for dom in ("art", "fashion", "scenery"):
+        lp = learn_prefix[dom]
+        lc = f"{lp}_learn"
+        ic = f"{lp}_interest"
+        if lc not in users.columns or ic not in users.columns:
+            continue
+        learn_bin = (pd.to_numeric(users[lc], errors="coerce").fillna(0) > 0)
+        intr_bin = (pd.to_numeric(users[ic], errors="coerce").fillna(0) > 0)
+        any_bin = learn_bin | intr_bin
+        def _fmt(s):
+            n = int(s.sum())
+            pct = 100.0 * n / n_users_total if n_users_total else 0
+            return f"{n:>4} ({pct:5.1f}%)"
+        print(f"  {dom:<10}{_fmt(learn_bin):>14}{_fmt(intr_bin):>16}"
+              f"{_fmt(any_bin):>14}")
+
+    # 評定参加者のうちドメイン経験ありの割合 (genre × any_exp).
+    if "user_id" in users.columns and "user_id" in ratings.columns:
+        print()
+        print(f"  Among raters of each genre (any_exp = learn=1 or interest>0):")
+        print(f"    {'genre':<10}{'raters':>10}{'with_exp':>12}{'pct':>10}")
+        for dom in ("art", "fashion", "scenery"):
+            lp = learn_prefix[dom]
+            lc, ic = f"{lp}_learn", f"{lp}_interest"
+            if lc not in users.columns or ic not in users.columns:
+                continue
+            any_bin = (
+                (pd.to_numeric(users[lc], errors="coerce").fillna(0) > 0)
+                | (pd.to_numeric(users[ic], errors="coerce").fillna(0) > 0)
+            )
+            exp_uids = set(users.loc[any_bin, "user_id"].astype(int).tolist())
+            raters = ratings.loc[ratings["genre"] == dom, "user_id"].unique()
+            n_r = len(raters)
+            n_exp = sum(1 for u in raters if int(u) in exp_uids)
+            pct = 100.0 * n_exp / n_r if n_r else 0
+            print(f"    {dom:<10}{n_r:>10,}{n_exp:>12,}{pct:>9.1f}%")
+
+    _hr("Score distribution by genre")
+    score_cols = [c for c in ("Aesthetic", "Like", "Beautiful") if c in ratings.columns]
+    for col in score_cols:
+        print(f"  [{col}]")
+        sub = ratings.groupby("genre")[col].agg(["count", "mean", "std", "min", "max"])
+        for g, row in sub.iterrows():
+            print(f"    {str(g):<12}n={int(row['count']):>7,}  "
+                  f"mean={row['mean']:.3f}  std={row['std']:.3f}  "
+                  f"min={row['min']:.0f}  max={row['max']:.0f}")
+
+    if "Time" in ratings.columns:
+        _hr("Response time (Time, seconds) by genre")
+        t = ratings.copy()
+        t["Time"] = pd.to_numeric(t["Time"], errors="coerce")
+        sub = t.groupby("genre")["Time"].agg(["count", "mean", "median", "std",
+                                              "min", "max"])
+        for g, row in sub.iterrows():
+            print(f"    {str(g):<12}n={int(row['count']):>7,}  "
+                  f"mean={row['mean']:.2f}  median={row['median']:.2f}  "
+                  f"std={row['std']:.2f}  min={row['min']:.2f}  max={row['max']:.2f}")
+
+    print()
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -2714,6 +2884,20 @@ if __name__ == '__main__':
     adf_parser.add_argument("--no-plots", action="store_true", dest="no_plots",
                             help="Skip plot generation")
 
+    # Subcommand: basic_stats
+    bs_parser = subparsers.add_parser(
+        "basic_stats",
+        help="ratings.csv と users.csv から基礎的な統計量を算出 "
+             "(ユーザー数, ドメイン別サンプル数, 評定/応答時間の要約 など)",
+    )
+    bs_parser.add_argument(
+        "--data-dir", type=str,
+        default=str(Path(__file__).resolve().parent.parent / "data" / "maked"),
+        dest="data_dir",
+        help="ratings.csv と users.csv を含むディレクトリ "
+             "(default: <project_root>/data/maked)",
+    )
+
     args = parser.parse_args()
 
     if args.command == 'aggregate':
@@ -2726,5 +2910,7 @@ if __name__ == '__main__':
         visualize_domain_gap(args)
     elif args.command == 'analyze_da_factors':
         analyze_da_factors(args)
+    elif args.command == 'basic_stats':
+        basic_stats(args)
     else:
         parser.print_help()
