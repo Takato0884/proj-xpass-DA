@@ -17,7 +17,7 @@ XPASSは、クロスドメイン個人化画像美的評価（PIAA）のため�
 6. [学習（PIAA）](#piaa事前学習--ファインチューニングici--mir)
 7. [推論（スタンドアロン）](#推論スタンドアロン)
 8. [LLM ゼロショット推論](#llm-ゼロショット推論)
-9. [分析ツール](#分析ツール)
+9. [分析ツール](#分析ツール)（[fold集約](#fold結果の集約aggregate) / [特徴量可視化](#特徴量の2d可視化visualize_features) / [ドメインギャップ](#ドメインギャップの可視化visualize_domain_gap) / [DA成否要因分析](#da成否要因の分析analyze_da_factors)）
 10. [特徴量の次元構成](#特徴量の次元構成)
 11. [コミットメッセージ規則](#コミットメッセージ規則)
 
@@ -766,6 +766,146 @@ python src/analysis.py visualize_domain_gap \
 | `--root-dir` | str | `proj-xpass-DA/data` | `maked/` および `split/` を含むデータルートディレクトリ |
 | `--models-pth-dir` | str | `proj-xpass-DA/models_pth` | 保存済み `.pth` モデルのルートディレクトリ |
 | `-o` / `--output-dir` | str | `reports/feature_viz` | 出力先ディレクトリ。ファイル名は `{source}2{target}_{uda_methods}_domain_gap_{method}.png` で自動生成 |
+
+---
+
+### DA成否要因の分析（analyze_da_factors）
+
+「どんなユーザーで DA が効くのか／効かないのか」を **per-user の Δ メトリクス** と **個人特徴** との **線形回帰** で調べる分析です。
+
+per-user の改善量を
+
+$$\Delta = \text{metric}(\text{DA finetune}, \text{target}) - \text{metric}(\text{no-DA finetune}, \text{target})$$
+
+と定義し（`mae` は符号反転で「Δ>0=改善」に統一）、`baseline_{metric}_target`（no-DA 時の target 性能 = 平均回帰の交絡）と `baseline_{metric}_source`（no-DA 時の source 性能）を統制変数として含めた上で、標準化済み特徴量に対して **OLS** を当てはめます:
+
+- 係数 β / 標準誤差 SE / t値 / p値 (BH-FDR 補正) / VIF を出力
+- 全データでの R² と adj-R² を報告（単発のフィット、交差検証は行わない）
+
+特徴量は z-score 標準化するので、β は「その特徴量が +1 SD 変化したときに Δ が何 CCC ポイント動くか」を表し、特徴量間で直接比較できます。
+
+#### 算出されるユーザー特徴量
+
+`reports/da_factors/{src}2{tgt}_{model}_{da}/per_user_features.csv` に保存される全列。スカラー値はすべて連続値（ワンホット化されるのは `gender` / `edu` / `nationality` のみ、各カテゴリ群の最初の水準は `drop_first=True` で参照カテゴリとして除外され多重共線性を回避）。
+
+**1. Big5 性格因子（5次元）** — TIPI（Gosling 2003, 1–7 リッカート）採点。`users.csv` の `Q1..Q10` から正項目＋逆項目の平均で算出。
+
+| 列名 | 因子 | 正項目 / 逆項目 |
+|------|------|----------------|
+| `big5_E` | Extraversion（外向性） | Q1 / Q6 |
+| `big5_A` | Agreeableness（協調性） | Q7 / Q2 |
+| `big5_C` | Conscientiousness（誠実性） | Q3 / Q8 |
+| `big5_ES` | Emotional Stability（情緒安定性） | Q9 / Q4 |
+| `big5_O` | Openness（開放性） | Q5 / Q10 |
+
+**2. 個人属性・人口統計**
+
+| 列 | 型 | 説明 |
+|----|----|------|
+| `age` | 連続 | 年齢 |
+| `{art,fashion,photoVideo}_interest` | 連続（1–7） | ドメイン興味 |
+| `{art,fashion,photoVideo}_learn` | 0/1 | ドメイン教育経験 |
+| `gender_*` | one-hot | 性別 |
+| `edu_level` | 順序（1–7） | 学歴 — `1:high_school` < `2:vocational` < `3:junior_college` < `4:technical_college` < `5:university` < `6:graduate` < `7:博士`（教育年数順） |
+| `nationality_*` | one-hot | 国籍 |
+
+**3. 評価スタイル（src/tgt × 4 統計量 = 8列）**
+
+| 列名 | 説明 |
+|------|------|
+| `src_{src}_mean`, `tgt_{tgt}_mean` | そのドメイン内のスコア平均 |
+| `src_{src}_std`, `tgt_{tgt}_std` | スコア標準偏差 |
+| `src_{src}_skew`, `tgt_{tgt}_skew` | スコア歪度 |
+| `src_{src}_kurt`, `tgt_{tgt}_kurt` | スコア尖度 |
+
+**4. 信頼性・汎用性（src/tgt 各々）**
+
+| 列名 | 説明 |
+|------|------|
+| `retest_mae_{src/tgt}` | テスト再テスト誤差（同一サンプル繰り返し評価の MAE）— 低いほど評価が一貫 |
+| `generality_{src/tgt}` | 「他ユーザー平均評価」との Pearson 相関 — 高いほど「普通っぽい」評価傾向 |
+
+**5. シフト特徴量（|target − source|、計 8列）** — src/tgt ペアになっている量すべてについて **絶対差** を計算。方向情報を捨て、ドメイン間の「ギャップの大きさ／類似性」を per-user で表す指標。`0` に近いほどそのユーザーは両ドメインで似た挙動・属性を持ち、大きいほど乖離している。
+
+| 列名（canonical） | 元の量 | 意味（小さいほど類似） |
+|------|--------|------|
+| `shift_mean_src_to_tgt` | 平均 | スコア平均のドメイン間距離 |
+| `shift_std_src_to_tgt` | 標準偏差 | ばらつきの違いの大きさ |
+| `shift_skew_src_to_tgt` | 歪度 | 評価分布の非対称性の違いの大きさ |
+| `shift_kurt_src_to_tgt` | 尖度 | 極端評価の出やすさの違いの大きさ |
+| `shift_retest_mae_src_to_tgt` | retest MAE | 評価一貫性のドメイン差の大きさ |
+| `shift_generality_src_to_tgt` | generality | 「普通っぽさ」のドメイン差の大きさ |
+| `shift_interest_src_to_tgt` | 興味 (1–7) | ドメイン興味の非類似度 |
+| `shift_learn_src_to_tgt` | 教育経験 (0/1) | 0 = 両ドメインで同じ／1 = 異なる |
+
+> 絶対値にしている理由: 後段の線形回帰で signed と abs を併用すると多重共線性が起きやすいため、片側に揃えて「ドメイン間ギャップ」の解釈で統一しています。
+>
+> scenery ドメインの `interest` / `learn` は `users.csv` の `photoVideo_*` 列にマップされます。
+
+**6. ベースライン（コントロール変数）**
+
+| 列名 | 説明 |
+|------|------|
+| `baseline_{metric}_target` | no-DA finetune のターゲット側 per-user メトリクス（平均回帰効果の制御用） |
+| `baseline_{metric}_source` | 同・ソース側 |
+
+#### コマンド例
+
+実行すると常に全 6 ペア (art↔fashion↔scenery) を一括で解析し、各ペアの結果は別ディレクトリに出力されます。
+
+```bash
+# ICI × DANN の DA 成否要因を全ペアで分析（metric=CCC）
+python src/analysis.py analyze_da_factors \
+  --version v3 --model-type ICI --da-method DANN --metric ccc
+
+# fold を絞る・プロットなしで CSV だけ出す
+python src/analysis.py analyze_da_factors \
+  --version v3 --model-type ICI --da-method DJDOT \
+  --folds 1 2 3 --no-plots
+```
+
+**出力ファイル** — `reports/da_factors/{src}2{tgt}_{model}_{da}/` 配下（6 ペア分すべて生成）:
+- `per_user_features.csv` — 上記すべての特徴量と Δ を結合した per-user テーブル
+- `delta_summary.json` — Δ の記述統計（n / mean / median / std / P(Δ>0)）
+- `regression_results.csv` — 特徴量ごとの `ols_coef_std` / `ols_se` / `ols_t` / `ols_p` / `ols_p_fdr` / `vif`（|β| 降順）
+- `regression_summary.json` — OLS の全データ R² / adj-R²
+- `delta_histogram.png` — target/source の Δ ヒストグラム
+- `feature_importance.png` — 上位 K 特徴量の OLS β（±95% CI、FDR<0.05 を赤）の棒グラフ
+
+**ペア横断の集約ランキング** — 6 ペアすべて完了後、`reports/da_factors/_aggregated_{model}_{da}_{metric}/` に以下を出力:
+- `aggregated_ols_betas.csv` — 各ペアの `regression_results.csv` から **標準化 OLS β** を取り出し、ペアで **平均** したワイド表。`|β|` 平均の降順。各行に `beta_{pair}` × 6 + `beta_mean` / `beta_std` / `se_mean` / `n_pairs` / `n_sig_fdr`（FDR<0.05 となったペア数）
+- `per_pair_ols_betas.csv` — `(pair, feature, ols_coef_std, ols_se, ols_t, ols_p, ols_p_fdr, vif)` の long フォーマット
+- `aggregated_feature_importance.png` — 上位 K 特徴量の `beta_mean`（±ペア間 95% CI = 1.96·std/√n_pairs）の棒グラフ。半数以上のペアで FDR<0.05 だった特徴を赤で表示
+
+集約時の特徴量の扱い:
+| 種類 | 例 | 扱い |
+|------|-----|------|
+| **paired**（src/tgt 固有） | `generality_art`, `tgt_fashion_mean`, `src_art_std`, `shift_*_art_to_fashion`, `art_learn`, `art_interest`, `baseline_ccc_target` | 正準名（`generality_src/tgt`, `style_tgt_mean`, `style_src_std`, `shift_*_src_to_tgt`, `learn_src/tgt`, `interest_src/tgt`, `baseline_src/tgt`）にリネームしてからペア平均 |
+| **global**（domain-general、ペア間で同名） | `big5_*`, `age`, `gender_*`, `edu_level`, `nationality_*` | そのままの列名で 6 ペア分を平均 |
+| **off-domain scenery**（scenery がペアに含まれない場合） | art↔fashion ペアでの `photoVideo_learn` / `photoVideo_interest` | `scenery_learn` / `scenery_interest` にリネームして集約（該当ペアのみなので `n_pairs=2`）|
+| **off-domain (その他)**（このペアの src/tgt 以外のドメインに属する learn/interest） | art↔scenery ペアでの `fashion_learn` 等 | drop（同じ users.csv 列が `learn_src/tgt` と二重カウントになるのを防ぐため）|
+
+> `photoVideo_*` は scenery ドメインの観測実体なので、scenery がペアに含まれない場合でも捨てずに `scenery_*` の off-domain 特徴として残します（scenery がペアにある場合は通常通り `learn_src/tgt`・`interest_src/tgt` にリネーム）。
+
+> 標準化 β なので「その特徴が +1 SD 動いたときに Δ が何 metric ポイント動くか」をペア間で直接比較できます。ペア内で多重共線が強い特徴は VIF が大きく出るので、解釈時は各ペアの `regression_results.csv` で個別 VIF も確認してください。scenery ドメインの `interest` / `learn` は `users.csv` の `photoVideo_*` 列にマップされます。
+
+#### オプション引数一覧（analyze_da_factors）
+
+| 引数 | 型 | デフォルト | 説明 |
+|------|----|-----------|------|
+| `--version` | str | (必須) | データセットバージョン（例: `v3` → `v3_fold*` を探索） |
+| `--model-type` | str | `ICI` | PIAA モデル（`ICI` / `MIR`） |
+| `--da-method` | str | (必須) | DA 手法タグ（`DANN` / `DJDOT` / `DAREGRAM` / `MCD` 等） |
+| `--metric` | str | `ccc` | per-user メトリクス（`ccc` / `srocc` / `ndcg@10` / `mae`）。`mae` は符号反転 |
+| `--folds` | list | なし | 特定 fold に限定（省略時は共通 fold すべて） |
+| `--score-col` | str | `Aesthetic` | 評価スタイル算出に使うスコア列 |
+| `--reports-dir` | str | `reports/exp` | finetune JSON を探すディレクトリ |
+| `--data-dir` | str | `<project_root>/data` | `maked/users.csv` と `ratings.csv` を含むディレクトリ |
+| `-o` / `--output-dir` | str | `reports/da_factors` | 出力ディレクトリ |
+| `--top-k` | int | `10` | feature importance バー図に表示する上位特徴量数（|OLS β| 降順） |
+| `--no-plots` | flag | False | プロット生成をスキップ |
+
+> 解析は常に `(art, fashion, scenery)` の全 6 順序ペアを対象に実行されます（ソース／ターゲットを個別に指定するオプションはありません）。
 
 ---
 
