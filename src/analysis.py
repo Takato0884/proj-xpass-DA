@@ -2546,6 +2546,248 @@ def basic_stats(args):
     print()
 
 
+def plot_user_traits(args):
+    """users.csv から Domain Interest と Personality Trait (TIPI Big5) の
+    分布を 2 枚並びの箱ひげ図で可視化する.
+
+    - Domain Interest:  art_interest / fashion_interest / photoVideo_interest
+                        (0-6 Likert)
+    - Personality Trait: TIPI Big5 (Q1..Q10 → 1-7 スケールで forward + reverse 平均)
+                         Extraversion / Agreeableness / Conscientiousness /
+                         Emotional Stability / Openness
+    """
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    users_csv = Path(args.users_csv)
+    if not users_csv.exists():
+        print(f"Error: not found: {users_csv}", file=sys.stderr)
+        sys.exit(1)
+
+    users = pd.read_csv(users_csv)
+
+    # --- Domain Interest ---
+    # 元データは 0-6 Likert. Personality Trait と同じ 1-7 スケールに揃えるため +1.
+    interest_map = {
+        "Art": "art_interest",
+        "Fashion": "fashion_interest",
+        "Scenery": "photoVideo_interest",
+    }
+    interest_data = {}
+    for label, col in interest_map.items():
+        if col not in users.columns:
+            print(f"Error: column '{col}' not found in {users_csv}", file=sys.stderr)
+            sys.exit(1)
+        interest_data[label] = (
+            pd.to_numeric(users[col], errors="coerce").dropna().values + 1.0
+        )
+
+    # --- Personality Trait: TIPI Big5 ---
+    # Q1..Q10 は 0..6 で保存されているので +1 して 1..7 に. 逆転項目は (8 - x).
+    for i in range(1, 11):
+        if f"Q{i}" not in users.columns:
+            print(f"Error: column 'Q{i}' not found in {users_csv}", file=sys.stderr)
+            sys.exit(1)
+    q = {i: pd.to_numeric(users[f"Q{i}"], errors="coerce") + 1.0 for i in range(1, 11)}
+    big5 = pd.DataFrame({
+        "Ext.": (q[1]  + (8 - q[6]))  / 2.0,
+        "Agr.": ((8 - q[2])  + q[7])  / 2.0,
+        "Con.": (q[3]  + (8 - q[8]))  / 2.0,
+        "E.S.": ((8 - q[4])  + q[9])  / 2.0,
+        "Opn.": (q[5]  + (8 - q[10])) / 2.0,
+    })
+
+    # --- Plot ---
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5),
+                             gridspec_kw={"width_ratios": [3, 5]})
+
+    fs = float(args.font_size)
+    mean_props = {"marker": "D", "markerfacecolor": "red",
+                  "markeredgecolor": "red", "markersize": max(4, fs * 0.45)}
+    median_props = {"color": "black", "linewidth": 1.5}
+
+    def _color_boxes(bp, colors):
+        for patch, c in zip(bp["boxes"], colors):
+            patch.set_facecolor(c)
+            patch.set_edgecolor("black")
+            patch.set_alpha(0.7)
+
+    def _style_axis(ax):
+        ax.set_ylim(0.5, 7.5)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.tick_params(axis="x", labelsize=fs)
+        ax.tick_params(axis="y", labelsize=fs)
+        ax.yaxis.label.set_size(fs)
+        ax.title.set_size(fs * 1.1)
+
+    ax = axes[0]
+    labels = list(interest_data.keys())
+    data = [interest_data[k] for k in labels]
+    interest_colors = ["#4C72B0", "#DD8452", "#55A467"]
+    bp = ax.boxplot(data, tick_labels=labels, showmeans=True,
+                    patch_artist=True,
+                    meanprops=mean_props, medianprops=median_props)
+    _color_boxes(bp, interest_colors)
+    ax.set_title(f"Domain Interest  (n={len(users):,})")
+    ax.set_ylabel("Interest score (1-7)")
+    _style_axis(ax)
+
+    ax = axes[1]
+    labels = list(big5.columns)
+    data = [big5[c].dropna().values for c in labels]
+    big5_colors = ["#8172B2", "#937860", "#DA8BC3", "#8C8C8C", "#CCB974"]
+    bp = ax.boxplot(data, tick_labels=labels, showmeans=True,
+                    patch_artist=True,
+                    meanprops=mean_props, medianprops=median_props)
+    _color_boxes(bp, big5_colors)
+    ax.set_title(f"Personality Trait (TIPI Big5)  (n={len(users):,})")
+    ax.set_ylabel("Score (1-7)")
+    _style_axis(ax)
+
+    fig.tight_layout()
+
+    out_path = Path(args.output)
+    if out_path.parent and not out_path.parent.exists():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def plot_rating_histograms(args):
+    """ratings.csv から美的評価＋美的感情の正規化ヒストグラムを 2×5 で描画する.
+
+    各サブプロットは 1-7 Likert 上の確率分布 (count / n_per_genre) で,
+    ジャンル (art / fashion / scenery) ごとに横並び棒グラフを描画.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ratings_csv = Path(args.ratings_csv)
+    if not ratings_csv.exists():
+        print(f"Error: not found: {ratings_csv}", file=sys.stderr)
+        sys.exit(1)
+
+    ratings = pd.read_csv(ratings_csv)
+
+    cols = list(args.columns)
+    if len(cols) != 10:
+        print(f"Error: --columns must have exactly 10 names "
+              f"(got {len(cols)}: {cols})", file=sys.stderr)
+        sys.exit(1)
+    missing = [c for c in cols if c not in ratings.columns]
+    if missing:
+        print(f"Error: columns not in ratings.csv: {missing}", file=sys.stderr)
+        sys.exit(1)
+    genres = list(args.genres)
+    missing_g = [g for g in genres if g not in set(ratings["genre"].unique())]
+    if missing_g:
+        print(f"Error: genres not found in ratings.csv: {missing_g}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    fs = float(args.font_size)
+
+    # 添付画像に倣ったジャンル別スタイル
+    genre_styles = {
+        "art":     {"color": "#F2A93B", "hatch": ""},
+        "fashion": {"color": "#A6CE5A", "hatch": "//"},
+        "scenery": {"color": "#5B8AB8", "hatch": "xx"},
+    }
+
+    bins_centers = np.arange(1, 8)            # 1..7
+    bin_edges = np.arange(0.5, 8.5, 1.0)
+    n_g = len(genres)
+    bar_width = 0.8 / n_g
+    offsets = np.linspace(-(n_g - 1) / 2.0, (n_g - 1) / 2.0, n_g) * bar_width
+
+    fig, axes = plt.subplots(2, 5,
+                             figsize=tuple(args.figsize),
+                             sharex=True, sharey=args.share_y)
+    axes_flat = axes.flatten()
+
+    handles, labels_ = [], []
+    for i, col in enumerate(cols):
+        ax = axes_flat[i]
+        for g_idx, g in enumerate(genres):
+            sub = ratings.loc[ratings["genre"] == g, col]
+            vals = pd.to_numeric(sub, errors="coerce").dropna() + 1.0  # 0-6 → 1-7
+            counts, _ = np.histogram(vals, bins=bin_edges)
+            total = counts.sum()
+            prop = counts / total if total else counts
+            x = bins_centers + offsets[g_idx]
+            style = genre_styles.get(g, {"color": f"C{g_idx}", "hatch": ""})
+            bars = ax.bar(x, prop, width=bar_width,
+                          color=style["color"], edgecolor="black",
+                          linewidth=0.6, hatch=style["hatch"], label=g)
+            if i == 0:
+                handles.append(bars[0])
+                labels_.append(g)
+
+        ax.set_title(col, fontsize=fs * 1.05)
+        ax.set_xticks(bins_centers)
+        ax.tick_params(axis="x", labelsize=fs * 0.9)
+        ax.tick_params(axis="y", labelsize=fs * 0.9)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        if i % 5 == 0:
+            ax.set_ylabel("Proportion", fontsize=fs)
+
+    fig.legend(handles, labels_, loc="upper center",
+               ncol=n_g, fontsize=fs, frameon=True,
+               bbox_to_anchor=(0.5, 1.0))
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    out_path = Path(args.output)
+    if out_path.parent and not out_path.parent.exists():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+    if not args.no_stats:
+        print()
+        print("=== Per-item rating statistics "
+              "(raw + 1, plot display scale; per-item range visible in min/max) ===")
+        header = (f"  {'genre':<10}{'n':>7}{'mean':>8}{'std':>8}"
+                  f"{'median':>9}{'Q1':>7}{'Q3':>7}{'min':>5}{'max':>5}{'mode':>6}")
+        for col in cols:
+            print()
+            print(f"[{col}]")
+            print(header)
+            # per-genre rows + aggregate
+            rows = []
+            for g in genres:
+                v = pd.to_numeric(
+                    ratings.loc[ratings["genre"] == g, col],
+                    errors="coerce",
+                ).dropna() + 1.0
+                rows.append((g, v))
+            v_all = pd.to_numeric(
+                ratings.loc[ratings["genre"].isin(genres), col],
+                errors="coerce",
+            ).dropna() + 1.0
+            rows.append(("all", v_all))
+            for name, v in rows:
+                if len(v) == 0:
+                    print(f"  {name:<10}{0:>7}  (no data)")
+                    continue
+                mode_val = int(v.round().mode().iloc[0])
+                print(
+                    f"  {name:<10}{len(v):>7,}"
+                    f"{v.mean():>8.2f}{v.std():>8.2f}"
+                    f"{v.median():>9.2f}"
+                    f"{v.quantile(0.25):>7.2f}{v.quantile(0.75):>7.2f}"
+                    f"{int(v.min()):>5}{int(v.max()):>5}"
+                    f"{mode_val:>6}"
+                )
+        print()
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -2898,6 +3140,81 @@ if __name__ == '__main__':
              "(default: <project_root>/data/maked)",
     )
 
+    # Subcommand: plot_user_traits
+    put_parser = subparsers.add_parser(
+        "plot_user_traits",
+        help="users.csv から Domain Interest と Personality Trait (TIPI Big5) の "
+             "分布を箱ひげ図で可視化",
+    )
+    put_parser.add_argument(
+        "--users-csv", type=str,
+        default=str(Path(__file__).resolve().parent.parent
+                    / "data" / "maked" / "users.csv"),
+        dest="users_csv",
+        help="users.csv のパス (default: <project_root>/data/maked/users.csv)",
+    )
+    put_parser.add_argument(
+        "-o", "--output", type=str,
+        default="reports/user_traits.png",
+        help="出力する図のパス (default: reports/user_traits.png)",
+    )
+    put_parser.add_argument(
+        "--font-size", type=float, default=12.0,
+        dest="font_size",
+        help="軸ラベル・目盛・タイトルの基本フォントサイズ (default: 12)",
+    )
+
+    # Subcommand: plot_rating_histograms
+    prh_parser = subparsers.add_parser(
+        "plot_rating_histograms",
+        help="ratings.csv から美的評価＋美的感情の正規化ヒストグラムを "
+             "2×5 で描画 (ジャンル別)",
+    )
+    prh_parser.add_argument(
+        "--ratings-csv", type=str,
+        default=str(Path(__file__).resolve().parent.parent
+                    / "data" / "maked" / "ratings.csv"),
+        dest="ratings_csv",
+        help="ratings.csv のパス (default: <project_root>/data/maked/ratings.csv)",
+    )
+    prh_parser.add_argument(
+        "--columns", type=str, nargs="+",
+        default=["Aesthetic", "Like", "Beautiful",
+                 "Impressed", "Intellectually",
+                 "Motivated", "Amused", "Nostalgic", "Sad", "Distasteful"],
+        help="プロットする 10 カラム (row-major で 2×5 に並ぶ. "
+             "default: 美的評価 3 + 美的感情 7)",
+    )
+    prh_parser.add_argument(
+        "--genres", type=str, nargs="+",
+        default=["art", "fashion", "scenery"],
+        help="比較するジャンル (default: art fashion scenery)",
+    )
+    prh_parser.add_argument(
+        "--share-y", action=argparse.BooleanOptionalAction,
+        default=True, dest="share_y",
+        help="サブプロット間で Y 軸スケールを共有 (default: True. "
+             "個別スケールにしたいときは --no-share-y)",
+    )
+    prh_parser.add_argument(
+        "--figsize", type=float, nargs=2, default=[18.0, 7.0],
+        help="figure サイズ (W H) (default: 18 7)",
+    )
+    prh_parser.add_argument(
+        "--font-size", type=float, default=12.0, dest="font_size",
+        help="フォントサイズ (default: 12)",
+    )
+    prh_parser.add_argument(
+        "-o", "--output", type=str,
+        default="reports/rating_histograms.png",
+        help="出力する図のパス (default: reports/rating_histograms.png)",
+    )
+    prh_parser.add_argument(
+        "--no-stats", action="store_true", dest="no_stats",
+        help="項目ごとの基本統計量 (n, mean, std, median, Q1, Q3, min, max, mode) "
+             "の標準出力をスキップ",
+    )
+
     args = parser.parse_args()
 
     if args.command == 'aggregate':
@@ -2912,5 +3229,9 @@ if __name__ == '__main__':
         analyze_da_factors(args)
     elif args.command == 'basic_stats':
         basic_stats(args)
+    elif args.command == 'plot_user_traits':
+        plot_user_traits(args)
+    elif args.command == 'plot_rating_histograms':
+        plot_rating_histograms(args)
     else:
         parser.print_help()

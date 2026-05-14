@@ -78,7 +78,7 @@ def parse_arguments(parse=True):
     parser.add_argument('--daregram_T', type=float, default=0.95,
                         help='[DAREGRAM] Cumulative eigenvalue threshold for truncated pseudo-inverse.')
     parser.add_argument('--nima_da_method', type=str, default=None,
-                        help='[DAREGRAM/UGAFEAT/DEEPCORAL] DA method whose pretrained NIMA to load for PIAA_pretrain. '
+                        help='[DAREGRAM/UGAFEAT/DEEPCORAL/RSD] DA method whose pretrained NIMA to load for PIAA_pretrain. '
                              'E.g. "source_only" (load NIMA from models_pth/{ver}/{genre}/), '
                              '"DANN"/"MCD"/"DJDOT"/"DEEPCORAL"/"CDAN" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
                              'Only meaningful for methods that have no GIAA-trained NIMA of their own.')
@@ -98,6 +98,13 @@ def parse_arguments(parse=True):
                         help='[UGAFEAT] Weight of the DER regularization term (λ_EVI).')
     parser.add_argument('--ugafeat_lambda_align', type=float, default=1.0,
                         help='[UGAFEAT] Fixed weight for the MMD alignment loss (no schedule, per design 8.7).')
+    # RSD-specific hyperparameters
+    parser.add_argument('--rsd_beta', type=float, default=0.01,
+                        help='[RSD] Weight β for the RSD loss (sum of sin of principal angles).')
+    parser.add_argument('--rsd_gamma', type=float, default=1e-5,
+                        help='[RSD] Weight γ for the BMP loss (basis mismatch penalization).')
+    parser.add_argument('--rsd_eps', type=float, default=1e-8,
+                        help='[RSD] Numerical stabilization ε for sqrt(1 - cos²θ).')
 
     if parse:
         args = parser.parse_args()

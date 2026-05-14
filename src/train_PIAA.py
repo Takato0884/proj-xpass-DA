@@ -19,6 +19,7 @@ _DA_METHOD_MODULES_PIAA = {
     'UGAFEAT':   '.methods.ugafeat',
     'DEEPCORAL': '.methods.deepcoral',
     'CDAN':      '.methods.cdan',
+    'RSD':       '.methods.rsd',
 }
 
 num_attr = None  # Determined dynamically from dataset
@@ -97,7 +98,7 @@ def run_main(args):
     # from any other DA method or source_only via --nima_da_method.
     # DAREGRAM/UGAFEAT default to 'source_only' (ICI / MIR 共通) when not specified.
     nima_override = getattr(args, 'nima_da_method', None)
-    if args.piaa_mode == 'PIAA_pretrain' and method_name in ('DAREGRAM', 'UGAFEAT') and nima_override is None:
+    if args.piaa_mode == 'PIAA_pretrain' and method_name in ('DAREGRAM', 'UGAFEAT', 'RSD') and nima_override is None:
         nima_override = 'source_only'
     if args.piaa_mode == 'PIAA_pretrain' and nima_override:
         if nima_override == 'source_only':
@@ -237,6 +238,11 @@ def run_main(args):
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                     args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                     num_attr, num_pt, cdan_target_genre=target_genre)
+            elif method_name == 'RSD':
+                mod.trainer_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    num_attr, num_pt, rsd_target_genre=target_genre)
             else:  # DJDOT
                 mod.trainer_finetune(
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
