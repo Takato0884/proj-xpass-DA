@@ -22,6 +22,7 @@ load_dotenv()
 # ──────────────────────────────────────────────────────────────────────────────
 _MAKED_DIR = '/home/hayashi0884/proj-xpass-DA/data/maked'
 _SAVE_DIR = '/home/hayashi0884/proj-xpass-DA/reports/exp/gemini'
+_EXCLUDE_DIR = '/home/hayashi0884/proj-xpass-DA/documents/exclude_samole'
 _SAMPLES_DIR_MAP = {
     'art':     '/home/hayashi0884/proj-xpass/data/samples/art',
     'fashion': '/home/hayashi0884/proj-xpass/data/samples/fashion',
@@ -279,7 +280,9 @@ def run_piaa(genre: str, n: int = 0, resume: bool = False):
 
     _MIME_MAP = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
     os.makedirs(_SAVE_DIR, exist_ok=True)
+    os.makedirs(_EXCLUDE_DIR, exist_ok=True)
     save_path = os.path.join(_SAVE_DIR, f'{genre}_piaa_results.json')
+    exclude_path = os.path.join(_EXCLUDE_DIR, f'{genre}_piaa_excluded.txt')
     _CHECKPOINT_INTERVAL = 100
 
     per_sample_results = defaultdict(dict)
@@ -346,7 +349,19 @@ def run_piaa(genre: str, n: int = 0, resume: bool = False):
                     temperature=0.0,
                 ),
             )
-            score = _parse_piaa_score(response.text)
+            if response.text is None:
+                cand = response.candidates[0] if response.candidates else None
+                finish_reason = getattr(cand, 'finish_reason', None)
+                pf = getattr(response, 'prompt_feedback', None)
+                block_reason = getattr(pf, 'block_reason', None)
+                print(f"[WARN] empty response for {fname} / user {user_id}: "
+                      f"finish_reason={finish_reason} block_reason={block_reason} → fallback score=4")
+                score = 4
+                with open(exclude_path, 'a') as ef:
+                    ef.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\t{fname}\tuser_{user_id}\t"
+                             f"finish_reason={finish_reason}\tblock_reason={block_reason}\n")
+            else:
+                score = _parse_piaa_score(response.text)
             per_sample_results[fname][user_id] = score
             done_pairs_set.add((fname, user_id))
             pair_idx += 1
