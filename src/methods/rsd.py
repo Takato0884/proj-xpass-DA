@@ -62,6 +62,7 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
     eps = getattr(args, 'rsd_eps', 1e-8)
 
     running_L_y = running_L_rsd = running_L_bmp = 0.0
+    running_norm_src = running_norm_tgt = 0.0
     total_batches = 0
     tgt_iter = iter(tgt_loader)
 
@@ -96,6 +97,9 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
         # SVD is done in float32 outside autocast for numerical stability.
         L_RSD, L_BMP = compute_rsd_bmp(I_ij_src, I_ij_tgt, eps=eps)
 
+        norm_src = I_ij_src.float().norm(dim=1).mean()
+        norm_tgt = I_ij_tgt.float().norm(dim=1).mean()
+
         loss = L_y + beta * L_RSD + gamma * L_BMP
 
         scaler.scale(loss).backward()
@@ -108,16 +112,20 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
         running_L_y += L_y.item()
         running_L_rsd += weighted_L_rsd.item()
         running_L_bmp += weighted_L_bmp.item()
+        running_norm_src += norm_src.item()
+        running_norm_tgt += norm_tgt.item()
         total_batches += 1
 
         progress_bar.set_postfix({
             'L_y':   f'{L_y.item():.4f}',
             'L_RSD': f'{weighted_L_rsd.item():.4f}',
             'L_BMP': f'{weighted_L_bmp.item():.4f}',
+            'norm_s': f'{norm_src.item():.2f}',
+            'norm_t': f'{norm_tgt.item():.2f}',
         })
 
     n = max(total_batches, 1)
-    return running_L_y / n, running_L_rsd / n, running_L_bmp / n
+    return running_L_y / n, running_L_rsd / n, running_L_bmp / n, running_norm_src / n, running_norm_tgt / n
 
 
 def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
@@ -176,7 +184,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     scaler = GradScaler('cuda')
 
     for epoch in range(args.num_epochs):
-        L_y, L_rsd, L_bmp = _train_one_epoch_piaa(
+        L_y, L_rsd, L_bmp, norm_src, norm_tgt = _train_one_epoch_piaa(
             model, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
             epoch=epoch, desc_suffix=" pretrain")
 
@@ -191,6 +199,8 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train L_BMP": L_bmp,
                 f"{genre}/Train ratio L_y/(L_y+L_RSD+L_BMP)": ratio_y_da,
                 f"{genre}/Train ratio L_RSD/(L_RSD+L_BMP)":   ratio_rsd_bmp,
+                f"{genre}/Train feat_norm_src": norm_src,
+                f"{genre}/Train feat_norm_tgt": norm_tgt,
             }, commit=False)
 
         genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
@@ -337,7 +347,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         torch.save(model_user.state_dict(), best_model_path)
 
         for epoch in range(args.num_epochs):
-            L_y, L_rsd, L_bmp = _train_one_epoch_piaa(
+            L_y, L_rsd, L_bmp, norm_src, norm_tgt = _train_one_epoch_piaa(
                 model_user, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
                 epoch=epoch, desc_suffix=" finetune")
 
@@ -356,6 +366,8 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 log_dict[f"{genre}/Train L_BMP user_{uid}"] = L_bmp
                 log_dict[f"{genre}/Train ratio L_y/(L_y+L_RSD+L_BMP) user_{uid}"] = ratio_y_da
                 log_dict[f"{genre}/Train ratio L_RSD/(L_RSD+L_BMP) user_{uid}"]   = ratio_rsd_bmp
+                log_dict[f"{genre}/Train feat_norm_src user_{uid}"] = norm_src
+                log_dict[f"{genre}/Train feat_norm_tgt user_{uid}"] = norm_tgt
                 if genre in genre_metrics:
                     log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
                     log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
