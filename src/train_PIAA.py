@@ -20,6 +20,7 @@ _DA_METHOD_MODULES_PIAA = {
     'DEEPCORAL': '.methods.deepcoral',
     'CDAN':      '.methods.cdan',
     'RSD':       '.methods.rsd',
+    'ALDA':      '.methods.alda',
 }
 
 num_attr = None  # Determined dynamically from dataset
@@ -243,6 +244,11 @@ def run_main(args):
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                     args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                     num_attr, num_pt, rsd_target_genre=target_genre)
+            elif method_name == 'ALDA':
+                mod.trainer_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    num_attr, num_pt, alda_target_genre=target_genre)
             else:  # DJDOT
                 mod.trainer_finetune(
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,

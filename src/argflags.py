@@ -80,7 +80,7 @@ def parse_arguments(parse=True):
     parser.add_argument('--nima_da_method', type=str, default=None,
                         help='[DAREGRAM/UGAFEAT/DEEPCORAL/RSD] DA method whose pretrained NIMA to load for PIAA_pretrain. '
                              'E.g. "source_only" (load NIMA from models_pth/{ver}/{genre}/), '
-                             '"DANN"/"MCD"/"DJDOT"/"DEEPCORAL"/"CDAN" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
+                             '"DANN"/"MCD"/"DJDOT"/"DEEPCORAL"/"CDAN"/"ALDA" (load from models_pth/{ver}/{src2tgt}/, filtered by method). '
                              'Only meaningful for methods that have no GIAA-trained NIMA of their own.')
     # DeepCORAL-specific hyperparameters
     parser.add_argument('--coral_lambda', type=float, default=1.0,
@@ -98,6 +98,18 @@ def parse_arguments(parse=True):
                         help='[UGAFEAT] Weight of the DER regularization term (λ_EVI).')
     parser.add_argument('--ugafeat_lambda_align', type=float, default=1.0,
                         help='[UGAFEAT] Fixed weight for the MMD alignment loss (no schedule, per design 8.7).')
+    # ALDA-specific hyperparameters
+    parser.add_argument('--alda_sigma', type=float, default=1.0,
+                        help='[ALDA] Width of the Gaussian Soft Ordinal Distribution used as p_t '
+                             'for PIAA L_T (per design 6.11). Fixed (not scheduled). GIAA uses '
+                             'softmax(logit_tgt) directly and ignores this flag.')
+    parser.add_argument('--alda_threshold', type=float, default=0.2,
+                        help='[ALDA] Confidence threshold δ for target pseudo-label filtering in L_T '
+                             '(per design 6.5). Default 0.2 lets L_T contribute from early epochs '
+                             '(GIAA max(p_t) starts ≈0.2 and converges ≈0.6, so 0.2 keeps the '
+                             'self-reinforcing L_T → sharpen p_t loop alive). Higher values can '
+                             'starve L_T early on (chicken-and-egg). Paper\'s δ=0.9 is unsuitable '
+                             'for K=7 / EMD-trained NIMA / Gaussian soft labels.')
     # RSD-specific hyperparameters
     parser.add_argument('--rsd_beta', type=float, default=0.01,
                         help='[RSD] Weight β for the RSD loss (sum of sin of principal angles).')

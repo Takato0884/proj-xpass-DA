@@ -19,6 +19,7 @@ _DA_METHOD_MODULES = {
     'MCD':       '.methods.mcd',
     'DEEPCORAL': '.methods.deepcoral',
     'CDAN':      '.methods.cdan',
+    'ALDA':      '.methods.alda',
 }
 
 
