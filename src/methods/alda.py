@@ -9,7 +9,7 @@ Implementation scope (per documents/design/ALDA_設計書.md §6):
   - ALDADiscriminator: 3-layer MLP (in_dim → 256 → 128 → K=7, no Dropout, no internal sigmoid).
   - GRL with shared `get_da_lambda` schedule (γ=10, --da_schedule_epochs).
   - Loss weights mirror DANN/CDAN: GIAA `L_y + λ·L_T + L_Adv + L_Reg`,
-    PIAA `L_y + 0.1·(λ·L_T + L_Adv + L_Reg)`.
+    PIAA `L_y + 0.05·(λ·L_T + L_Adv + 0.1·L_Reg)`.
 """
 
 import os
@@ -110,6 +110,8 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
     running_L_y = running_L_T = running_L_Adv = running_L_Reg = 0.0
     running_disc_acc_tgt = 0.0
     running_max_pt = 0.0
+    running_weighted_da = 0.0
+    running_cls_total = running_disc_total = 0.0
     total_batches = 0
     tgt_iter = iter(tgt_loader)
 
@@ -183,6 +185,10 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
             L_Reg = F.cross_entropy(discriminator(domain_feat_src.detach()), y_s_idx)
 
             loss = L_y + lambda_ * L_T + L_Adv + L_Reg
+            weighted_da = lambda_ * L_T + L_Adv + L_Reg
+            # Per-optimizer effective losses (L_Reg is detached from G; L_Adv affects both via GRL).
+            cls_total = L_y + lambda_ * L_T + L_Adv
+            disc_total = L_Adv + L_Reg
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -203,6 +209,9 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
         running_L_Reg += L_Reg.item()
         running_disc_acc_tgt += disc_acc_tgt
         running_max_pt += max_pt_batch
+        running_weighted_da += weighted_da.item()
+        running_cls_total += cls_total.item()
+        running_disc_total += disc_total.item()
         total_batches += 1
         global_step += 1
         progress_bar.set_postfix({
@@ -222,6 +231,9 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
         'L_Reg': running_L_Reg / n,
         'disc_acc_tgt': running_disc_acc_tgt / n,
         'max_pt': running_max_pt / n,
+        'weighted_da': running_weighted_da / n,
+        'cls_total': running_cls_total / n,
+        'disc_total': running_disc_total / n,
         'global_step': global_step,
     }
 
@@ -257,12 +269,23 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
         lambda_ = get_da_lambda(global_step, alda_total_steps, getattr(args, 'da_gamma', 10.0))
 
         if args.is_log:
+            L_y_avg = metrics['train_emd']
+            da_w = metrics['weighted_da']
+            cls_total = metrics['cls_total']
+            disc_total = metrics['disc_total']
+            ratio_Ly = L_y_avg / (L_y_avg + da_w) if (L_y_avg + da_w) > 0 else 0.0
+            ratio_Ly_cls = L_y_avg / cls_total if cls_total > 0 else 0.0
+            ratio_Adv_disc = metrics['L_Adv'] / disc_total if disc_total > 0 else 0.0
             wandb.log({
                 "epoch": epoch,
                 f"{args.genre}/Train EMD GIAA": metrics['train_emd'],
                 f"{args.genre}/Train L_T": metrics['L_T'],
                 f"{args.genre}/Train L_Adv": metrics['L_Adv'],
                 f"{args.genre}/Train L_Reg": metrics['L_Reg'],
+                f"{args.genre}/Train DA total (weighted)": da_w,
+                f"{args.genre}/Train ratio L_y/(L_y+DA)": ratio_Ly,
+                f"{args.genre}/Train ratio L_y in classifier": ratio_Ly_cls,
+                f"{args.genre}/Train ratio L_Adv in discriminator": ratio_Adv_disc,
                 f"{args.genre}/Train Disc Acc (tgt)": metrics['disc_acc_tgt'],
                 f"{args.genre}/Train max(p_t)": metrics['max_pt'],
                 f"{args.genre}/ALDA lambda": lambda_,
@@ -327,6 +350,8 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, discriminator, grl,
     running_L_y = running_L_T = running_L_Adv = running_L_Reg = 0.0
     running_disc_acc_tgt = 0.0
     running_max_pt = 0.0
+    running_weighted_da = 0.0
+    running_cls_total = running_disc_total = 0.0
     total_batches = 0
     tgt_iter = iter(tgt_loader)
 
@@ -407,8 +432,14 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, discriminator, grl,
             # ── L_Reg ──
             L_Reg = F.cross_entropy(discriminator(I_ij_src.detach()), y_s_idx)
 
-            # PIAA loss weighting (mirror DANN/CDAN PIAA: 0.1× DA-related terms)
-            loss = L_y + 0.1 * (lambda_ * L_T + L_Adv + L_Reg)
+            # PIAA loss weighting: outer 0.05 (smaller than DANN/CDAN's 0.1) since
+            # ALDA stacks 3 DA terms and L_y(MSE) on score ∈ [0,1] is naturally O(0.01-0.05).
+            # L_Reg gets an additional 0.1× to give L_Adv more relative share in D's gradient.
+            loss = L_y + 0.05 * (lambda_ * L_T + L_Adv + 0.1 * L_Reg)
+            weighted_da = 0.05 * (lambda_ * L_T + L_Adv + 0.1 * L_Reg)
+            # Per-optimizer effective losses (L_Reg is detached from G; L_Adv affects both via GRL).
+            cls_total = L_y + 0.05 * (lambda_ * L_T + L_Adv)
+            disc_total = 0.05 * (L_Adv + 0.1 * L_Reg)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -429,6 +460,9 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, discriminator, grl,
         running_L_Reg += L_Reg.item()
         running_disc_acc_tgt += disc_acc_tgt
         running_max_pt += max_pt_batch
+        running_weighted_da += weighted_da.item()
+        running_cls_total += cls_total.item()
+        running_disc_total += disc_total.item()
         total_batches += 1
         global_step += 1
         progress_bar.set_postfix({
@@ -442,7 +476,9 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, discriminator, grl,
 
     n = max(total_batches, 1)
     return (running_L_y / n, running_L_T / n, running_L_Adv / n,
-            running_L_Reg / n, running_disc_acc_tgt / n, running_max_pt / n, global_step)
+            running_L_Reg / n, running_disc_acc_tgt / n, running_max_pt / n,
+            running_weighted_da / n, running_cls_total / n,
+            running_disc_total / n, global_step)
 
 
 def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
@@ -489,7 +525,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     discriminator = ALDADiscriminator(d_f, K=num_bins).to(device)
     grl = GradientReversalLayer()
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-    optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
+    optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
     steps_per_epoch = len(src_loader)
@@ -505,12 +541,15 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     scaler = GradScaler('cuda')
 
     for epoch in range(args.num_epochs):
-        L_y, L_T, L_Adv, L_Reg, disc_acc_tgt, max_pt, global_step = _train_one_epoch_piaa(
+        L_y, L_T, L_Adv, L_Reg, disc_acc_tgt, max_pt, weighted_da, cls_total, disc_total, global_step = _train_one_epoch_piaa(
             model, src_loader, tgt_loader, discriminator, grl,
             optimizer, optimizer_disc, scaler, device, args, genre, sigma,
             epoch=epoch, global_step=global_step, alda_total_steps=alda_total_steps,
             desc_suffix=" pretrain")
         lambda_ = get_da_lambda(global_step, alda_total_steps, getattr(args, 'da_gamma', 10.0))
+        ratio_Ly = L_y / (L_y + weighted_da) if (L_y + weighted_da) > 0 else 0.0
+        ratio_Ly_cls = L_y / cls_total if cls_total > 0 else 0.0
+        ratio_Adv_disc = (0.05 * L_Adv) / disc_total if disc_total > 0 else 0.0
 
         if args.is_log:
             wandb.log({
@@ -519,6 +558,10 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train L_T": L_T,
                 f"{genre}/Train L_Adv": L_Adv,
                 f"{genre}/Train L_Reg": L_Reg,
+                f"{genre}/Train DA total (weighted)": weighted_da,
+                f"{genre}/Train ratio L_y/(L_y+DA)": ratio_Ly,
+                f"{genre}/Train ratio L_y in classifier": ratio_Ly_cls,
+                f"{genre}/Train ratio L_Adv in discriminator": ratio_Adv_disc,
                 f"{genre}/Train Disc Acc (tgt)": disc_acc_tgt,
                 f"{genre}/Train max(p_t)": max_pt,
                 f"{genre}/ALDA lambda": lambda_,
@@ -657,7 +700,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         discriminator = ALDADiscriminator(d_f, K=num_bins).to(device)
         grl = GradientReversalLayer()
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model_user.parameters()), lr=args.lr)
-        optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
+        optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
         steps_per_epoch = len(src_loader)
@@ -675,12 +718,15 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         torch.save(model_user.state_dict(), best_model_path)
 
         for epoch in range(args.num_epochs):
-            L_y, L_T, L_Adv, L_Reg, disc_acc_tgt, max_pt, global_step = _train_one_epoch_piaa(
+            L_y, L_T, L_Adv, L_Reg, disc_acc_tgt, max_pt, weighted_da, cls_total, disc_total, global_step = _train_one_epoch_piaa(
                 model_user, src_loader, tgt_loader, discriminator, grl,
                 optimizer, optimizer_disc, scaler, device, args, genre, sigma,
                 epoch=epoch, global_step=global_step, alda_total_steps=alda_total_steps,
                 desc_suffix=" finetune")
             lambda_ = get_da_lambda(global_step, alda_total_steps, getattr(args, 'da_gamma', 10.0))
+            ratio_Ly = L_y / (L_y + weighted_da) if (L_y + weighted_da) > 0 else 0.0
+            ratio_Ly_cls = L_y / cls_total if cls_total > 0 else 0.0
+            ratio_Adv_disc = (0.05 * L_Adv) / disc_total if disc_total > 0 else 0.0
 
             genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
@@ -693,6 +739,10 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 log_dict[f"{genre}/Train L_T user_{uid}"] = L_T
                 log_dict[f"{genre}/Train L_Adv user_{uid}"] = L_Adv
                 log_dict[f"{genre}/Train L_Reg user_{uid}"] = L_Reg
+                log_dict[f"{genre}/Train DA total (weighted) user_{uid}"] = weighted_da
+                log_dict[f"{genre}/Train ratio L_y/(L_y+DA) user_{uid}"] = ratio_Ly
+                log_dict[f"{genre}/Train ratio L_y in classifier user_{uid}"] = ratio_Ly_cls
+                log_dict[f"{genre}/Train ratio L_Adv in discriminator user_{uid}"] = ratio_Adv_disc
                 log_dict[f"{genre}/Train Disc Acc (tgt) user_{uid}"] = disc_acc_tgt
                 log_dict[f"{genre}/Train max(p_t) user_{uid}"] = max_pt
                 log_dict[f"{genre}/ALDA lambda user_{uid}"] = lambda_

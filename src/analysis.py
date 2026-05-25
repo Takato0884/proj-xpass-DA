@@ -1124,12 +1124,15 @@ def visualize_features(args):
 
     samples_dir = Path.home() / "proj-xpass" / "data" / "samples"
 
+    # train_GIAA.py と同じ backbone 略称（ファイル名に埋まる）
+    _BACKBONE_ABBR = {'resnet50': 'RN50', 'i3d': 'I3D', 'vit_b_16': 'ViT',
+                      'clip_rn50': 'CLRN50', 'clip_vit_b16': 'CLViT'}
+    backbone_key = _BACKBONE_ABBR.get(backbone, '')
+
     def find_nima_pth(fold_name, subdir, uda_method=None):
         d = models_pth_dir / fold_name / subdir
-        if uda_method:
-            ptns = list(d.glob(f"{subdir}_{uda_method}_NIMA_*.pth"))
-        else:
-            ptns = list(d.glob(f"{subdir}_NIMA_*.pth"))
+        method_tag = (uda_method if uda_method else 'Only') + (f"_{backbone_key}" if backbone_key else '')
+        ptns = list(d.glob(f"{subdir}_{method_tag}_NIMA_*.pth"))
         return ptns[0] if ptns else None
 
     def load_model(pth_path):
@@ -1351,9 +1354,17 @@ def visualize_domain_gap(args):
     各foldのソース画像とターゲット画像の特徴量を両モデルで抽出し、t-SNE/UMAP/PCAで2次元にプロット。
     非DA（左）とDA（右）を横並びサブプロットで比較し、DAによるドメインギャップ縮小を可視化。
     ドメイン分離度をSilhouette Scoreで定量評価（低いほどドメインギャップが小さい）。
+
+    Feature source:
+      * model_type == 'NIMA' → 256-dim NIMA `feat_proj` output (`domain_feat`).
+      * model_type ∈ {'ICI', 'MIR'} → 64-dim Interaction representation `I_ij`
+        (the input to `attr_corr`). Requires `--user-id` to build the per-user
+        PT vector that conditions `I_ij`.
     """
     import numpy as np
+    import pandas as pd
     import torch
+    import torch.nn.functional as F
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1364,7 +1375,8 @@ def visualize_domain_gap(args):
     _src = Path(__file__).resolve().parent
     if str(_src) not in _sys.path:
         _sys.path.insert(0, str(_src))
-    from train_common import NIMA, num_bins
+    from train_common import NIMA, num_bins, PIAA_ICI_CrossDomain, PIAA_MIR_CrossDomain
+    from data import build_global_encoders
 
     source_genre = args.source_genre
     target_genre = args.target_genre
@@ -1377,10 +1389,100 @@ def visualize_domain_gap(args):
     n_source = args.n_source
     n_target = args.n_target
     uda_methods = args.uda_methods  # e.g. ["DANN"], ["DJDOT"], ["DANN", "DJDOT"]
+    model_type = getattr(args, 'model_type', 'NIMA')  # 'NIMA' | 'ICI' | 'MIR'
+    piaa_mode = getattr(args, 'piaa_mode', 'pretrain')  # 'pretrain' | 'finetune'
+    user_id = getattr(args, 'user_id', None)  # Optional[int], only used in PIAA finetune
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    is_piaa = model_type in ('ICI', 'MIR')
+    if is_piaa and user_id is None:
+        print("Error: --user-id is required for --model-type ICI/MIR "
+              "(needed to build the personal-traits vector that conditions I_ij).",
+              file=_sys.stderr)
+        _sys.exit(1)
 
     print(f"Device: {device}")
     print(f"Task: {source_genre} → {target_genre}  |  UDA: {', '.join(uda_methods)}")
+    if model_type == 'NIMA':
+        print(f"Model: NIMA  |  Feature: 256-dim domain_feat")
+    else:
+        user_str = f", user={user_id}" if (piaa_mode == 'finetune' and user_id is not None) else ""
+        print(f"Model: {model_type} ({piaa_mode}{user_str})  |  Feature: 64-dim I_ij (Interaction)")
+
+    # ── PIAA-only: build PT vector + load QIP tables ────────────────────────
+    def _build_user_pt_vector(uid, encoders, age_bins):
+        """Reconstruct Image_PIAA_HistogramDataset's `traits` vector for one user.
+
+        Concatenation order matches data.py (Q1..Q10 first as score_vecs,
+        then interests + age/gender/edu/nationality/*_learn one-hots as trait_vecs).
+        """
+        users = pd.read_csv(root_dir / 'maked' / 'users.csv').set_index('user_id')
+        if uid not in users.index:
+            raise ValueError(f"user_id={uid} not found in users.csv")
+        row = users.loc[uid]
+
+        encoded_trait_columns = ['age', 'gender', 'edu', 'nationality',
+                                 'art_learn', 'fashion_learn', 'photoVideo_learn']
+
+        score_vecs = [F.one_hot(torch.tensor(int(row[f'Q{i}'])), num_classes=7).float()
+                      for i in range(1, 11)]
+
+        trait_vecs = [F.one_hot(torch.tensor(int(row[k])), num_classes=7).float()
+                      for k in ['art_interest', 'fashion_interest', 'photoVideo_interest']]
+
+        age_labels = [f'{int(age_bins[i])}-{int(age_bins[i+1])-1}'
+                      for i in range(len(age_bins) - 1)]
+        age_label = pd.cut([row['age']], bins=age_bins,
+                           labels=age_labels, include_lowest=True)[0]
+        for i, trait in enumerate(encoded_trait_columns):
+            encoder = encoders[i]
+            key = age_label if trait == 'age' else row[trait]
+            if key not in encoder:
+                raise ValueError(f"trait '{trait}' value {key!r} not in encoder "
+                                 f"(keys: {list(encoder.keys())})")
+            trait_vecs.append(
+                F.one_hot(torch.tensor(encoder[key]), num_classes=len(encoder)).float()
+            )
+        return torch.cat(score_vecs + trait_vecs)
+
+    def _load_qip_lookup(genre):
+        """Load + min-max normalize QIP CSV; return (dict[img_file → 1-D tensor], num_attr).
+
+        Column order is alphabetically sorted to match Image_PIAA_HistogramDataset's
+        `sorted(qip.keys())` flattening at data.py:759.
+        """
+        if genre == 'scenery' and backbone == 'i3d':
+            qip_filename = 'QIP_scenery_video.csv'
+        elif genre == 'scenery':
+            qip_filename = 'QIP_scenery_image.csv'
+        else:
+            qip_filename = f'QIP_{genre}.csv'
+        df = pd.read_csv(root_dir / 'maked' / qip_filename).set_index('img_file')
+        qmin, qmax = df.min(), df.max()
+        rng = qmax - qmin
+        rng[rng == 0] = 1
+        df = (df - qmin) / rng
+        sorted_cols = sorted(df.columns)
+        vals = df[sorted_cols].to_numpy(dtype='float32')
+        lookup = {img: torch.from_numpy(vals[i]) for i, img in enumerate(df.index)}
+        return lookup, len(sorted_cols)
+
+    pt_vector = None
+    src_qip_lookup = tgt_qip_lookup = None
+    num_attr = num_pt = None
+    if is_piaa:
+        global_trait_encoders, global_age_bins = build_global_encoders(str(root_dir))
+        pt_vector = _build_user_pt_vector(user_id, global_trait_encoders, global_age_bins).to(device)
+        num_pt = int(pt_vector.shape[0])
+        src_qip_lookup, num_attr_src = _load_qip_lookup(source_genre)
+        tgt_qip_lookup, num_attr_tgt = _load_qip_lookup(target_genre)
+        if num_attr_src != num_attr_tgt:
+            print(f"Error: QIP column counts differ "
+                  f"({source_genre}={num_attr_src}, {target_genre}={num_attr_tgt}); "
+                  "PIAA model requires matching num_attr across domains.", file=_sys.stderr)
+            _sys.exit(1)
+        num_attr = num_attr_src
+        print(f"PIAA inputs: num_pt={num_pt}, num_attr={num_attr}")
 
     # ── 1. 画像変換（CLIP-ViT-B/16の標準前処理） ─────────────────────────────
     transform = transforms.Compose([
@@ -1412,26 +1514,102 @@ def visualize_domain_gap(args):
         "scenery": ("scenery_image", ".jpg"),
     }
 
-    def find_nima_pth(fold_name, subdir, uda_method=None):
+    # train_GIAA.py と同じ backbone 略称（ファイル名に埋まる）
+    _BACKBONE_ABBR = {'resnet50': 'RN50', 'i3d': 'I3D', 'vit_b_16': 'ViT',
+                      'clip_rn50': 'CLRN50', 'clip_vit_b16': 'CLViT'}
+    backbone_key = _BACKBONE_ABBR.get(backbone, '')
+
+    def find_model_pth(fold_name, subdir, uda_method=None):
+        """Locate a .pth file matching the requested model_type / piaa_mode.
+
+        NIMA:   {subdir}_{Only|UDA}_{backbone}_NIMA_*.pth
+        PIAA pretrain (non-DA): {source}_{ICI|MIR}_Only_*_pretrain.pth in {source}/
+        PIAA pretrain (DA):     {source2target}_{UDA}_{ICI|MIR}_*_pretrain.pth in {source2target}/
+        PIAA finetune (non-DA): {source}_{ICI|MIR}_user_*_Only_*_finetune.pth in {source}/
+        PIAA finetune (DA):     {source}_{ICI|MIR}_user_*_{UDA}_*_finetune.pth in {source2target}/
+        """
         d = models_pth_dir / fold_name / subdir
-        if uda_method:
-            ptns = list(d.glob(f"{subdir}_{uda_method}_NIMA_*.pth"))
-        else:
-            ptns = list(d.glob(f"{subdir}_NIMA_*.pth"))
-        return ptns[0] if ptns else None
+        if model_type == 'NIMA':
+            method_tag = (uda_method if uda_method else 'Only') + (f"_{backbone_key}" if backbone_key else '')
+            ptns = list(d.glob(f"{subdir}_{method_tag}_NIMA_*.pth"))
+            return ptns[0] if ptns else None
+
+        # PIAA (ICI / MIR)
+        method_tag = uda_method if uda_method else 'Only'
+        if piaa_mode == 'pretrain':
+            ptns = list(d.glob(f"{subdir}_{method_tag}_{model_type}_*_pretrain.pth"))
+            # Source-only pretrain has pattern {source}_{model_type}_Only_*_pretrain.pth
+            if not ptns and uda_method is None:
+                ptns = list(d.glob(f"{source_genre}_{model_type}_Only_*_pretrain.pth"))
+            return ptns[0] if ptns else None
+        else:  # finetune
+            uid_tag = f"user_{user_id}" if user_id is not None else "user_*"
+            ptns = list(d.glob(f"{source_genre}_{model_type}_{uid_tag}_{method_tag}_*_finetune.pth"))
+            if ptns:
+                return ptns[0]
+            if user_id is not None:
+                # Requested user not present — list available users to help the caller pick one.
+                available = sorted({
+                    p.name.split("_user_")[1].split("_")[0]
+                    for p in d.glob(f"{source_genre}_{model_type}_user_*_{method_tag}_*_finetune.pth")
+                }, key=lambda s: int(s) if s.isdigit() else s)
+                if available:
+                    print(f"  [warn] user_{user_id} finetune pth not found in {d.name}; "
+                          f"available users: {available}")
+                    return None
+            # Non-DA finetune pths are not always saved; fall back to non-DA pretrain.
+            # For NIMA domain_feat this is exact (PIAA backbone is frozen). For
+            # I_ij (Interaction features) the interaction modules are trained
+            # during finetune, so the fallback gives the *pretrain* I_ij — an
+            # approximation, not the true non-DA-finetune I_ij.
+            if uda_method is None:
+                fallback = list(d.glob(f"{source_genre}_{model_type}_Only_*_pretrain.pth"))
+                if fallback:
+                    print(f"  [info] non-DA finetune pth not found in {d.name}; "
+                          f"falling back to pretrain: {fallback[0].name}")
+                    return fallback[0]
+            return None
 
     def load_model(pth_path):
-        model = NIMA(num_bins, backbone=backbone)
+        """Load a feature extractor.
+
+        NIMA: instantiate `NIMA` and load directly (extracts 256-dim domain_feat).
+        ICI/MIR: instantiate the full PIAA model and load directly. `use_da`
+        is inferred from the state_dict (DA models drop `direct_fc`).
+        """
         state = torch.load(pth_path, map_location=device, weights_only=True)
-        model.load_state_dict(state)
+        if not is_piaa:
+            model = NIMA(num_bins, backbone=backbone)
+            model.load_state_dict(state)
+        else:
+            use_da = not any(k.startswith('direct_fc.') for k in state)
+            # Detect whether the pth was trained with dropout > 0: this changes
+            # InternalInteraction's Sequential layout (Linear/ReLU/Dropout/Linear
+            # → mlp.3 instead of mlp.2). The exact value doesn't matter in eval.
+            had_dropout = any('internal_interaction_img.mlp.3' in k for k in state)
+            cls = PIAA_ICI_CrossDomain if model_type == 'ICI' else PIAA_MIR_CrossDomain
+            model = cls(num_bins, num_attr, num_pt,
+                        genres=[source_genre],
+                        backbone_dict={source_genre: backbone},
+                        dropout=0.5 if had_dropout else None,
+                        use_da=use_da)
+            model.load_state_dict(state)
         model.to(device).eval()
         return model
 
     def extract_domain_features(model, img_files, genre, domain_label, max_n):
-        """指定ドメインの画像から特徴量を抽出する。domain_label: 0=source, 1=target"""
-        feats, labels = [], []
+        """指定ドメインの画像から特徴量を抽出する。domain_label: 0=source, 1=target
+
+        NIMA → 256-dim domain_feat (from `feat_proj`).
+        ICI/MIR → 64-dim I_ij (input to `attr_corr`), forwarded with the
+        per-user PT vector and per-image QIP attributes. The model's
+        `nima_dict` is keyed only by `source_genre`, so we always pass
+        `genre=source_genre` even for target images.
+        """
+        feats, labels, fnames = [], [], []
         targets = img_files[:max_n] if max_n is not None else img_files
         samples_subdir, img_ext = GENRE_SAMPLES_MAP.get(genre, (genre, None))
+        qip_lookup = (src_qip_lookup if genre == source_genre else tgt_qip_lookup) if is_piaa else None
         with torch.no_grad():
             for img_file in targets:
                 # split ファイルの拡張子を画像拡張子に置き換える（必要な場合）
@@ -1440,27 +1618,93 @@ def visualize_domain_gap(args):
                 try:
                     img = Image.open(img_path).convert("RGB")
                     t = transform(img).unsqueeze(0).to(device)
-                    _, feat, _ = model(t, return_feat=True)
+                    if not is_piaa:
+                        _, feat, _ = model(t, return_feat=True)
+                    else:
+                        qip_t = qip_lookup.get(fname)
+                        if qip_t is None:
+                            print(f"  Warning: QIP missing for {fname}, skipping")
+                            continue
+                        _, feat = model(
+                            t,
+                            pt_vector.unsqueeze(0),
+                            qip_t.unsqueeze(0).to(device),
+                            source_genre,
+                            return_feat=True,
+                        )
                     feats.append(feat.cpu().float().numpy()[0])
                     labels.append(domain_label)
+                    fnames.append(fname)
                 except Exception as e:
                     print(f"  Warning: skip {img_file}: {e}")
-        return feats, labels
+        return feats, labels, fnames
+
+    # Highlight set: match either bare stem or full filename (with extension).
+    raw_highlights = getattr(args, 'highlight_images', None) or []
+    highlight_keys = set()
+    for h in raw_highlights:
+        h = h.strip()
+        if not h:
+            continue
+        highlight_keys.add(h)
+        highlight_keys.add(Path(h).name)
+        highlight_keys.add(Path(h).stem)
+    if highlight_keys:
+        print(f"Highlight (yellow): {sorted({Path(h).name for h in raw_highlights if h.strip()})}")
 
     # domain_label: 0=source, 1=target
     keys = ["nonda"] + uda_methods
     all_feats = {k: [] for k in keys}
     all_labels = {k: [] for k in keys}
+    all_fnames = {k: [] for k in keys}
     all_fold_ids = {k: [] for k in keys}
     fold_sil_scores = {k: [] for k in keys}
 
     from sklearn.metrics import silhouette_score
 
+    # In finetune mode with a specified user_id, restrict samples to those the
+    # user actually trained on. trainer_finetune (DANN/RSD/... and source_only)
+    # filters both src and tgt train_PIAA.txt by user_id == uid, so we mirror
+    # that here regardless of what --split-file the caller passed.
+    finetune_user_filter = (piaa_mode == 'finetune' and user_id is not None)
+    if finetune_user_filter:
+        effective_split_file = 'train_PIAA.txt'
+        if split_file != effective_split_file:
+            print(f"  [info] finetune mode (user_id={user_id}): overriding "
+                  f"--split-file '{split_file}' → '{effective_split_file}' "
+                  f"to match samples used during finetune training.")
+    else:
+        effective_split_file = split_file
+
+    def _read_split(path):
+        """Read a split file. PIAA splits are 'user_id\\tfilename' (multi-user);
+        GIAA splits are bare filenames. In finetune+user_id mode, filter to the
+        target user; otherwise dedupe filenames (a PIAA split lists the same
+        image once per rater)."""
+        items = []
+        seen = set()
+        with open(path) as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                parts = ln.split()
+                if len(parts) >= 2 and parts[0].lstrip('-').isdigit():
+                    uid_str, fname = parts[0], parts[-1]
+                    if finetune_user_filter and int(uid_str) != user_id:
+                        continue
+                else:
+                    fname = ln
+                if fname not in seen:
+                    seen.add(fname)
+                    items.append(fname)
+        return items
+
     for fold_idx, fold_dir in enumerate(fold_dirs):
         fold_name = fold_dir.name
 
-        src_img_file = fold_dir / source_genre / split_file
-        tgt_img_file = fold_dir / target_genre / split_file
+        src_img_file = fold_dir / source_genre / effective_split_file
+        tgt_img_file = fold_dir / target_genre / effective_split_file
 
         if not src_img_file.exists():
             print(f"Warning: {src_img_file} not found, skipping")
@@ -1469,12 +1713,15 @@ def visualize_domain_gap(args):
             print(f"Warning: {tgt_img_file} not found, skipping")
             continue
 
-        with open(src_img_file) as f:
-            src_images = [line.strip() for line in f if line.strip()]
-        with open(tgt_img_file) as f:
-            tgt_images = [line.strip() for line in f if line.strip()]
+        src_images = _read_split(src_img_file)
+        tgt_images = _read_split(tgt_img_file)
 
-        nonda_pth = find_nima_pth(fold_name, source_genre)
+        if finetune_user_filter and (len(src_images) == 0 or len(tgt_images) == 0):
+            print(f"Warning: user_id={user_id} has no samples in "
+                  f"{fold_name} (src={len(src_images)}, tgt={len(tgt_images)}); skipping fold")
+            continue
+
+        nonda_pth = find_model_pth(fold_name, source_genre)
         if nonda_pth is None:
             print(f"Warning: Non-DA model not found for {fold_name}/{source_genre}, skipping")
             continue
@@ -1482,7 +1729,7 @@ def visualize_domain_gap(args):
         pth_pairs = [("nonda", nonda_pth)]
         skip_fold = False
         for um in uda_methods:
-            da_pth = find_nima_pth(fold_name, f"{source_genre}2{target_genre}", uda_method=um)
+            da_pth = find_model_pth(fold_name, f"{source_genre}2{target_genre}", uda_method=um)
             if da_pth is None:
                 print(f"Warning: {um} model not found for {fold_name}/{source_genre}2{target_genre}, skipping")
                 skip_fold = True
@@ -1499,12 +1746,14 @@ def visualize_domain_gap(args):
 
         for key, pth_path in pth_pairs:
             model = load_model(pth_path)
-            src_feats, src_labs = extract_domain_features(model, src_images, source_genre, 0, n_source)
-            tgt_feats, tgt_labs = extract_domain_features(model, tgt_images, target_genre, 1, n_target)
+            src_feats, src_labs, src_fns = extract_domain_features(model, src_images, source_genre, 0, n_source)
+            tgt_feats, tgt_labs, tgt_fns = extract_domain_features(model, tgt_images, target_genre, 1, n_target)
             feats = src_feats + tgt_feats
             labels = src_labs + tgt_labs
+            fnames = src_fns + tgt_fns
             all_feats[key].extend(feats)
             all_labels[key].extend(labels)
+            all_fnames[key].extend(fnames)
             all_fold_ids[key].extend([fold_idx] * len(feats))
             del model
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -1528,7 +1777,8 @@ def visualize_domain_gap(args):
         print(f"\nTotal samples ({key}): {n}")
 
     # ── 4. Silhouette Score 集計（平均±std） ──────────────────────────────────
-    print("\n=== Domain Separation Score (256-dim domain_feat, source vs target) ===")
+    feat_label = "64-dim I_ij" if is_piaa else "256-dim domain_feat"
+    print(f"\n=== Domain Separation Score ({feat_label}, source vs target) ===")
     print("  (lower Silhouette = better domain alignment)")
     key_label_pairs = [("nonda", "Non-DA")] + [(um, um) for um in uda_methods]
     for key, label in key_label_pairs:
@@ -1566,6 +1816,14 @@ def visualize_domain_gap(args):
         s = fold_sil_scores[key]
         sil_means[key] = float(np.mean(s)) if s else float("nan")
 
+    point_size = float(getattr(args, 'point_size', 18.0))
+    font_size = float(getattr(args, 'font_size', 10.0))
+    centroid_size = point_size * (250.0 / 18.0)  # preserve original 18→250 ratio
+    title_fs = font_size + 2.0
+    suptitle_fs = font_size + 3.0
+    legend_fs = max(1.0, font_size - 1.0)
+    tick_fs = max(1.0, font_size - 1.0)
+
     def _plot_and_save(m):
         plot_keys = keys  # ["nonda"] + uda_methods
         subtitles = [f"Non-DA  ({source_genre} only)"] + [
@@ -1588,39 +1846,68 @@ def visualize_domain_gap(args):
         fig, axes = plt.subplots(1, n_plots, figsize=(6.5 * n_plots, 5.5))
         if n_plots == 1:
             axes = [axes]
-        for ax, key, subtitle in zip(axes, plot_keys, subtitles):
+        for ax_idx, (ax, key, subtitle) in enumerate(zip(axes, plot_keys, subtitles)):
             labels_arr = np.array(all_labels[key])
+            fnames_arr = np.array(all_fnames[key])
             embed = embeds[key]
+            if highlight_keys:
+                hl_mask = np.array([
+                    (fn in highlight_keys) or (Path(fn).stem in highlight_keys)
+                    for fn in fnames_arr
+                ])
+            else:
+                hl_mask = np.zeros(len(fnames_arr), dtype=bool)
             for dom_idx, (dname, color, marker) in enumerate(
                 zip(domain_names, domain_colors, domain_markers)
             ):
-                mask = labels_arr == dom_idx
+                mask = (labels_arr == dom_idx) & (~hl_mask)
                 ax.scatter(
                     embed[mask, 0], embed[mask, 1],
                     c=color, label=f"{dname} (n={mask.sum()})",
-                    s=18, alpha=0.7, linewidths=0, marker=marker,
+                    s=point_size, alpha=0.7, linewidths=0, marker=marker,
                 )
-                if mask.sum() > 0:
-                    cx, cy = embed[mask, 0].mean(), embed[mask, 1].mean()
-                    ax.scatter(cx, cy, marker="*", c=color, s=250,
+                dom_full_mask = labels_arr == dom_idx
+                if dom_full_mask.sum() > 0:
+                    cx, cy = embed[dom_full_mask, 0].mean(), embed[dom_full_mask, 1].mean()
+                    ax.scatter(cx, cy, marker="*", c=color, s=centroid_size,
                                edgecolors="black", linewidths=0.5, zorder=5,
                                label="_nolegend_")
+                # Highlighted points: keep domain fill color, add a thick
+                # yellow edge so they stand out without losing domain identity.
+                hl_dom_mask = (labels_arr == dom_idx) & hl_mask
+                if hl_dom_mask.any():
+                    ax.scatter(
+                        embed[hl_dom_mask, 0], embed[hl_dom_mask, 1],
+                        c=color, marker=marker,
+                        s=point_size * 2.5, alpha=1.0,
+                        edgecolors="#f1c40f",
+                        linewidths=max(2.0, point_size * 0.08),
+                        zorder=6,
+                        label="_nolegend_",
+                    )
             sil_val = sil_means[key]
             sil_str = f"{sil_val:.4f}" if not np.isnan(sil_val) else "N/A"
             ax.set_xlim(xlim)
             ax.set_ylim(ylim)
-            ax.set_title(f"{subtitle}\nSilhouette={sil_str}", fontsize=12, fontweight="bold")
-            ax.legend(fontsize=9, loc="best")
-            ax.set_xlabel(f"{m.upper()} 1", fontsize=10)
-            ax.set_ylabel(f"{m.upper()} 2", fontsize=10)
-            ax.tick_params(labelsize=9)
+            ax.set_title(f"{subtitle}\nSilhouette={sil_str}", fontsize=title_fs, fontweight="bold")
+            if ax_idx == n_plots - 1:
+                ax.legend(fontsize=legend_fs, loc="best")
+            ax.set_xlabel(f"{m.upper()} 1", fontsize=font_size)
+            if ax_idx == 0:
+                ax.set_ylabel(f"{m.upper()} 2", fontsize=font_size)
+            ax.tick_params(labelsize=tick_fs)
         methods_str = "_".join(uda_methods)
+        if model_type == 'NIMA':
+            model_tag = 'NIMA'
+        else:
+            uid_suffix = f"_user{user_id}" if (piaa_mode == 'finetune' and user_id is not None) else ""
+            model_tag = f"{model_type}_{piaa_mode}{uid_suffix}"
         fig.suptitle(
-            f"Domain gap: {source_genre} vs {target_genre}  [{m.upper()}]",
-            fontsize=13, y=1.01,
+            f"Domain gap [{model_tag}]: {source_genre} vs {target_genre}  [{m.upper()}]",
+            fontsize=suptitle_fs, y=1.01,
         )
         plt.tight_layout()
-        out = output_dir / f"{source_genre}2{target_genre}_{methods_str}_domain_gap_{m}.png"
+        out = output_dir / f"{source_genre}2{target_genre}_{methods_str}_{model_tag}_domain_gap_{m}.png"
         plt.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {out}")
@@ -1641,10 +1928,6 @@ def _canonical_rename_map(src: str, tgt: str, metric: str) -> dict:
     returned map; callers should drop them. scenery's learn/interest map to
     users.csv `photoVideo_*` columns.
     """
-    learn_prefix = {"art": "art", "fashion": "fashion", "scenery": "photoVideo"}
-    src_lp = learn_prefix.get(src, src)
-    tgt_lp = learn_prefix.get(tgt, tgt)
-
     rename = {
         f"generality_{src}": "generality_src",
         f"generality_{tgt}": "generality_tgt",
@@ -1658,24 +1941,27 @@ def _canonical_rename_map(src: str, tgt: str, metric: str) -> dict:
         f"shift_generality_{src}_to_{tgt}": "shift_generality_src_to_tgt",
         f"shift_interest_{src}_to_{tgt}": "shift_interest_src_to_tgt",
         f"shift_learn_{src}_to_{tgt}": "shift_learn_src_to_tgt",
-        f"{src_lp}_learn": "learn_src",
-        f"{tgt_lp}_learn": "learn_tgt",
-        f"{src_lp}_interest": "interest_src",
-        f"{tgt_lp}_interest": "interest_tgt",
         f"baseline_{metric}_target": "baseline_tgt",
         f"baseline_{metric}_source": "baseline_src",
     }
-    if src_lp == tgt_lp:
-        rename.pop(f"{tgt_lp}_learn", None)
-        rename.pop(f"{tgt_lp}_interest", None)
+    # photoVideo_interest / photoVideo_learn are scenery's interest/learn
+    # proxies in users.csv. Always map them to scenery_interest/scenery_learn
+    # (treated as a domain-tagged global feature) so they appear in every
+    # pair's aggregated row, regardless of whether scenery is on-domain.
+    rename["photoVideo_interest"] = "scenery_interest"
+    rename["photoVideo_learn"] = "scenery_learn"
+    # interest_src / learn_src exist only when src is art or fashion;
+    # similarly for tgt. When scenery is on a side, that slot is left
+    # unmapped (the scenery_interest row above captures it instead).
+    if src != "scenery":
+        rename[f"{src}_interest"] = "interest_src"
+        rename[f"{src}_learn"] = "learn_src"
+    if tgt != "scenery":
+        rename[f"{tgt}_interest"] = "interest_tgt"
+        rename[f"{tgt}_learn"] = "learn_tgt"
     for stat in ("mean", "std", "skew", "kurt"):
         rename[f"src_{src}_{stat}"] = f"style_src_{stat}"
         rename[f"tgt_{tgt}_{stat}"] = f"style_tgt_{stat}"
-    # When scenery is off-domain (i.e., art↔fashion pairs), keep photoVideo_*
-    # columns as scenery-tagged off-domain features instead of dropping them.
-    if "scenery" not in (src, tgt):
-        rename["photoVideo_learn"] = "scenery_learn"
-        rename["photoVideo_interest"] = "scenery_interest"
     return rename
 
 
@@ -1941,6 +2227,7 @@ def _build_user_features(users_csv: Path, ratings_csv: Path,
     feat = users_idx[attr_cols].copy()
     feat = feat.join(big5)
     # edu → ordinal scale, ordered by years of formal education
+    # graduate と 博士 はサンプル数が少ないため同一カテゴリに統合
     edu_order = {
         "high_school": 1,
         "vocational": 2,
@@ -1948,7 +2235,7 @@ def _build_user_features(users_csv: Path, ratings_csv: Path,
         "technical_college": 4,
         "university": 5,
         "graduate": 6,
-        "博士": 7,
+        "博士": 6,
     }
     feat["edu_level"] = users_idx["edu"].map(edu_order)
     # drop_first=True avoids the dummy-variable trap (perfect collinearity)
@@ -3076,10 +3363,50 @@ if __name__ == '__main__':
              "Multiple values produce one subplot per method. (default: DANN)",
     )
     vdg_parser.add_argument(
+        "--model-type", type=str, default="NIMA",
+        choices=["NIMA", "ICI", "MIR"], dest="model_type",
+        help="Model type to load .pth from. NIMA uses the GIAA-trained NIMA pth; "
+             "ICI/MIR loads the PIAA pth and uses its inner NIMA backbone "
+             "(domain_feat is the same since the backbone is frozen). (default: NIMA)",
+    )
+    vdg_parser.add_argument(
+        "--piaa-mode", type=str, default="pretrain",
+        choices=["pretrain", "finetune"], dest="piaa_mode",
+        help="For --model-type ICI/MIR: load `_pretrain.pth` or `_user_*_finetune.pth`. "
+             "Ignored when --model-type=NIMA. In finetune mode the first matching "
+             "per-user pth is used unless --user-id is given. (default: pretrain)",
+    )
+    vdg_parser.add_argument(
+        "--user-id", type=int, default=None, dest="user_id",
+        help="For --piaa-mode finetune: load the pth for this specific user_id "
+             "(e.g. --user-id 2 → matches `..._user_2_..._finetune.pth`). "
+             "If omitted, the first matching user's pth is used. PIAA backbone is "
+             "frozen during finetune, so domain_feat is identical across users — "
+             "this flag mainly controls which pth file is reported.",
+    )
+    vdg_parser.add_argument(
         "-o", "--output-dir", default="reports/feature_viz",
         dest="output_dir",
         help="Output directory for figures; filenames are auto-generated as "
              "{source}2{target}_{methods}_domain_gap_{dim_method}.png (default: reports/feature_viz)",
+    )
+    vdg_parser.add_argument(
+        "--point-size", type=float, default=18.0, dest="point_size",
+        help="Scatter point size for individual samples (matplotlib `s`, default: 18). "
+             "Centroid star size scales as ~14× this value.",
+    )
+    vdg_parser.add_argument(
+        "--font-size", type=float, default=10.0, dest="font_size",
+        help="Base font size for axis labels/ticks (default: 10). "
+             "Subplot title, suptitle, and legend scale relative to this "
+             "(title=+2, suptitle=+3, legend=-1).",
+    )
+    vdg_parser.add_argument(
+        "--highlight-images", type=str, nargs="+", default=None,
+        dest="highlight_images",
+        help="Image filename(s) to highlight in yellow on every subplot. "
+             "Matches against the bare filename or the stem (extension optional), "
+             "e.g. --highlight-images foo.jpg bar  → both 'foo.jpg' and 'bar.*' are highlighted.",
     )
 
     # Subcommand: analyze_da_factors

@@ -268,9 +268,12 @@ def run_main(args):
                 datasets_dict_user, args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                 num_attr, num_pt, tgt_val_piaa_dataset=tgt_val_piaa_dataset, tgt_genre=eval_target)
         inference_finetune(datasets_dict_user, args, device, dirname, experiment_name, backbone_dict, eval_datasets_dict=eval_datasets_dict)
-        for pth_file in [f for f in os.listdir(dirname) if f.endswith('_finetune.pth')]:
-            os.remove(os.path.join(dirname, pth_file))
-        print(f"Deleted temporary finetune model files from {dirname}")
+        if not args.keep_finetune_pth:
+            for pth_file in [f for f in os.listdir(dirname) if f.endswith('_finetune.pth')]:
+                os.remove(os.path.join(dirname, pth_file))
+            print(f"Deleted temporary finetune model files from {dirname}")
+        else:
+            print(f"Kept finetune model files in {dirname} (--keep_finetune_pth)")
     else:
         raise ValueError(f"Error: --piaa_mode must be 'PIAA_pretrain' or 'PIAA_finetune', got: {args.piaa_mode}")
 
@@ -281,6 +284,8 @@ if __name__ == '__main__':
     parser = parse_arguments(parse=False)
     parser.add_argument('--model_type', type=str, default='ICI', choices=['ICI', 'MIR'],
                         help='PIAA model architecture: ICI (Interaction-based) or MIR (MLP Interaction Regression)')
+    parser.add_argument('--keep_finetune_pth', action='store_true', default=False,
+                        help='Keep *_finetune.pth files after inference (default: delete them)')
     import sys
     parser.set_defaults(lr=5e-6, batch_size=32, djdot_alpha=0.1, djdot_lambda_t=1)
     args = parser.parse_args()
