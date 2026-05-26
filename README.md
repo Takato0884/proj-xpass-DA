@@ -862,7 +862,26 @@ python src/analysis.py analyze_da_factors \
 python src/analysis.py analyze_da_factors \
   --version v3 --model-type ICI --da-method DJDOT \
   --folds 1 2 3 --no-plots
+
+# DA 実施前にわかる特徴量だけで回帰（ターゲットドメインのラベル不要）。
+# 出力ディレクトリ名は `_preda` サフィックス付きになる。
+python src/analysis.py analyze_da_factors \
+  --version v3 --model-type ICI --da-method DANN --metric ccc \
+  --pre-da-only
 ```
+
+> `--pre-da-only` モード — DA を実施する**前に**わかる特徴量だけで回帰する診断用モード。
+> 「どんなユーザーで DA が効きそうか」を **DA 実施前** にスクリーニングする使い方を想定。
+> 以下のターゲットドメインの **ラベル（評定値）** に依存する特徴量を回帰から除外します:
+>
+> - `baseline_{metric}_target` — no-DA finetune のターゲット評価（target ラベル必要）
+> - `tgt_{tgt}_{mean,std,skew,kurt}` — target ドメインの評価スタイル
+> - `retest_mae_{tgt}` — target ドメインのテスト再テスト誤差
+> - `generality_{tgt}` — target ドメインの汎用性
+> - `shift_{mean,std,skew,kurt}_{src}_to_{tgt}` / `shift_retest_mae_*` / `shift_generality_*` — 上記 tgt 量を含むシフト特徴
+>
+> 残るのは Big5・人口統計・全ドメインの `interest`/`learn`（アンケート由来でラベル不要）・`src_*`・`retest_mae_{src}`・`generality_{src}`・`baseline_{metric}_source`・`shift_interest_*`（アンケート由来）。
+> 出力は `reports/da_factors/{src}2{tgt}_{model}_{da}_preda/` および集約は `_aggregated_{model}_{da}_{metric}_preda/` に保存され、通常モードの結果と共存できます。
 
 **出力ファイル** — `reports/da_factors/{src}2{tgt}_{model}_{da}/` 配下（6 ペア分すべて生成）:
 - `per_user_features.csv` — 上記すべての特徴量と Δ を結合した per-user テーブル
@@ -904,6 +923,7 @@ python src/analysis.py analyze_da_factors \
 | `-o` / `--output-dir` | str | `reports/da_factors` | 出力ディレクトリ |
 | `--top-k` | int | `10` | feature importance バー図に表示する上位特徴量数（|OLS β| 降順） |
 | `--no-plots` | flag | False | プロット生成をスキップ |
+| `--pre-da-only` | flag | False | DA 以前にわかる特徴量だけで回帰（ターゲットラベル依存の特徴を除外）。出力ディレクトリ名は `_preda` サフィックス付き |
 
 > 解析は常に `(art, fashion, scenery)` の全 6 順序ペアを対象に実行されます（ソース／ターゲットを個別に指定するオプションはありません）。
 

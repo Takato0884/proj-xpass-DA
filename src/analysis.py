@@ -1974,6 +1974,34 @@ def _is_global_canonical_feature(f: str) -> bool:
     return f.startswith(("big5_", "gender_", "edu_", "nationality_"))
 
 
+def _is_post_da_only_feature(feat: str, src: str, tgt: str, metric: str) -> bool:
+    """Return True if a feature requires target-domain rating labels.
+
+    Such features cannot be known before performing domain adaptation
+    because they require collecting target-domain ratings. Used by the
+    --pre-da-only mode to keep only features available at DA-planning time.
+
+    Pre-DA-OK (NOT post-DA-only):
+      - Big5 / demographics (survey)
+      - Domain interest / learn for all domains (survey responses, not labels)
+      - src_*, retest_mae_src, generality_src, baseline_{metric}_source
+      - shift_interest_* / shift_learn_*  (use survey data, not ratings)
+    """
+    if feat == f"baseline_{metric}_target":
+        return True
+    if feat in (f"retest_mae_{tgt}", f"generality_{tgt}"):
+        return True
+    for stat in ("mean", "std", "skew", "kurt"):
+        if feat == f"tgt_{tgt}_{stat}":
+            return True
+        if feat == f"shift_{stat}_{src}_to_{tgt}":
+            return True
+    if feat in (f"shift_retest_mae_{src}_to_{tgt}",
+                f"shift_generality_{src}_to_{tgt}"):
+        return True
+    return False
+
+
 def _aggregate_canonical_ranking(args, pairs):
     """Average standardized OLS β across (src→tgt) pairs.
 
@@ -1993,14 +2021,16 @@ def _aggregate_canonical_ranking(args, pairs):
     import matplotlib.pyplot as plt
 
     base_dir = Path(args.output_dir)
-    out_dir = base_dir / f"_aggregated_{args.model_type}_{args.da_method}_{args.metric}"
+    pre_da_only = bool(getattr(args, "pre_da_only", False))
+    suffix = "_preda" if pre_da_only else ""
+    out_dir = base_dir / f"_aggregated_{args.model_type}_{args.da_method}_{args.metric}{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     per_pair = {}  # pair → {canonical_feat: {beta, se, t, p, p_fdr, vif}}
     used_pairs = []
     for src, tgt in pairs:
         pair = f"{src}2{tgt}"
-        csv_path = base_dir / f"{pair}_{args.model_type}_{args.da_method}" / "regression_results.csv"
+        csv_path = base_dir / f"{pair}_{args.model_type}_{args.da_method}{suffix}" / "regression_results.csv"
         if not csv_path.exists():
             print(f"  [skip] {csv_path} not found", file=sys.stderr)
             continue
@@ -2427,10 +2457,14 @@ def analyze_da_factors(args):
 
     reports_dir = Path(args.reports_dir)
     data_dir = Path(args.data_dir)
+    pre_da_only = bool(getattr(args, "pre_da_only", False))
+    suffix = "_preda" if pre_da_only else ""
     out_dir = Path(args.output_dir) / (
-        f"{args.source_genre}2{args.target_genre}_{args.model_type}_{args.da_method}"
+        f"{args.source_genre}2{args.target_genre}_{args.model_type}_{args.da_method}{suffix}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
+    if pre_da_only:
+        print("[mode] pre-DA-only: dropping features that require target-domain labels")
 
     metric = args.metric
     higher_is_better = metric in ("ccc", "srocc", "ndcg@10")
@@ -2542,6 +2576,15 @@ def analyze_da_factors(args):
     # - baseline_source: how well the user is modeled on source (no-DA)
     feat_cols = [f"baseline_{metric}_target",
                  f"baseline_{metric}_source"] + feat_cols
+
+    if pre_da_only:
+        dropped_post_da = [c for c in feat_cols
+                           if _is_post_da_only_feature(
+                               c, args.source_genre, args.target_genre, metric)]
+        if dropped_post_da:
+            print(f"[filter] pre-DA-only: drop target-label-dependent features: "
+                  f"{dropped_post_da}")
+        feat_cols = [c for c in feat_cols if c not in dropped_post_da]
 
     # coerce to numeric, drop constant / near-empty columns
     Xy = merged[feat_cols + ["delta_target"]].apply(pd.to_numeric, errors="coerce")
@@ -3452,6 +3495,14 @@ if __name__ == '__main__':
                                  "bar plot (default: 15)")
     adf_parser.add_argument("--no-plots", action="store_true", dest="no_plots",
                             help="Skip plot generation")
+    adf_parser.add_argument("--pre-da-only", action="store_true",
+                            dest="pre_da_only",
+                            help="Run regression using only features known BEFORE "
+                                 "domain adaptation (i.e. that do NOT require target-"
+                                 "domain rating labels). Drops tgt_*/retest_mae_tgt/"
+                                 "generality_tgt/shift_*(except shift_interest/learn)/"
+                                 "baseline_{metric}_target. Output dirs are suffixed "
+                                 "with `_preda`.")
 
     # Subcommand: basic_stats
     bs_parser = subparsers.add_parser(
