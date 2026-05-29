@@ -16,6 +16,7 @@ from .inference import inference, inference_giaa
 _DA_METHOD_MODULES = {
     'DANN':      '.methods.dann',
     'DJDOT':     '.methods.djdot',
+    'JUMBOT':    '.methods.jumbot',
     'MCD':       '.methods.mcd',
     'DEEPCORAL': '.methods.deepcoral',
     'CDAN':      '.methods.cdan',

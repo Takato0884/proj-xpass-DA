@@ -61,10 +61,24 @@ def parse_arguments(parse=True):
     parser.add_argument('--da_gamma', type=float, default=10.0,
                         help='[DA] λ schedule: sharpness of the sigmoid (Ganin et al.)')
     # DeepJDOT-specific hyperparameters
-    parser.add_argument('--djdot_alpha', type=float, default=0.001,
+    parser.add_argument('--djdot_alpha', type=float, default=0.1,
                         help='[DJDOT] Weight for feature alignment term (L2 feature distance).')
-    parser.add_argument('--djdot_lambda_t', type=float, default=0.0001,
+    parser.add_argument('--djdot_lambda_t', type=float, default=0.1,
                         help='[DJDOT] Weight for label alignment term (EMD label cost).')
+    # JUMBOT-specific hyperparameters (Unbalanced minibatch OT; aligns with DeepJDOT)
+    #   eta1/eta2 are the feature/label weights -> matched to DeepJDOT alpha/lambda_t
+    #   (GIAA: 0.1/0.1). eta3=1.0 keeps the effective loss (eta3*eta1, eta3*eta2)
+    #   identical to DeepJDOT while staying a round value inside the design-doc range.
+    parser.add_argument('--jumbot_eta1', type=float, default=0.1,
+                        help='[JUMBOT] Weight of the feature-distance term (L2^2) in the OT cost matrix.')
+    parser.add_argument('--jumbot_eta2', type=float, default=0.1,
+                        help='[JUMBOT] Weight of the label-cost term (GIAA: EMD / PIAA: squared error) in the OT cost matrix.')
+    parser.add_argument('--jumbot_eta3', type=float, default=1.0,
+                        help='[JUMBOT] Scale of the transport loss <pi, C> added to the source task loss.')
+    parser.add_argument('--jumbot_tau', type=float, default=0.5,
+                        help='[JUMBOT] Marginal KL penalty (reg_m) of the Unbalanced OT. Smaller = looser marginals.')
+    parser.add_argument('--jumbot_epsilon', type=float, default=0.1,
+                        help='[JUMBOT] Entropic regularization (reg) of the Sinkhorn Unbalanced OT.')
     # MCD-specific hyperparameters
     parser.add_argument('--mcd_lambda', type=float, default=10.0,
                         help='[MCD] Weight for the discrepancy loss in Step B (lambda in L_s - lambda * L_adv).')

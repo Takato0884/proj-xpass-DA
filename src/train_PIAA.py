@@ -14,6 +14,7 @@ from .inference import inference_finetune, evaluate_pretrain_on_val_piaa, infere
 _DA_METHOD_MODULES_PIAA = {
     'DANN':      '.methods.dann',
     'DJDOT':     '.methods.djdot',
+    'JUMBOT':    '.methods.jumbot',
     'MCD':       '.methods.mcd',
     'DAREGRAM':  '.methods.daregram',
     'UGAFEAT':   '.methods.ugafeat',
@@ -249,6 +250,11 @@ def run_main(args):
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                     args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
                     num_attr, num_pt, alda_target_genre=target_genre)
+            elif method_name == 'JUMBOT':
+                mod.trainer_finetune(
+                    datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
+                    args, device, dirname, experiment_name, backbone_dict, pretrained_model_dict,
+                    num_attr, num_pt, jumbot_target_genre=target_genre)
             else:  # DJDOT
                 mod.trainer_finetune(
                     datasets_dict_user, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
@@ -287,7 +293,8 @@ if __name__ == '__main__':
     parser.add_argument('--keep_finetune_pth', action='store_true', default=False,
                         help='Keep *_finetune.pth files after inference (default: delete them)')
     import sys
-    parser.set_defaults(lr=5e-6, batch_size=32, djdot_alpha=0.1, djdot_lambda_t=1)
+    parser.set_defaults(lr=5e-6, batch_size=32, djdot_alpha=0.1, djdot_lambda_t=1,
+                        jumbot_eta1=0.1, jumbot_eta2=1.0)
     args = parser.parse_args()
     if args.piaa_mode == 'PIAA_pretrain':
         if not any(a.startswith('--mcd_lambda') for a in sys.argv[1:]):

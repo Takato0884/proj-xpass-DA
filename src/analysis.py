@@ -2862,6 +2862,34 @@ def basic_stats(args):
                   f"mean={row['mean']:.3f}  std={row['std']:.3f}  "
                   f"min={row['min']:.0f}  max={row['max']:.0f}")
 
+    _hr("Test-retest MAE by genre (pair-level mean)")
+    # 同一 (user_id, sample_file) を 2 回以上評定したペアを抽出し,
+    # |r1 - r2| をペア単位で算出. その平均/分布をジャンルごとに表示する.
+    # plot_quality はユーザー単位で先に平均してからユーザー間で再集計するが,
+    # ここでは各ペアを 1 サンプルとして扱い, ペアそのものの平均を出す.
+    if {"user_id", "sample_file", "genre"}.issubset(ratings.columns):
+        for col in score_cols:
+            print(f"  [{col}]")
+            print(f"    {'genre':<12}{'n_pairs':>10}{'n_users':>10}"
+                  f"{'mean':>10}{'std':>10}{'median':>10}")
+            for g, gdf in ratings.groupby("genre"):
+                diffs = []
+                users_with_retest = set()
+                for (uid, _sf), s in gdf.groupby(["user_id", "sample_file"])[col]:
+                    s = s.dropna()
+                    if len(s) >= 2:
+                        diffs.append(abs(float(s.iloc[0]) - float(s.iloc[1])))
+                        users_with_retest.add(uid)
+                if not diffs:
+                    print(f"    {str(g):<12}{'-':>10}{'-':>10}"
+                          f"{'-':>10}{'-':>10}{'-':>10}")
+                    continue
+                ds = pd.Series(diffs)
+                print(f"    {str(g):<12}{len(ds):>10,}"
+                      f"{len(users_with_retest):>10,}"
+                      f"{ds.mean():>10.3f}{ds.std():>10.3f}"
+                      f"{ds.median():>10.3f}")
+
     if "Time" in ratings.columns:
         _hr("Response time (Time, seconds) by genre")
         t = ratings.copy()
@@ -2886,6 +2914,7 @@ def plot_user_traits(args):
                          Extraversion / Agreeableness / Conscientiousness /
                          Emotional Stability / Openness
     """
+    import numpy as np
     import pandas as pd
     import matplotlib
     matplotlib.use("Agg")
@@ -2903,7 +2932,7 @@ def plot_user_traits(args):
     interest_map = {
         "Art": "art_interest",
         "Fashion": "fashion_interest",
-        "Scenery": "photoVideo_interest",
+        "Landscape": "photoVideo_interest",
     }
     interest_data = {}
     for label, col in interest_map.items():
@@ -2934,32 +2963,44 @@ def plot_user_traits(args):
                              gridspec_kw={"width_ratios": [3, 5]})
 
     fs = float(args.font_size)
-    mean_props = {"marker": "D", "markerfacecolor": "red",
-                  "markeredgecolor": "red", "markersize": max(4, fs * 0.45)}
+    # 箱ひげは白黒.
+    box_props = {"facecolor": "white", "edgecolor": "black", "linewidth": 1.2}
+    whisker_props = {"color": "black", "linewidth": 1.0}
+    cap_props = {"color": "black", "linewidth": 1.0}
     median_props = {"color": "black", "linewidth": 1.5}
+    flier_props = {"marker": "", "markersize": 0}  # 個別点を散布図で出すので非表示
 
-    def _color_boxes(bp, colors):
-        for patch, c in zip(bp["boxes"], colors):
-            patch.set_facecolor(c)
-            patch.set_edgecolor("black")
-            patch.set_alpha(0.7)
+    def _jitter_scatter(ax, data, colors, jitter=0.18, alpha=0.75):
+        rng = np.random.default_rng(seed=0)
+        for i, (vals, c) in enumerate(zip(data, colors), start=1):
+            if len(vals) == 0:
+                continue
+            x = rng.uniform(i - jitter, i + jitter, size=len(vals))
+            ax.scatter(x, vals, s=max(10, fs * 1.2), color=c,
+                       alpha=alpha, edgecolors="none", zorder=4)
 
     def _style_axis(ax):
         ax.set_ylim(0.5, 7.5)
         ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.set_axisbelow(True)
         ax.tick_params(axis="x", labelsize=fs)
         ax.tick_params(axis="y", labelsize=fs)
         ax.yaxis.label.set_size(fs)
         ax.title.set_size(fs * 1.1)
 
+    # 属性ごとの色 (やや濃いめのパステル).
+    interest_colors = ["#E27A4A", "#7CB342", "#4A90B8"]                # Art / Fashion / Landscape
+    big5_colors     = ["#8E7AB5", "#A88E66", "#D87BB0",
+                       "#7F7F7F", "#C9B870"]                            # Ext / Agr / Con / E.S. / Opn
+
     ax = axes[0]
     labels = list(interest_data.keys())
     data = [interest_data[k] for k in labels]
-    interest_colors = ["#4C72B0", "#DD8452", "#55A467"]
-    bp = ax.boxplot(data, tick_labels=labels, showmeans=True,
-                    patch_artist=True,
-                    meanprops=mean_props, medianprops=median_props)
-    _color_boxes(bp, interest_colors)
+    _jitter_scatter(ax, data, interest_colors)
+    ax.boxplot(data, tick_labels=labels, patch_artist=True,
+               boxprops=box_props, whiskerprops=whisker_props,
+               capprops=cap_props, medianprops=median_props,
+               flierprops=flier_props, zorder=3)
     ax.set_title(f"Domain Interest  (n={len(users):,})")
     ax.set_ylabel("Interest score (1-7)")
     _style_axis(ax)
@@ -2967,11 +3008,11 @@ def plot_user_traits(args):
     ax = axes[1]
     labels = list(big5.columns)
     data = [big5[c].dropna().values for c in labels]
-    big5_colors = ["#8172B2", "#937860", "#DA8BC3", "#8C8C8C", "#CCB974"]
-    bp = ax.boxplot(data, tick_labels=labels, showmeans=True,
-                    patch_artist=True,
-                    meanprops=mean_props, medianprops=median_props)
-    _color_boxes(bp, big5_colors)
+    _jitter_scatter(ax, data, big5_colors)
+    ax.boxplot(data, tick_labels=labels, patch_artist=True,
+               boxprops=box_props, whiskerprops=whisker_props,
+               capprops=cap_props, medianprops=median_props,
+               flierprops=flier_props, zorder=3)
     ax.set_title(f"Personality Trait (TIPI Big5)  (n={len(users):,})")
     ax.set_ylabel("Score (1-7)")
     _style_axis(ax)
@@ -3030,37 +3071,47 @@ def plot_rating_histograms(args):
         "scenery": {"color": "#5B8AB8", "hatch": "xx"},
     }
 
-    bins_centers = np.arange(1, 8)            # 1..7
-    bin_edges = np.arange(0.5, 8.5, 1.0)
     n_g = len(genres)
     bar_width = 0.8 / n_g
     offsets = np.linspace(-(n_g - 1) / 2.0, (n_g - 1) / 2.0, n_g) * bar_width
 
+    # Aesthetic は 7 点 (0-6 → 1-7), それ以外の感情項目は 5 点 (0-4 → 1-5).
+    def _scale_for(c):
+        return 7 if c == "Aesthetic" else 5
+
+    # ジャンルの表示名 (図中レジェンド / 統計表で使用).
+    genre_display = {"art": "Art", "fashion": "Fashion", "scenery": "Landscape"}
+
     fig, axes = plt.subplots(2, 5,
                              figsize=tuple(args.figsize),
-                             sharex=True, sharey=args.share_y)
+                             sharex=False, sharey=args.share_y)
     axes_flat = axes.flatten()
 
     handles, labels_ = [], []
     for i, col in enumerate(cols):
         ax = axes_flat[i]
+        max_val = _scale_for(col)
+        bins_centers = np.arange(1, max_val + 1)
+        bin_edges = np.arange(0.5, max_val + 1.5, 1.0)
         for g_idx, g in enumerate(genres):
             sub = ratings.loc[ratings["genre"] == g, col]
-            vals = pd.to_numeric(sub, errors="coerce").dropna() + 1.0  # 0-6 → 1-7
+            vals = pd.to_numeric(sub, errors="coerce").dropna() + 1.0
             counts, _ = np.histogram(vals, bins=bin_edges)
             total = counts.sum()
             prop = counts / total if total else counts
             x = bins_centers + offsets[g_idx]
             style = genre_styles.get(g, {"color": f"C{g_idx}", "hatch": ""})
+            disp = genre_display.get(g, g)
             bars = ax.bar(x, prop, width=bar_width,
                           color=style["color"], edgecolor="black",
-                          linewidth=0.6, hatch=style["hatch"], label=g)
+                          linewidth=0.6, hatch=style["hatch"], label=disp)
             if i == 0:
                 handles.append(bars[0])
-                labels_.append(g)
+                labels_.append(disp)
 
         ax.set_title(col, fontsize=fs * 1.05)
         ax.set_xticks(bins_centers)
+        ax.set_xlim(0.4, max_val + 0.6)
         ax.tick_params(axis="x", labelsize=fs * 0.9)
         ax.tick_params(axis="y", labelsize=fs * 0.9)
         ax.grid(axis="y", linestyle="--", alpha=0.4)
@@ -3103,12 +3154,13 @@ def plot_rating_histograms(args):
             ).dropna() + 1.0
             rows.append(("all", v_all))
             for name, v in rows:
+                disp_name = genre_display.get(name, name)
                 if len(v) == 0:
-                    print(f"  {name:<10}{0:>7}  (no data)")
+                    print(f"  {disp_name:<10}{0:>7}  (no data)")
                     continue
                 mode_val = int(v.round().mode().iloc[0])
                 print(
-                    f"  {name:<10}{len(v):>7,}"
+                    f"  {disp_name:<10}{len(v):>7,}"
                     f"{v.mean():>8.2f}{v.std():>8.2f}"
                     f"{v.median():>9.2f}"
                     f"{v.quantile(0.25):>7.2f}{v.quantile(0.75):>7.2f}"

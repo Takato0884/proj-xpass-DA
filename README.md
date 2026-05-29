@@ -257,8 +257,13 @@ python src/preprocessing.py make_data_split_cv \
 | `--eval_target` | str | `None` | ソースのみ学習中にターゲットジャンルを評価（例: `fashion`）。ドメイン適応なしでターゲットのval EMDを記録する |
 | `--dann_epochs` | int | `50` | `[DANN]` λスケジュール: λが〜1.0に達するまでのエポック数。内部で `total_steps = dann_epochs × (data_size / batch_size)` に変換される |
 | `--dann_gamma` | float | `10.0` | `[DANN]` λスケジュール: シグモイドの鋭さ（Ganin et al.） |
-| `--djdot_alpha` | float | `0.001` | `[DJDOT]` 特徴整合項の重み（L2特徴距離） |
-| `--djdot_lambda_t` | float | `0.0001` | `[DJDOT]` ラベル整合項の重み（EMDラベルコスト） |
+| `--djdot_alpha` | float | `0.1` | `[DJDOT]` 特徴整合項の重み（L2特徴距離） |
+| `--djdot_lambda_t` | float | `0.1` | `[DJDOT]` ラベル整合項の重み（EMDラベルコスト） |
+| `--jumbot_eta1` | float | `0.1` | `[JUMBOT]` OTコスト行列の特徴距離項（L2^2）の重み。DeepJDOT の `djdot_alpha` に揃えてある |
+| `--jumbot_eta2` | float | `0.1` | `[JUMBOT]` OTコスト行列のラベルコスト項（GIAA: EMD）の重み。DeepJDOT の `djdot_lambda_t` に揃えてある |
+| `--jumbot_eta3` | float | `1.0` | `[JUMBOT]` ソースタスク損失に加える転送損失 `<pi, C>` のスケール。`eta3*eta1`・`eta3*eta2` が DeepJDOT の有効重みと一致するよう 1.0 |
+| `--jumbot_tau` | float | `0.5` | `[JUMBOT]` Unbalanced OT のマージナル KL ペナルティ（`reg_m`）。小さいほどマージナル制約が緩む |
+| `--jumbot_epsilon` | float | `0.1` | `[JUMBOT]` Sinkhorn Unbalanced OT のエントロピー正則化（`reg`） |
 | `--mcd_lambda` | float | `10.0` | `[MCD]` Step Bにおける Discrepancy損失の重み（`L_s - lambda * L_adv`のlambda） |
 | `--mcd_n_steps` | int | `4` | `[MCD]` Step C（ジェネレータ更新）の1バッチあたり繰り返し回数 |
 
@@ -275,6 +280,9 @@ python -m src.train_GIAA --genre art --da_method DANN-fashion
 
 # art → fashion へのDeepJDOT
 python -m src.train_GIAA --genre art --da_method DJDOT-fashion
+
+# art → fashion へのJUMBOT
+python -m src.train_GIAA --genre art --da_method JUMBOT-fashion
 
 # art → fashion へのMCD
 python -m src.train_GIAA --genre art --da_method MCD-fashion
@@ -299,6 +307,7 @@ GIAA学習（`train_GIAA`）では `--da_method METHOD-target` を指定する�
 |------|---------------------|------|------|
 | **DANN** | `DANN-fashion` | Gradient Reversal Layerによるドメイン識別器の敵対的学習 | GIAA / PIAA |
 | **DeepJDOT** | `DJDOT-fashion` | 最適輸送（OT）によるジョイント分布整合。特徴距離とEMDラベルコストをコスト行列に使用 | GIAA / PIAA |
+| **JUMBOT** | `JUMBOT-fashion` | DeepJDOT の Unbalanced ミニバッチ OT 版。厳密 OT（`ot.emd`）を不均衡エントロピー OT（`ot.sinkhorn_unbalanced`）に置換 | GIAA / PIAA |
 | **MCD** | `MCD-fashion` | 2つの独立した分類ヘッド（F1/F2）の予測Discrepancyを最大化・最小化することでターゲット特徴をソースのサポート内に引き込む | GIAA / PIAA (ICI のみ) |
 | **DARE-GRAM** | `DAREGRAM-fashion` | グラム行列の角度（cos類似度）とスケール（特異値）の整合により、ソース・ターゲットの特徴空間を線形回帰の幾何構造レベルで揃える | PIAA (ICI のみ) |
 
@@ -322,7 +331,7 @@ $$\min_{\gamma, f, g} \frac{1}{n_s}\sum_i \text{EMD}(y^s_i, f(g(x^s_i))) + \sum_
 ```bash
 # art → fashion
 python -m src.train_GIAA --genre art --da_method DJDOT-fashion \
-  --dataset_ver v_giaa --djdot_alpha 0.001 --djdot_lambda_t 0.0001
+  --dataset_ver v_giaa --djdot_alpha 0.1 --djdot_lambda_t 0.1
 
 # art → scenery
 python -m src.train_GIAA --genre art --da_method DJDOT-scenery \
@@ -334,6 +343,42 @@ python -m src.train_GIAA --genre fashion --da_method DJDOT-scenery \
 ```
 
 モデルは `models_pth/{dataset_ver}/{source}2{target}/` に保存されます（例: `models_pth/v_giaa/art2fashion/`）。
+
+### JUMBOT（Joint Unbalanced MiniBatch Optimal Transport）
+
+Fatras et al. (ICML 2021)。DeepJDOT を雛形とし、唯一の本質的な差分である「バランス型・厳密 OT」を「Unbalanced ミニバッチ OT」に置き換えた手法です。特徴量の位置・ラベルコスト・勾配処理・損失構成・学習ループ・早期停止/保存/ログは DeepJDOT に揃えてあります。
+
+$$L_\text{total} = L_\text{cls} + \eta_3 \langle \pi, C\rangle,\quad C_{ij} = \eta_1 \|z^s_i - z^t_j\|^2 + \eta_2 \cdot \text{label\_cost}_{ij}$$
+
+$$\pi = \arg\min_\pi \langle \pi, C\rangle + \varepsilon\,\text{KL}(\pi\,\|\,a\otimes b) + \tau\bigl(\text{KL}(\pi\mathbf{1}\,\|\,a) + \text{KL}(\pi^\top\mathbf{1}\,\|\,b)\bigr)$$
+
+各バッチで以下を実行します：
+
+1. **πの更新**：コスト行列 $C$ を max 正規化し、`ot.sinkhorn_unbalanced`（log安定化版 Sinkhorn）で不均衡輸送計画πを求める
+2. **f, gの更新**：πを固定して合計損失を誤差逆伝播
+
+実装上の詳細：
+- ラベルコストは DeepJDOT に揃える（GIAA: `EMD(hist_src, pred_t)` / PIAA: `(score_s - score_t)^2`）
+- OT求解は CPU・float64。NaN/Inf が出たバッチは π=0 にフォールバックして転送損失を無効化
+- ハイパラ方針：特徴/ラベル重み `eta1`/`eta2` は DeepJDOT の `alpha`/`lambda_t` に揃え（GIAA: 0.1/0.1, PIAA: 0.1/1.0）、JUMBOT 固有の `eta3`/`tau`/`epsilon` は設計書レンジ内のキリのいい値（1.0/0.5/0.1）。`eta3=1.0` により有効損失重み `eta3*eta1`・`eta3*eta2` が DeepJDOT と一致する
+- Early stoppingはソースval EMD（GIAA）/ ソースval CCC（PIAA）で判断
+
+#### ペアワイズ適応の例
+
+```bash
+# art → fashion
+python -m src.train_GIAA --genre art --da_method JUMBOT-fashion \
+  --dataset_ver v_giaa --jumbot_eta1 0.1 --jumbot_eta2 0.1 \
+  --jumbot_eta3 1.0 --jumbot_tau 0.5 --jumbot_epsilon 0.1
+
+# art → scenery
+python -m src.train_GIAA --genre art --da_method JUMBOT-scenery \
+  --dataset_ver v_giaa
+
+# fashion → scenery
+python -m src.train_GIAA --genre fashion --da_method JUMBOT-scenery \
+  --dataset_ver v_giaa
+```
 
 ### MCD（Maximum Classifier Discrepancy）
 
@@ -489,6 +534,11 @@ python -m src.train_PIAA --genre art --dataset_ver v2_all \
 | `--dann_gamma` | float | `10.0` | `[DANN]` λスケジュール: シグモイドの鋭さ（Ganin et al.） |
 | `--djdot_alpha` | float | `0.1` | `[DJDOT]` 特徴整合項の重み（L2特徴距離） |
 | `--djdot_lambda_t` | float | `1` | `[DJDOT]` ラベル整合項の重み（EMDラベルコスト） |
+| `--jumbot_eta1` | float | `0.1` | `[JUMBOT]` OTコスト行列の特徴距離項（L2^2）の重み。DeepJDOT の `djdot_alpha`（PIAA）に揃えてある |
+| `--jumbot_eta2` | float | `1.0` | `[JUMBOT]` OTコスト行列のラベルコスト項（PIAA: 二乗誤差）の重み。DeepJDOT の `djdot_lambda_t`（PIAA）に揃えてある |
+| `--jumbot_eta3` | float | `1.0` | `[JUMBOT]` 転送損失 `<pi, C>` のスケール（GIAA と共通） |
+| `--jumbot_tau` | float | `0.5` | `[JUMBOT]` Unbalanced OT のマージナル KL ペナルティ（`reg_m`）。小さいほどマージナル制約が緩む |
+| `--jumbot_epsilon` | float | `0.1` | `[JUMBOT]` Sinkhorn Unbalanced OT のエントロピー正則化（`reg`） |
 | `--mcd_lambda` | float | `10.0` | `[MCD]` Step B における Discrepancy損失の重み（`L_s - lambda * L_adv` の lambda） |
 | `--mcd_n_steps` | int | `4` | `[MCD]` Step C（ジェネレータ更新）の1バッチあたり繰り返し回数 |
 | `--daregram_alpha_cos` | float | `0.01` | `[DAREGRAM]` 角度整合損失 L_cos の重み |

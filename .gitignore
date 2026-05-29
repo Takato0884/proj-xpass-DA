@@ -4,6 +4,7 @@
 *.pth
 *.json
 *.out
+*.png
 
 # Wandb
 wandb/
